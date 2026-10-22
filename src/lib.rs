@@ -7,3 +7,6 @@ pub mod card_preview;
 #[cfg(feature = "desktop")]
 pub mod ui_motion;
 pub mod viewer;
+
+#[cfg(feature = "desktop")]
+pub mod video;

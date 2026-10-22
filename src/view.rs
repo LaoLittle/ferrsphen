@@ -107,6 +107,8 @@ pub struct AppView {
     card_textures: Entity<CardTextureCache>,
     bubble_sizes: Rc<RefCell<HashMap<String, gpui_kit::Size<Pixels>>>>,
     viewer_window: Option<AnyWindowHandle>,
+    video_windows: HashMap<String, AnyWindowHandle>,
+    video_results: HashMap<String, Result<PathBuf, String>>,
     forward_window: Option<AnyWindowHandle>,
     forward_key: Option<String>,
     forward_error: Option<String>,
@@ -676,6 +678,8 @@ impl AppView {
             card_textures: CardTextureCache::new(cx),
             bubble_sizes: Rc::new(RefCell::new(HashMap::new())),
             viewer_window: None,
+            video_windows: HashMap::new(),
+            video_results: HashMap::new(),
             forward_window: None,
             forward_key: None,
             forward_error: None,
@@ -909,6 +913,9 @@ impl AppView {
                     }
                 }
             },
+            Update::Video { key, result } => {
+                self.video_results.insert(key, result);
+            }
             Update::Asset { key, path } => {
                 self.assets.insert(key, path);
             }
@@ -2019,13 +2026,21 @@ impl AppView {
                     .context_menu(self.message_menu(message, cx, read_only, Some(index)))
                     .into_any_element()
             }
-            MessageElement::Voice(reference)
-            | MessageElement::Video(reference)
-            | MessageElement::File(reference) => {
+            MessageElement::Video(reference) => {
+                let reference = reference.clone();
+                Button::new(SharedString::from(format!("video:{key}")))
+                    .ghost()
+                    .icon(gpui_kit::assets::IconName::Play)
+                    .label(format!("视频 · {} 秒", reference.duration))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_video(format!("video:{key}"), reference.clone(), cx);
+                    }))
+                    .into_any_element()
+            }
+            MessageElement::Voice(reference) | MessageElement::File(reference) => {
                 let reference = reference.clone();
                 let label = match element {
                     MessageElement::Voice(_) => format!("▷ 语音 · {} 秒", reference.duration),
-                    MessageElement::Video(_) => format!("▷ 视频 · {} 秒", reference.duration),
                     _ => format!("文件 · {}", reference.name),
                 };
                 Button::new(SharedString::from(format!("media:{key}")))
@@ -2525,14 +2540,6 @@ impl AppView {
                         },
                     ),
             )
-            .when(!expanded, |view| {
-                view.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{} 张", images.len())),
-                )
-            })
             .when(expanded, |view| {
                 view.child(
                     Button::new(SharedString::from(format!("collapse:{key}")))
@@ -3276,6 +3283,90 @@ impl AppView {
             )
             .into_any_element()
     }
+    fn open_video(
+        &mut self,
+        key: String,
+        reference: atri_qq::media::MediaReference,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(handle) = owner.read(cx).video_windows.get(&key).copied()
+                && handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+            {
+                return;
+            }
+            owner.update(cx, |this, cx| {
+                if !matches!(this.video_results.get(&key), Some(Ok(_))) {
+                    this.video_results.remove(&key);
+                    if !this.command(Command::ViewVideo {
+                        key: key.clone(),
+                        reference,
+                    }) {
+                        this.video_results
+                            .insert(key.clone(), Err("操作队列不可用".into()));
+                    }
+                }
+                cx.notify();
+            });
+            let content_owner = owner.clone();
+            let content_key = key.clone();
+            let result = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::centered(size(px(960.), px(680.)), cx)),
+                    window_min_size: Some(size(px(520.), px(360.))),
+                    app_owns_titlebar_drag: true,
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("视频".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(12.), px(20.))),
+                    }),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let mut view = ferrsphen::video::VideoView::new(window, cx);
+                        if let Some(result) = content_owner
+                            .read(cx)
+                            .video_results
+                            .get(&content_key)
+                            .cloned()
+                        {
+                            view.complete_download(result, cx);
+                        }
+                        let observer = cx.observe(
+                            &content_owner,
+                            move |view: &mut ferrsphen::video::VideoView, owner, cx| {
+                                if let Some(result) =
+                                    owner.read(cx).video_results.get(&content_key).cloned()
+                                {
+                                    view.complete_download(result, cx);
+                                }
+                            },
+                        );
+                        view.watch(observer);
+                        view
+                    })
+                },
+            );
+            owner.update(cx, |this, cx| {
+                match result {
+                    Ok((handle, _)) => {
+                        this.video_windows.insert(key, handle);
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "open video window failed");
+                        this.error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
     fn open_detail_window(&mut self, kind: DetailKind, cx: &mut Context<Self>) {
         let owner = cx.entity();
         // Native window creation may synchronously render its content.
@@ -4742,6 +4833,53 @@ mod ui_tests {
             assert_eq!(view.model.messages["group:42"].len(), 35);
         });
     }
+    #[gpui::test]
+    fn video_window_is_deferred_reused_and_displays_download_failure(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        let reference = MediaReference::new(MediaKind::Video, MediaConversation::Group { uin: 42 });
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.open_video("video-test".into(), reference.clone(), cx)
+            })
+        });
+        cx.run_until_parked();
+        let player = cx.update(|cx| view.read(cx).video_windows["video-test"]);
+        assert_ne!(main.window_id(), player.window_id());
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::ViewVideo { key, .. } if key == "video-test")
+        );
+        draw(cx, player);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Video {
+                    key: "video-test".into(),
+                    result: Err("下载失败".into()),
+                });
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        draw(cx, player);
+        cx.update_window(player, |root, _, cx| {
+            assert!(root.downcast::<ferrsphen::video::VideoView>().is_ok());
+            assert_eq!(cx.windows().len(), 2);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.open_video("video-test".into(), reference, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(commands.try_recv().is_err());
+        cx.update(|cx| {
+            assert_eq!(
+                view.read(cx).video_windows["video-test"].window_id(),
+                player.window_id()
+            )
+        });
+    }
+
     #[gpui::test]
     fn detail_windows_open_after_owner_update_and_can_be_reused(cx: &mut TestAppContext) {
         let (main, view, _updates, _commands) = fixture(cx);

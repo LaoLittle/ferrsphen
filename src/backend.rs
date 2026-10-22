@@ -79,6 +79,10 @@ pub enum Command {
         key: String,
         reference: MediaReference,
     },
+    ViewVideo {
+        key: String,
+        reference: MediaReference,
+    },
     OpenMedia(MediaReference),
     GroupFile {
         group: u64,
@@ -141,6 +145,10 @@ pub enum Update {
         path: PathBuf,
     },
     Image {
+        key: String,
+        result: Result<PathBuf, String>,
+    },
+    Video {
         key: String,
         result: Result<PathBuf, String>,
     },
@@ -369,6 +377,7 @@ async fn run(
                             Some(Command::CardPreview{key,path,slot,width,height})=>{let cache=root.join("cache/cards");jobs.spawn(async move{let result=tokio::task::spawn_blocking(move||prepare_card(&cache,&key,&path,slot,width,height).map(|path|(key,path))).await;match result { Ok(Ok((key,path)))=>Update::Asset{key,path}, Ok(Err(error))=>{tracing::warn!(?error,"prepare stacked card failed");Update::Status(String::new())},Err(error)=>Update::Error(error.to_string()) }});}
                             Some(Command::Preview{key,reference})=>{let media=media.clone();let path=root.join("cache");jobs.spawn(async move{let result=async{let url=media.download_url(&reference).await?;fetch_asset(&path,&key,&url).await}.await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::Status(String::new())}}});}
                             Some(Command::ViewImage{key,reference})=>{let media=media.clone();let root=root.join("cache");jobs.spawn(async move{let result=async {let url=media.download_url(&reference).await?;fetch_asset(&root,&key,&url).await}.await.map_err(|error:anyhow::Error|error.to_string());Update::Image{key,result}});}
+                            Some(Command::ViewVideo{key,reference})=>{let media=media.clone();let root=root.join("cache/videos");jobs.spawn(async move{let result=download_video(&media,&reference,&root,&key).await.map_err(|error|format!("{error:#}"));if let Err(error)=&result{tracing::error!(%error,asset=key,"download video failed");}Update::Video{key,result}});}
                             Some(Command::OpenMedia(reference))=>{let media=media.clone();let path=root.join("downloads");jobs.spawn(async move{match download_open(&media,&reference,&path).await{Ok(())=>Update::Status(String::new()),Err(error)=>Update::Error(error.to_string())}});}
                             Some(Command::GroupFile{group,file})=>{let media=media.clone();jobs.spawn(async move{match media.group_file_download_url(group,&file).await {Ok(url)=>match open::that(url){Ok(_)=>Update::Status(String::new()),Err(error)=>Update::Error(error.to_string())},Err(error)=>Update::Error(error.to_string())}});}
                             Some(Command::Forward{key,reference,is_group})=>{let messaging=messaging.clone();jobs.spawn(async move{match messaging.download_forward(&reference.resource_id,is_group).await{Ok(messages) if !messages.is_empty()=>Update::Forward{key,messages},Ok(_)=>Update::ForwardFailed{key,error:"聊天记录为空".into()},Err(error)=>Update::ForwardFailed{key,error:error.to_string()}}});}
@@ -543,6 +552,33 @@ async fn fetch_asset(root: &Path, key: &str, url: &str) -> Result<PathBuf> {
     }
     let temporary = root.join(format!(".{:016x}.part", rand::random::<u64>()));
     tokio::fs::write(&temporary, bytes).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        if !path.is_file() {
+            return Err(error.into());
+        }
+    }
+    Ok(path)
+}
+async fn download_video(
+    media: &Media,
+    reference: &MediaReference,
+    root: &Path,
+    key: &str,
+) -> Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    let path = root.join(format!("{:016x}.mp4", hash.finish()));
+    if path.is_file() {
+        return Ok(path);
+    }
+    tokio::fs::create_dir_all(root).await?;
+    let temporary = root.join(format!(".{:016x}.part", rand::random::<u64>()));
+    if let Err(error) = media.download(reference, &temporary).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
     if let Err(error) = tokio::fs::rename(&temporary, &path).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         if !path.is_file() {

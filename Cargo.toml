@@ -7,13 +7,14 @@ license = "AGPL-3.0-or-later"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:gpui-kit"]
+desktop = ["dep:gpui-kit", "dep:alhazen-core"]
 ui-tests = ["desktop", "dep:gpui"]
 
 [dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", optional = true, features = ["test-support"] }
 atri_qq = { path = "../atri_qq", default-features = false }
-gpui-kit = { path = "../third_party/gpui-kit/crates/kit", optional = true }
+gpui-kit = { version = "=0.8.0", optional = true }
+alhazen-core = { version = "0.6", optional = true }
 surrealkv = "=1.0.0"
 silk-rs = "0.2"
 chrono = "0.4"
