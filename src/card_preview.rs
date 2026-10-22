@@ -1,0 +1,240 @@
+use anyhow::Result;
+use image::{ImageDecoder as _, ImageReader, RgbaImage, imageops::FilterType};
+use std::path::Path;
+
+pub const FRAMES: usize = 25;
+pub const COLUMNS: u32 = 5;
+pub const ACTION_HEIGHT: f32 = 32.;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardSize {
+    pub width: f32,
+    pub height: f32,
+}
+pub fn fitted(width: u32, height: u32) -> CardSize {
+    if width == 0 || height == 0 {
+        return CardSize {
+            width: 240.,
+            height: 180.,
+        };
+    }
+    let scale = (288. / width as f32).min(300. / height as f32).min(1.);
+    CardSize {
+        width: (width as f32 * scale).max(1.),
+        height: (height as f32 * scale).max(1.),
+    }
+}
+pub fn angle(slot: usize) -> f32 {
+    match slot {
+        1 => -0.065,
+        2 => 0.105,
+        3 => -0.095,
+        4 => 0.045,
+        _ => 0.,
+    }
+}
+pub struct CollapsedCards {
+    pub width: f32,
+    pub height: f32,
+    pub centers: Vec<(f32, f32)>,
+    pub sizes: Vec<CardSize>,
+}
+
+pub fn collapsed(sizes: &[CardSize]) -> CollapsedCards {
+    let count = if sizes.len() <= 5 { sizes.len() } else { 3 };
+    let mut layout = CollapsedCards {
+        width: 0.,
+        height: 0.,
+        centers: Vec::new(),
+        sizes: Vec::new(),
+    };
+    if sizes.len() <= 5 {
+        layout.sizes = sizes
+            .iter()
+            .map(|size| {
+                let scale = (144. / size.width).min(140. / size.height).min(1.);
+                CardSize {
+                    width: size.width * scale,
+                    height: size.height * scale,
+                }
+            })
+            .collect();
+        let mut top = 20.;
+        let offsets = [0., 8., 4., 0., 8.];
+        for (slot, size) in layout.sizes.iter().enumerate() {
+            let rotated = bounds(*size, angle(slot));
+            let left = 20. + offsets[slot];
+            layout
+                .centers
+                .push((left + rotated.width / 2., top + rotated.height / 2.));
+            layout.width = layout.width.max(left + rotated.width + 20.);
+            top += rotated.height + 4.;
+            layout.height = top + 16.;
+        }
+    } else {
+        layout.sizes.extend_from_slice(&sizes[..count]);
+        let width = sizes
+            .iter()
+            .take(count)
+            .map(|size| size.width)
+            .fold(0., f32::max);
+        let height = sizes
+            .iter()
+            .take(count)
+            .map(|size| size.height)
+            .fold(0., f32::max);
+        for slot in 0..count {
+            layout.centers.push((
+                20. + width / 2. + slot as f32 * 8.,
+                20. + height / 2. + slot as f32 * 8.,
+            ));
+        }
+        layout.width = width + 56.;
+        layout.height = height + 56.;
+    }
+    layout
+}
+
+pub fn frame(progress: f32) -> usize {
+    (progress.clamp(0., 1.) * (FRAMES - 1) as f32).round() as usize
+}
+pub fn bounds(size: CardSize, angle: f32) -> CardSize {
+    let (sine, cosine) = angle.sin_cos();
+    CardSize {
+        width: size.width * cosine.abs() + size.height * sine.abs(),
+        height: size.height * cosine.abs() + size.width * sine.abs(),
+    }
+}
+
+pub fn render(source: &Path, output: &Path, slot: usize, width: u32, height: u32) -> Result<()> {
+    let mut reader = ImageReader::open(source)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    let picture = image
+        .resize_exact(width.max(1), height.max(1), FilterType::Triangle)
+        .to_rgba8();
+    let (cell_width, cell_height) = (picture.width() + 40, picture.height() + 40);
+    let mut sheet = RgbaImage::new(cell_width * COLUMNS, cell_height * COLUMNS);
+    for index in 0..FRAMES {
+        let angle = angle(slot) * (1. - index as f32 / (FRAMES - 1) as f32);
+        let card = tilt(&picture, angle);
+        image::imageops::replace(
+            &mut sheet,
+            &card,
+            i64::from(index as u32 % COLUMNS * cell_width),
+            i64::from(index as u32 / COLUMNS * cell_height),
+        );
+    }
+    sheet.save_with_format(output, image::ImageFormat::Png)?;
+    Ok(())
+}
+
+fn tilt(picture: &RgbaImage, angle: f32) -> RgbaImage {
+    let (width, height) = picture.dimensions();
+    let mut output = RgbaImage::new(width + 40, height + 40);
+    let (sine, cosine) = angle.sin_cos();
+    let radius = 8_f32.min(width.min(height) as f32 / 2.);
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        let dx = x as f32 - (width + 40) as f32 / 2.;
+        let dy = y as f32 - (height + 40) as f32 / 2.;
+        let sx = cosine * dx + sine * dy + width as f32 / 2.;
+        let sy = -sine * dx + cosine * dy + height as f32 / 2.;
+        if sx < 0. || sy < 0. || sx >= width as f32 || sy >= height as f32 {
+            continue;
+        }
+        let corner_x = (sx - sx.clamp(radius, width as f32 - radius)).abs();
+        let corner_y = (sy - sy.clamp(radius, height as f32 - radius)).abs();
+        if corner_x * corner_x + corner_y * corner_y > radius * radius {
+            continue;
+        }
+        let ix = sx.floor() as u32;
+        let iy = sy.floor() as u32;
+        let (nx, ny) = ((ix + 1).min(width - 1), (iy + 1).min(height - 1));
+        let (fx, fy) = (sx.fract(), sy.fract());
+        for channel in 0..4 {
+            pixel[channel] = ((1. - fx) * (1. - fy) * picture.get_pixel(ix, iy)[channel] as f32
+                + fx * (1. - fy) * picture.get_pixel(nx, iy)[channel] as f32
+                + (1. - fx) * fy * picture.get_pixel(ix, ny)[channel] as f32
+                + fx * fy * picture.get_pixel(nx, ny)[channel] as f32)
+                .round() as u8;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fitting_keeps_aspect_and_small_native_sizes() {
+        let landscape = super::fitted(1920, 1080);
+        let portrait = super::fitted(1080, 1920);
+        assert!((landscape.width / landscape.height - 1920. / 1080.).abs() < 0.001);
+        assert!((portrait.width / portrait.height - 1080. / 1920.).abs() < 0.001);
+        assert_ne!(landscape, portrait);
+        assert_eq!(super::fitted(32, 24).width, 32.);
+    }
+    #[test]
+    fn small_stacks_show_each_card_at_its_own_size_and_angle() {
+        let sizes = [
+            super::fitted(160, 90),
+            super::fitted(80, 160),
+            super::fitted(240, 120),
+            super::fitted(120, 200),
+            super::fitted(32, 24),
+        ];
+        for count in 2..=5 {
+            let layout = super::collapsed(&sizes[..count]);
+            assert_eq!(layout.centers.len(), count);
+            let mut bottom = 0.;
+            for (slot, native) in sizes.iter().take(count).enumerate() {
+                let rotated = super::bounds(layout.sizes[slot], super::angle(slot));
+                let (x, y) = layout.centers[slot];
+                assert!(y - rotated.height / 2. >= bottom);
+                assert!(
+                    (layout.sizes[slot].width / layout.sizes[slot].height
+                        - native.width / native.height)
+                        .abs()
+                        < 0.001
+                );
+                assert!(x - rotated.width / 2. >= 0.);
+                assert!(x + rotated.width / 2. <= layout.width);
+                bottom = y + rotated.height / 2.;
+                for other in 0..slot {
+                    assert_ne!(super::angle(slot), super::angle(other));
+                }
+            }
+            assert!(bottom <= layout.height);
+            assert!(layout.width < 220. && layout.height < 800.);
+        }
+        assert_eq!(
+            super::collapsed(&[super::fitted(160, 90); 6]).centers.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn rotation_sheet_has_distinct_intermediate_frames_and_preserves_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.png");
+        let preview = directory.path().join("sheet.png");
+        image::RgbaImage::from_pixel(80, 120, image::Rgba([20, 80, 180, 255]))
+            .save(&source)
+            .unwrap();
+        let bytes = std::fs::read(&source).unwrap();
+        super::render(&source, &preview, 2, 80, 120).unwrap();
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+        let sheet = image::open(preview).unwrap().to_rgba8();
+        assert_eq!(sheet.dimensions(), (600, 800));
+        let cell = |index: u32| {
+            image::imageops::crop_imm(&sheet, index % 5 * 120, index / 5 * 160, 120, 160).to_image()
+        };
+        assert_ne!(cell(0), cell(12));
+        assert_ne!(cell(12), cell(24));
+        assert_eq!(super::frame(0.5), 12);
+    }
+}
