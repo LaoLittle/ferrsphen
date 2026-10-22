@@ -642,7 +642,7 @@ async fn send_attachment(
                     bail!("音频转换失败");
                 }
                 let encoded = tokio::task::spawn_blocking(move || {
-                    silk_rs::encode_silk(output.stdout, 24000, 24000, true)
+                    atri_qq::voice::encode_silk(&output.stdout, 24000, 24000, true)
                 })
                 .await??;
                 MediaInput::Data {

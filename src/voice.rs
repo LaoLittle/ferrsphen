@@ -1,6 +1,10 @@
 use anyhow::{Result, ensure};
 pub fn silk_to_wave(input: &[u8]) -> Result<Vec<u8>> {
-    let pcm = silk_rs::decode_silk(input, 24000)?;
+    let samples = atri_qq::voice::decode_silk(input, 24000)?;
+    let pcm: Vec<u8> = samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect();
     pcm_to_wave(&pcm, 24000)
 }
 pub fn pcm_to_wave(pcm: &[u8], sample_rate: u32) -> Result<Vec<u8>> {
@@ -41,5 +45,22 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 40);
         assert_eq!(&wav[44..], &[0, 0, 255, 127]);
         assert!(pcm_to_wave(&[0], 24000).is_err());
+    }
+    #[test]
+    fn qq_voice_codec_produces_a_mono_wave_with_the_padded_duration() {
+        let samples = 1201usize;
+        let pcm: Vec<u8> = (0..samples)
+            .flat_map(|i| {
+                let value =
+                    ((std::f64::consts::TAU * 440. * i as f64 / 24000.).sin() * 6000.) as i16;
+                value.to_le_bytes()
+            })
+            .collect();
+        let encoded = atri_qq::voice::encode_silk(&pcm, 24000, 24000, true).unwrap();
+        let wav = silk_to_wave(&encoded).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 24000);
+        assert_eq!(wav.len(), 44 + samples.div_ceil(480) * 480 * 2);
     }
 }

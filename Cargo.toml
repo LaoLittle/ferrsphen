@@ -16,7 +16,6 @@ atri_qq = { path = "../atri_qq", default-features = false }
 gpui-kit = { version = "=0.8.0", optional = true }
 alhazen-core = { version = "0.6", optional = true }
 surrealkv = "=1.0.0"
-silk-rs = "0.2"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

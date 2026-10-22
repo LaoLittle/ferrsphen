@@ -4860,11 +4860,12 @@ mod ui_tests {
         });
         cx.run_until_parked();
         draw(cx, player);
-        cx.update_window(player, |root, _, cx| {
-            assert!(root.downcast::<ferrsphen::video::VideoView>().is_ok());
-            assert_eq!(cx.windows().len(), 2);
-        })
-        .unwrap();
+        assert!(
+            VisualTestContext::from_window(player, cx)
+                .debug_bounds("video-error")
+                .is_some()
+        );
+        cx.update(|cx| assert_eq!(cx.windows().len(), 2));
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 view.open_video("video-test".into(), reference, cx)

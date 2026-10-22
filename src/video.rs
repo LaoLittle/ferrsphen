@@ -341,7 +341,13 @@ impl Render for VideoView {
                         |view| view.child(Spinner::new()),
                     )
                     .when_some(self.error.clone(), |view, error| {
-                        view.child(div().p_4().text_sm().child(error))
+                        view.child(
+                            div()
+                                .debug_selector(|| "video-error".into())
+                                .p_4()
+                                .text_sm()
+                                .child(error),
+                        )
                     }),
             )
             .child(
@@ -502,15 +508,15 @@ mod tests {
         assert!(player.has_video());
         assert!(player.duration().unwrap() >= Duration::from_secs(1));
         player.play();
-        wait_for(|| {
-            player.position() >= Duration::from_millis(150) && player.current_frame().is_some()
+        wait_for(&player, "play", || {
+            player.current_frame().is_some() && player.position() >= Duration::from_millis(150)
         });
         player.pause();
         let paused = player.position();
         std::thread::sleep(Duration::from_millis(80));
         assert!(player.position().abs_diff(paused) < Duration::from_millis(20));
         player.seek(Duration::from_millis(1100));
-        wait_for(|| {
+        wait_for(&player, "seek", || {
             player.current_frame().is_some_and(|frame| {
                 let VideoFrame::Cpu {
                     pts,
@@ -524,12 +530,21 @@ mod tests {
             })
         });
         player.play();
-        wait_for(|| matches!(player.state(), PlayerState::Ended));
+        wait_for(&player, "end", || {
+            player.current_frame();
+            matches!(player.state(), PlayerState::Ended)
+        });
     }
-    fn wait_for(mut ready: impl FnMut() -> bool) {
+    fn wait_for(player: &Player, stage: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready() {
-            assert!(Instant::now() < deadline, "video operation timed out");
+            assert!(
+                Instant::now() < deadline,
+                "{stage} timed out: {:?}, position {:?}, events {:?}",
+                player.state(),
+                player.position(),
+                player.events().try_iter().collect::<Vec<_>>()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
