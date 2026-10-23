@@ -75,11 +75,22 @@ pub enum Command {
         key: String,
         url: String,
     },
+    ResolveUser {
+        uid: String,
+    },
     ViewImage {
         key: String,
         reference: MediaReference,
     },
     ViewVideo {
+        key: String,
+        reference: MediaReference,
+    },
+    Voice {
+        key: String,
+        reference: MediaReference,
+    },
+    VideoPreview {
         key: String,
         reference: MediaReference,
     },
@@ -140,6 +151,10 @@ pub enum Update {
         id: u64,
         result: Result<Message, String>,
     },
+    UserUin {
+        uid: String,
+        result: Result<u64, String>,
+    },
     Asset {
         key: String,
         path: PathBuf,
@@ -149,6 +164,10 @@ pub enum Update {
         result: Result<PathBuf, String>,
     },
     Video {
+        key: String,
+        result: Result<PathBuf, String>,
+    },
+    Voice {
         key: String,
         result: Result<PathBuf, String>,
     },
@@ -322,7 +341,7 @@ async fn run(
                         },
                         packet=packets.recv(),if online=>match packet {
                             Ok(packet)=>for event in messaging.decode_push(packet).await {
-                                match event {PushEvent::Message{message}=>{db.save_message(session.keystore.uin,&message).await?;emit(&sender,Update::Message(message)).await?;},event=>{if let PushEvent::Recall{conversation,sequence,..}=&event {db.save_recall(session.keystore.uin,conversation,*sequence).await?;}db.put(&format!("notification/{}/{:020}",session.keystore.uin,now_millis()),&event).await?;emit(&sender,Update::Notification(event)).await?;}}
+                                match event {PushEvent::Message{message}=>{db.save_message(session.keystore.uin,&message).await?;emit(&sender,Update::Message(message)).await?;},event=>{if let PushEvent::Recall{conversation,sequence,..}=&event {tracing::info!(?event,"QQ recall received");db.save_recall(session.keystore.uin,conversation,*sequence).await?;}db.put(&format!("notification/{}/{:020}",session.keystore.uin,now_millis()),&event).await?;emit(&sender,Update::Notification(event)).await?;}}
                             },
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(count))=>emit(&sender,Update::Error(format!("消息事件丢失 {count}"))).await?,
                             Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
@@ -336,6 +355,7 @@ async fn run(
                                 Update::Contacts{friends,groups}=>{db.put(&format!("friends/{}",session.keystore.uin),friends).await?;db.put(&format!("groups/{}",session.keystore.uin),groups).await?;},
                                 Update::Announcements{group,result:Ok(items)}=>db.put(&format!("announcements/{}/{group}",session.keystore.uin),items).await?,
                                 Update::Announcements{result:Err(error),..}=>tracing::error!(%error,"fetch group announcements"),
+                                Update::UserUin{uid,result:Ok(uin)}=>db.save_user_uin(session.keystore.uin,uid,*uin).await?,
                                 Update::Recalled{conversation,sequence}=>db.save_recall(session.keystore.uin,conversation,*sequence).await?,
                                 Update::Members{group,members}=>db.put(&format!("members/{}/{group}",session.keystore.uin),members).await?,
                                 Update::Sent{id,result:Err(error)}=>tracing::error!(id,%error,"send message failed"),
@@ -356,6 +376,16 @@ async fn run(
                             }
                             Some(Command::SubmitCaptcha{ticket,random})=>{let client=client.clone();jobs.spawn(async move{match client.submit_captcha(ticket,random).await{Ok(())=>Update::Status("正在验证".into()),Err(error)=>Update::Error(error.to_string())}});}
                             Some(Command::SaveChats(chats))=>{db.put(&format!("chats/{}",session.keystore.uin),&chats).await?;}
+                            Some(Command::ResolveUser{uid})=>{
+                                if let Some(uin)=db.user_uin(session.keystore.uin,&uid)? {
+                                    emit(&sender,Update::UserUin{uid,result:Ok(uin)}).await?;
+                                } else if !online {
+                                    emit(&sender,Update::UserUin{uid,result:Err("账号离线".into())}).await?;
+                                } else {
+                                    let operations=operations.clone();
+                                    jobs.spawn(async move{let result=operations.resolve_uin(&uid).await.and_then(|uin|if uin!=0{Ok(uin)}else{Err(atri_qq::Error::Malformed("UID resolved to zero UIN".into()))}).map_err(|error|format!("{error:#}"));Update::UserUin{uid,result}});
+                                }
+                            }
                             Some(command) if !online=>{let _=command;emit(&sender,Update::Error("账号离线".into())).await?;}
                             Some(Command::Select(conversation))=>{
                                 let key=conversation_key(&conversation);let messages=db.messages(session.keystore.uin,&key,300)?;emit(&sender,Update::CachedMessages{key,messages}).await?;
@@ -378,6 +408,8 @@ async fn run(
                             Some(Command::Preview{key,reference})=>{let media=media.clone();let path=root.join("cache");jobs.spawn(async move{let result=async{let url=media.download_url(&reference).await?;fetch_asset(&path,&key,&url).await}.await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::Status(String::new())}}});}
                             Some(Command::ViewImage{key,reference})=>{let media=media.clone();let root=root.join("cache");jobs.spawn(async move{let result=async {let url=media.download_url(&reference).await?;fetch_asset(&root,&key,&url).await}.await.map_err(|error:anyhow::Error|error.to_string());Update::Image{key,result}});}
                             Some(Command::ViewVideo{key,reference})=>{let media=media.clone();let root=root.join("cache/videos");jobs.spawn(async move{let result=download_video(&media,&reference,&root,&key).await.map_err(|error|format!("{error:#}"));if let Err(error)=&result{tracing::error!(%error,asset=key,"download video failed");}Update::Video{key,result}});}
+                            Some(Command::Voice{key,reference})=>{let media=media.clone();let root=root.join("cache/voices");jobs.spawn(async move{let result=download_voice(&media,&reference,&root,&key).await.map_err(|error|format!("{error:#}"));if let Err(error)=&result{tracing::error!(%error,asset=key,"prepare voice failed");}Update::Voice{key,result}});}
+                            Some(Command::VideoPreview{key,reference})=>{let media=media.clone();let root=root.join("cache");jobs.spawn(async move{match video_preview(&media,&reference,&root,&key).await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(?error,asset=key,"load video preview failed");Update::Status(String::new())}}});}
                             Some(Command::OpenMedia(reference))=>{let media=media.clone();let path=root.join("downloads");jobs.spawn(async move{match download_open(&media,&reference,&path).await{Ok(())=>Update::Status(String::new()),Err(error)=>Update::Error(error.to_string())}});}
                             Some(Command::GroupFile{group,file})=>{let media=media.clone();jobs.spawn(async move{match media.group_file_download_url(group,&file).await {Ok(url)=>match open::that(url){Ok(_)=>Update::Status(String::new()),Err(error)=>Update::Error(error.to_string())},Err(error)=>Update::Error(error.to_string())}});}
                             Some(Command::Forward{key,reference,is_group})=>{let messaging=messaging.clone();jobs.spawn(async move{match messaging.download_forward(&reference.resource_id,is_group).await{Ok(messages) if !messages.is_empty()=>Update::Forward{key,messages},Ok(_)=>Update::ForwardFailed{key,error:"聊天记录为空".into()},Err(error)=>Update::ForwardFailed{key,error:error.to_string()}}});}
@@ -542,14 +574,19 @@ async fn fetch_asset(root: &Path, key: &str, url: &str) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "send", transport = "http", method = "GET", url, "QQ asset request");
+    let response = client.get(url).send().await?;
+    tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", transport = "http", url = %response.url(), status = response.status().as_u16(), headers = ?response.headers(), "QQ asset response");
+    let mut response = response;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
+        tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", transport = "http", url, offset = bytes.len(), length = chunk.len(), body_hex = %hex::encode(&chunk), "QQ asset body");
         if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
             bail!("图片过大");
         }
         bytes.extend_from_slice(&chunk);
     }
+    response.error_for_status_ref()?;
     let temporary = root.join(format!(".{:016x}.part", rand::random::<u64>()));
     tokio::fs::write(&temporary, bytes).await?;
     if let Err(error) = tokio::fs::rename(&temporary, &path).await {
@@ -566,10 +603,19 @@ async fn download_video(
     root: &Path,
     key: &str,
 ) -> Result<PathBuf> {
+    download_cached(media, reference, root, key, "mp4").await
+}
+async fn download_cached(
+    media: &Media,
+    reference: &MediaReference,
+    root: &Path,
+    key: &str,
+    extension: &str,
+) -> Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
-    let path = root.join(format!("{:016x}.mp4", hash.finish()));
+    let path = root.join(format!("{:016x}.{extension}", hash.finish()));
     if path.is_file() {
         return Ok(path);
     }
@@ -586,6 +632,99 @@ async fn download_video(
         }
     }
     Ok(path)
+}
+async fn download_voice(
+    media: &Media,
+    reference: &MediaReference,
+    root: &Path,
+    key: &str,
+) -> Result<PathBuf> {
+    let path = download_cached(media, reference, root, key, "audio")
+        .await
+        .with_context(|| format!("下载语音失败：{reference:?}"))?;
+    let wave_path = path.with_extension("wav");
+    if wave_path.is_file() {
+        return Ok(wave_path);
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    tracing::debug!(asset = key, ?reference, length = bytes.len(), header = %hex::encode(&bytes[..bytes.len().min(32)]), "voice downloaded");
+    if bytes.starts_with(b"#!AMR") {
+        let temporary = root.join(format!(".{:016x}.wav.part", rand::random::<u64>()));
+        let output = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&path)
+            .args([
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "wav",
+            ])
+            .arg(&temporary)
+            .output()
+            .await
+            .context("转换 AMR 语音需要 ffmpeg")?;
+        if !output.status.success() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            bail!("AMR 转换失败：{}", String::from_utf8_lossy(&output.stderr));
+        }
+        tokio::fs::rename(&temporary, &wave_path).await?;
+        return Ok(wave_path);
+    }
+    if bytes.starts_with(b"#!SILK_V3") || bytes.starts_with(b"\x02#!SILK_V3") {
+        let wave = tokio::task::spawn_blocking(move || crate::voice::silk_to_wave(&bytes))
+            .await?
+            .with_context(|| format!("解码 SILK 语音失败：{}", path.display()))?;
+        let temporary = root.join(format!(".{:016x}.wav.part", rand::random::<u64>()));
+        tokio::fs::write(&temporary, wave).await?;
+        if let Err(error) = tokio::fs::rename(&temporary, &wave_path).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            if !wave_path.is_file() {
+                return Err(error.into());
+            }
+        }
+        return Ok(wave_path);
+    }
+    Ok(path)
+}
+async fn video_preview(
+    media: &Media,
+    reference: &MediaReference,
+    root: &Path,
+    key: &str,
+) -> Result<PathBuf> {
+    // The video service signs the thumbnail's own index.
+    match media.video_thumbnail_url(reference).await {
+        Ok(url) => return fetch_asset(root, key, &url).await,
+        Err(error) => tracing::debug!(?error, "video thumbnail unavailable"),
+    }
+    #[cfg(feature = "desktop")]
+    {
+        let video = download_video(
+            media,
+            reference,
+            &root.join("videos"),
+            key.trim_start_matches("preview:"),
+        )
+        .await?;
+        let output = video.with_extension("png");
+        if output.is_file() {
+            return Ok(output);
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::video::extract_preview(&video, &output)?;
+            Ok(output)
+        })
+        .await?
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        bail!("Video thumbnail unavailable")
+    }
 }
 async fn download_open(media: &Media, reference: &MediaReference, root: &Path) -> Result<()> {
     tokio::fs::create_dir_all(root).await?;
@@ -691,4 +830,97 @@ async fn send_attachment(
     Ok(messaging
         .send_with_nonce(conversation, vec![element], nonce)
         .await?)
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::fetch_asset;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn downloaded_qq_voice_is_decoded_and_cached_as_wave() {
+        use super::*;
+        use atri_qq::media::{MediaConversation, MediaKind};
+        let root = tempfile::tempdir().unwrap();
+        let pcm = vec![0; 2400 * 2];
+        let silk = atri_qq::voice::encode_silk(&pcm, 24000, 24000, true).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let size = silk.len() as u64;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        silk.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&silk).await.unwrap();
+        });
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let media = Media::new(client);
+        let mut reference = MediaReference::new(
+            MediaKind::Voice,
+            MediaConversation::Friend { uid: "peer".into() },
+        );
+        reference.download_url = Some(format!("http://{address}/voice"));
+        reference.size = size;
+        let wave = download_voice(&media, &reference, root.path(), "voice:test")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let bytes = std::fs::read(&wave).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(bytes.len(), 44 + pcm.len());
+        reference.download_url = Some("http://127.0.0.1:1/unavailable".into());
+        assert_eq!(
+            download_voice(&media, &reference, root.path(), "voice:test")
+                .await
+                .unwrap(),
+            wave
+        );
+    }
+
+    #[tokio::test]
+    async fn avatar_cache_is_bound_to_uin_and_reused_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let received = stream.read(&mut request).await.unwrap();
+            assert!(received > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\navatar",
+                )
+                .await
+                .unwrap();
+        });
+        let path = fetch_asset(
+            root.path(),
+            "avatar:77",
+            &format!("http://{address}/avatar"),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let cached = fetch_asset(root.path(), "avatar:77", "http://127.0.0.1:1/unavailable")
+            .await
+            .unwrap();
+        assert_eq!(path, cached);
+        assert_eq!(std::fs::read(cached).unwrap(), b"avatar");
+        assert!(
+            fetch_asset(root.path(), "avatar:78", "http://127.0.0.1:1/unavailable")
+                .await
+                .is_err()
+        );
+    }
 }

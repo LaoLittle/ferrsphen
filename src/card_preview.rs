@@ -3,6 +3,7 @@ use image::{ImageDecoder as _, ImageReader, RgbaImage, imageops::FilterType};
 use std::path::Path;
 
 pub const FRAMES: usize = 25;
+pub const RASTER_SCALE: u32 = 2;
 pub const COLUMNS: u32 = 5;
 pub const ACTION_HEIGHT: f32 = 32.;
 
@@ -116,9 +117,16 @@ pub fn render(source: &Path, output: &Path, slot: usize, width: u32, height: u32
     let mut image = image::DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
     let picture = image
-        .resize_exact(width.max(1), height.max(1), FilterType::Triangle)
+        .resize_exact(
+            width.max(1) * RASTER_SCALE,
+            height.max(1) * RASTER_SCALE,
+            FilterType::Lanczos3,
+        )
         .to_rgba8();
-    let (cell_width, cell_height) = (picture.width() + 40, picture.height() + 40);
+    let (cell_width, cell_height) = (
+        picture.width() + 40 * RASTER_SCALE,
+        picture.height() + 40 * RASTER_SCALE,
+    );
     let mut sheet = RgbaImage::new(cell_width * COLUMNS, cell_height * COLUMNS);
     for index in 0..FRAMES {
         let angle = angle(slot) * (1. - index as f32 / (FRAMES - 1) as f32);
@@ -136,32 +144,46 @@ pub fn render(source: &Path, output: &Path, slot: usize, width: u32, height: u32
 
 fn tilt(picture: &RgbaImage, angle: f32) -> RgbaImage {
     let (width, height) = picture.dimensions();
-    let mut output = RgbaImage::new(width + 40, height + 40);
+    let padding = 40 * RASTER_SCALE;
+    let mut output = RgbaImage::new(width + padding, height + padding);
     let (sine, cosine) = angle.sin_cos();
-    let radius = 8_f32.min(width.min(height) as f32 / 2.);
+    let radius = ((8 * RASTER_SCALE) as f32).min(width.min(height) as f32 / 2.);
     for (x, y, pixel) in output.enumerate_pixels_mut() {
-        let dx = x as f32 - (width + 40) as f32 / 2.;
-        let dy = y as f32 - (height + 40) as f32 / 2.;
+        let dx = x as f32 + 0.5 - (width + padding) as f32 / 2.;
+        let dy = y as f32 + 0.5 - (height + padding) as f32 / 2.;
         let sx = cosine * dx + sine * dy + width as f32 / 2.;
         let sy = -sine * dx + cosine * dy + height as f32 / 2.;
-        if sx < 0. || sy < 0. || sx >= width as f32 || sy >= height as f32 {
+        let qx = (sx - width as f32 / 2.).abs() - (width as f32 / 2. - radius);
+        let qy = (sy - height as f32 / 2.).abs() - (height as f32 / 2. - radius);
+        let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius;
+        let coverage = (0.5 - distance).clamp(0., 1.);
+        if coverage == 0. {
             continue;
         }
-        let corner_x = (sx - sx.clamp(radius, width as f32 - radius)).abs();
-        let corner_y = (sy - sy.clamp(radius, height as f32 - radius)).abs();
-        if corner_x * corner_x + corner_y * corner_y > radius * radius {
-            continue;
-        }
-        let ix = sx.floor() as u32;
-        let iy = sy.floor() as u32;
-        let (nx, ny) = ((ix + 1).min(width - 1), (iy + 1).min(height - 1));
+        let sx = (sx - 0.5).clamp(0., width as f32 - 1.);
+        let sy = (sy - 0.5).clamp(0., height as f32 - 1.);
+        let (ix, iy) = (sx.floor() as u32, sy.floor() as u32);
         let (fx, fy) = (sx.fract(), sy.fract());
-        for channel in 0..4 {
-            pixel[channel] = ((1. - fx) * (1. - fy) * picture.get_pixel(ix, iy)[channel] as f32
-                + fx * (1. - fy) * picture.get_pixel(nx, iy)[channel] as f32
-                + (1. - fx) * fy * picture.get_pixel(ix, ny)[channel] as f32
-                + fx * fy * picture.get_pixel(nx, ny)[channel] as f32)
-                .round() as u8;
+        let mut alpha = 0.;
+        let mut color = [0.; 3];
+        for (x, y, weight) in [
+            (ix, iy, (1. - fx) * (1. - fy)),
+            ((ix + 1).min(width - 1), iy, fx * (1. - fy)),
+            (ix, (iy + 1).min(height - 1), (1. - fx) * fy),
+            ((ix + 1).min(width - 1), (iy + 1).min(height - 1), fx * fy),
+        ] {
+            let sample = picture.get_pixel(x, y);
+            let weighted_alpha = weight * sample[3] as f32 / 255.;
+            alpha += weighted_alpha;
+            for channel in 0..3 {
+                color[channel] += sample[channel] as f32 * weighted_alpha;
+            }
+        }
+        if alpha > 0. {
+            for channel in 0..3 {
+                pixel[channel] = (color[channel] / alpha).round() as u8;
+            }
+            pixel[3] = (alpha * coverage * 255.).round() as u8;
         }
     }
     output
@@ -229,10 +251,20 @@ mod tests {
         super::render(&source, &preview, 2, 80, 120).unwrap();
         assert_eq!(std::fs::read(source).unwrap(), bytes);
         let sheet = image::open(preview).unwrap().to_rgba8();
-        assert_eq!(sheet.dimensions(), (600, 800));
+        assert_eq!(sheet.dimensions(), (1200, 1600));
         let cell = |index: u32| {
-            image::imageops::crop_imm(&sheet, index % 5 * 120, index / 5 * 160, 120, 160).to_image()
+            image::imageops::crop_imm(&sheet, index % 5 * 240, index / 5 * 320, 240, 320).to_image()
         };
+        let tilted = cell(0);
+        let edge = tilted
+            .pixels()
+            .filter(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            .collect::<Vec<_>>();
+        assert!(edge.len() > 100, "rotated edges need fractional coverage");
+        assert!(
+            edge.iter()
+                .all(|pixel| pixel[0] == 20 && pixel[1] == 80 && pixel[2] == 180)
+        );
         assert_ne!(cell(0), cell(12));
         assert_ne!(cell(12), cell(24));
         assert_eq!(super::frame(0.5), 12);

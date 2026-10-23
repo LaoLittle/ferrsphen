@@ -46,6 +46,59 @@ mod tests {
         assert_eq!(&wav[44..], &[0, 0, 255, 127]);
         assert!(pcm_to_wave(&[0], 24000).is_err());
     }
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn silk_voice_plays_pauses_and_reaches_end_without_audio_output() {
+        use alhazen_core::{
+            Player, PlayerConfig, PlayerState, Source,
+            audio::{AudioOutputConfig, NullOutput},
+        };
+        use std::time::{Duration, Instant};
+        let pcm = (0..12000)
+            .flat_map(|i| {
+                let value =
+                    ((std::f64::consts::TAU * 440. * i as f64 / 24000.).sin() * 6000.) as i16;
+                value.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        let silk = atri_qq::voice::encode_silk(&pcm, 24000, 24000, true).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("voice.wav");
+        std::fs::write(&path, silk_to_wave(&silk).unwrap()).unwrap();
+        let output = NullOutput::new(24000, 1);
+        let player = Player::open(
+            Source::File(path),
+            PlayerConfig {
+                audio_output: AudioOutputConfig::Null(output.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!player.has_video());
+        assert_eq!(player.duration().unwrap(), Duration::from_millis(500));
+        player.play();
+        let started = Instant::now();
+        let mut audible = false;
+        while player.position() < Duration::from_millis(80) {
+            let _ = player.current_frame();
+            audible |= output.pull(240).iter().any(|sample| sample.abs() > 0.001);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        player.pause();
+        let paused = player.position();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(player.position().abs_diff(paused) < Duration::from_millis(10));
+        assert!(output.pull(240).iter().all(|sample| *sample == 0.));
+        player.play();
+        while !matches!(player.state(), PlayerState::Ended) {
+            let _ = player.current_frame();
+            audible |= output.pull(240).iter().any(|sample| sample.abs() > 0.001);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(audible);
+    }
     #[test]
     fn qq_voice_codec_produces_a_mono_wave_with_the_padded_duration() {
         let samples = 1201usize;

@@ -10,3 +10,12 @@ pub mod viewer;
 
 #[cfg(feature = "desktop")]
 pub mod video;
+
+#[cfg(feature = "desktop")]
+pub mod audio;
+
+#[cfg(feature = "desktop")]
+pub mod window_chrome;
+
+pub mod packet_log;
+pub mod search;

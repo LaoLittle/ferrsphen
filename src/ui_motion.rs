@@ -71,8 +71,10 @@ pub fn card_frame(
             };
             let dimensions = image.size(0);
             let columns = crate::card_preview::COLUMNS as f32;
-            let width = dimensions.width.0 as f32 / columns * scale;
-            let height = dimensions.height.0 as f32 / columns * scale;
+            let width = dimensions.width.0 as f32 / columns * scale
+                / crate::card_preview::RASTER_SCALE as f32;
+            let height = dimensions.height.0 as f32 / columns * scale
+                / crate::card_preview::RASTER_SCALE as f32;
             let image_bounds = Bounds::new(
                 point(
                     bounds.center().x - px(width / 2. + index as f32 % columns * width),

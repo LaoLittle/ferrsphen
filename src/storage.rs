@@ -46,7 +46,21 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+    pub fn user_uin(&self, account: u64, uid: &str) -> Result<Option<u64>> {
+        Ok(self
+            .get::<u64>(&format!("user-uin/{account}/{}", hex::encode(uid)))?
+            .filter(|uin| *uin != 0))
+    }
+    pub async fn save_user_uin(&self, account: u64, uid: &str, uin: u64) -> Result<()> {
+        anyhow::ensure!(!uid.is_empty() && uin != 0, "Invalid user identity");
+        self.put(&format!("user-uin/{account}/{}", hex::encode(uid)), &uin)
+            .await
+    }
     pub async fn save_message(&self, account: u64, message: &Message) -> Result<()> {
+        if message.is_recalled() {
+            self.save_recall(account, &message.conversation, message.sequence)
+                .await?;
+        }
         let key = format!(
             "message/{account}/{}/{:020}/{:020}/{:020}",
             hex::encode(crate::model::conversation_key(&message.conversation).as_bytes()),

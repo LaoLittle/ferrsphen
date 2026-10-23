@@ -23,7 +23,7 @@ ciborium = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rand = "0.8"
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -31,6 +31,7 @@ toml = "1.1"
 anyhow = "1"
 open = "5"
 qrcode = { version = "0.14", default-features = false }
+pinyin = { version = "0.11", default-features = false, features = ["plain"] }
 
 [dev-dependencies]
 tempfile = "3"

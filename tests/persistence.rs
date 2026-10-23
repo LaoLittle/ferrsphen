@@ -580,3 +580,141 @@ fn quoted_content_roundtrips_without_loaded_history() {
     assert!(ferrsphen::model::reply_target(&[impostor], reply).is_none());
     assert_eq!(model.reply_preview(&item.conversation, reply).raw, item.raw);
 }
+
+fn historical_tombstone() -> Message {
+    let mut item = message();
+    item.elements.clear();
+    item.metadata.clear();
+    item.raw = vec![0x0a, 6, 8, 7, 0x42, 2, 8, 42, 0x12, 4, 8, 82, 0x28, 15];
+    item
+}
+#[test]
+fn history_tombstone_marks_recall_even_when_richer_cached_content_is_kept() {
+    let mut model = Model::default();
+    let mut original = message();
+    original.raw = vec![1; 100];
+    model.receive(original.clone(), false);
+    model.receive(historical_tombstone(), false);
+    assert_eq!(model.messages["group:42"].len(), 1);
+    assert!(model.is_recalled(&model.messages["group:42"][0]));
+    assert_eq!(model.messages["group:42"][0].raw, original.raw);
+    model.receive(original, false);
+    assert!(model.is_recalled(&model.messages["group:42"][0]));
+}
+#[tokio::test]
+async fn history_recall_survives_restart_and_an_older_cache_write() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    db.save_message(1, &historical_tombstone()).await.unwrap();
+    assert_eq!(
+        db.get::<String>(&format!("recall/1/{}", hex::encode("group:42:15")))
+            .unwrap()
+            .as_deref(),
+        Some("group:42:15")
+    );
+    db.save_message(1, &message()).await.unwrap();
+    db.close().await.unwrap();
+    drop(db);
+    let db = Database::open(root.path()).unwrap();
+    let model = db.restore(1).unwrap();
+    assert_eq!(model.messages["group:42"].len(), 1);
+    assert!(model.is_recalled(&model.messages["group:42"][0]));
+    assert!(db.restore(2).unwrap().recalled.is_empty());
+    db.close().await.unwrap();
+}
+#[tokio::test]
+async fn legacy_cached_tombstone_is_recognized_without_a_saved_recall_event() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    let item = historical_tombstone();
+    db.put(
+        &format!(
+            "message/1/{}/{:020}/{:020}/{:020}",
+            hex::encode("group:42"),
+            item.time,
+            item.sequence,
+            item.message_id
+        ),
+        &item,
+    )
+    .await
+    .unwrap();
+    let model = db.restore(1).unwrap();
+    assert!(model.is_recalled(&model.messages["group:42"][0]));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn private_recall_matches_server_sequence_after_restoring_legacy_wire_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    let mut item = message();
+    item.conversation = Conversation::Friend {
+        uin: 7,
+        uid: "peer".into(),
+    };
+    item.sequence = 444;
+    item.client_sequence = 333;
+    item.raw = vec![
+        0x0a, 2, 8, 7, 0x12, 9, 8, 0xa6, 1, 0x28, 0xbc, 3, 0x58, 0xcd, 2,
+    ];
+    db.save_message(1, &item).await.unwrap();
+    db.save_recall(
+        1,
+        &Conversation::Friend {
+            uin: 0,
+            uid: "peer".into(),
+        },
+        333,
+    )
+    .await
+    .unwrap();
+    let model = db.restore(1).unwrap();
+    let restored = &model.messages["dm:uid:peer"][0];
+    assert_eq!((restored.sequence, restored.client_sequence), (333, 444));
+    assert!(model.is_recalled(restored));
+    assert_eq!(Reply::from(restored).sequences, [444]);
+    assert!(
+        ferrsphen::model::reply_target(&model.messages["dm:uid:peer"], &Reply::from(restored))
+            .is_some()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn avatar_identity_cache_survives_restart_and_is_account_scoped() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    assert!(db.user_uin(1, "peer").unwrap().is_none());
+    db.save_user_uin(1, "peer", 77).await.unwrap();
+    assert!(db.save_user_uin(1, "bad", 0).await.is_err());
+    db.close().await.unwrap();
+    drop(db);
+    let db = Database::open(root.path()).unwrap();
+    assert_eq!(db.user_uin(1, "peer").unwrap(), Some(77));
+    assert!(db.user_uin(2, "peer").unwrap().is_none());
+    db.close().await.unwrap();
+}
+
+#[test]
+fn conversation_preview_only_prefixes_other_group_members() {
+    let mut model = Model::default();
+    let mut row = message();
+    row.elements = vec![MessageElement::Text("消息".into())];
+    let group = row.conversation.clone();
+    model.receive(row.clone(), false);
+    assert_eq!(model.chat_preview(&group), "默认: 消息");
+    model.members.insert(42, vec![member()]);
+    assert_eq!(model.chat_preview(&group), "群名片: 消息");
+    model.friends.push(friend());
+    assert_eq!(model.chat_preview(&group), "好友: 消息");
+    model.messages.get_mut("group:42").unwrap()[0].is_self = true;
+    assert_eq!(model.chat_preview(&group), "消息");
+    row.conversation = Conversation::Friend {
+        uin: 7,
+        uid: "u_peer".into(),
+    };
+    let direct = row.conversation.clone();
+    model.receive(row, false);
+    assert_eq!(model.chat_preview(&direct), "消息");
+}

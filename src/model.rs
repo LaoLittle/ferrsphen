@@ -46,6 +46,7 @@ pub struct Model {
     pub friends: Vec<Friend>,
     pub groups: Vec<Group>,
     pub members: HashMap<u64, Vec<GroupMember>>,
+    pub resolved_uins: HashMap<String, u64>,
     pub announcements: HashMap<u64, Result<Vec<GroupAnnouncement>, String>>,
     pub messages: HashMap<String, Vec<Message>>,
     pub history: HashMap<String, History>,
@@ -55,6 +56,26 @@ pub struct Model {
     pub recalled: HashSet<String>,
 }
 impl Model {
+    pub fn chat_preview(&self, conversation: &Conversation) -> String {
+        let Some(message) = self
+            .messages
+            .get(&conversation_key(conversation))
+            .and_then(|rows| rows.last())
+        else {
+            return String::new();
+        };
+        let preview = if self.is_recalled(message) {
+            "[已撤回]".into()
+        } else {
+            summary(&message.elements)
+        };
+        if matches!(conversation, Conversation::Group { .. }) && !message.is_self {
+            format!("{}: {preview}", self.sender_name(message))
+        } else {
+            preview
+        }
+    }
+
     pub fn sorted_chats(&self) -> Vec<&Chat> {
         let mut chats = self.chats.iter().collect::<Vec<_>>();
         chats.sort_by_cached_key(|chat| {
@@ -211,8 +232,19 @@ impl Model {
         }
         self.receive(message, false);
     }
-    pub fn receive(&mut self, message: Message, live: bool) {
+    pub fn is_recalled(&self, message: &Message) -> bool {
+        self.recalled.contains(&format!(
+            "{}:{}",
+            conversation_key(&message.conversation),
+            message.sequence
+        )) || message.is_recalled()
+    }
+    pub fn receive(&mut self, mut message: Message, live: bool) {
+        message.normalize_identity();
         let key = conversation_key(&message.conversation);
+        if message.is_recalled() {
+            self.recalled.insert(format!("{key}:{}", message.sequence));
+        }
         if !self
             .chats
             .iter()
@@ -251,9 +283,16 @@ impl Model {
         if let Some(friend) = self
             .friends
             .iter()
-            .find(|friend| friend.uid == message.sender_uid)
+            .find(|friend| friend.uin != 0 && friend.uid == message.sender_uid)
         {
             return friend.uin;
+        }
+        if let Some(uin) = self
+            .resolved_uins
+            .get(&message.sender_uid)
+            .filter(|uin| **uin != 0)
+        {
+            return *uin;
         }
         if let Conversation::Group { uin } = message.conversation
             && let Some(member) = self.members.get(&uin).and_then(|members| {
@@ -264,7 +303,15 @@ impl Model {
         {
             return member.uin;
         }
-        0
+        self.members
+            .values()
+            .flatten()
+            .find(|member| {
+                member.uin != 0
+                    && !message.sender_uid.is_empty()
+                    && member.uid == message.sender_uid
+            })
+            .map_or(0, |member| member.uin)
     }
     pub fn sender_name(&self, message: &Message) -> String {
         if message.is_self && !matches!(message.conversation, Conversation::Group { .. }) {
@@ -313,7 +360,9 @@ pub fn reply_target<'a>(messages: &'a [Message], reply: &Reply) -> Option<&'a Me
             true
         };
         sender
-            && ((message.sequence != 0 && reply.sequences.contains(&message.sequence))
+            && ((message.reply_sequence() != 0
+                && reply.sequences.contains(&message.reply_sequence()))
+                || (message.sequence != 0 && reply.sequences.contains(&message.sequence))
                 || (reply.message_id != 0 && reply.message_id == message.message_id))
     })
 }

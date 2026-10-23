@@ -17,6 +17,52 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub fn extract_preview(source: &std::path::Path, output: &std::path::Path) -> anyhow::Result<()> {
+    let player = Player::open(
+        Source::File(source.to_owned()),
+        PlayerConfig {
+            audio_output: alhazen_core::audio::AudioOutputConfig::Disabled,
+            max_output_size: Some((768, 704)),
+            ..Default::default()
+        },
+    )?;
+    let started = Instant::now();
+    loop {
+        if let Some(VideoFrame::Cpu {
+            width,
+            height,
+            bgra,
+            ..
+        }) = player.current_frame()
+        {
+            let mut rgba = bgra.to_vec();
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            let image = image::RgbaImage::from_raw(width, height, rgba)
+                .ok_or_else(|| anyhow::anyhow!("Invalid video frame dimensions"))?;
+            let temporary =
+                output.with_file_name(format!(".{:016x}.png.part", rand::random::<u64>()));
+            image.save_with_format(&temporary, image::ImageFormat::Png)?;
+            if let Err(error) = std::fs::rename(&temporary, output) {
+                let _ = std::fs::remove_file(&temporary);
+                if !output.is_file() {
+                    return Err(error.into());
+                }
+            }
+            return Ok(());
+        }
+        if let PlayerState::Error(error) = player.state() {
+            anyhow::bail!("{error:?}");
+        }
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Video preview timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub struct VideoView {
     player: Option<Player>,
     frame: Option<(Arc<RenderImage>, Arc<[u8]>)>,
@@ -270,7 +316,7 @@ impl Render for VideoView {
                     .update(cx, |state, cx| state.set_value(fraction, window, cx));
             }
         }
-        div()
+        let content = div()
             .id("video-player")
             .track_focus(&self.focus)
             .flex()
@@ -297,17 +343,9 @@ impl Render for VideoView {
                 cx.notify();
             }))
             .child(
-                div()
+                crate::window_chrome::title_bar(cx)
                     .h_12()
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, |event, window, _| {
-                        if event.click_count == 2 {
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    }),
+                    .child(div().flex_1()),
             )
             .child(
                 div()
@@ -428,7 +466,8 @@ impl Render for VideoView {
                                     .on_click(|_, window, _| window.toggle_fullscreen()),
                             ),
                     ),
-            )
+            );
+        crate::window_chrome::surface(content, window, cx)
     }
 }
 fn timestamp(duration: Duration) -> String {
@@ -496,6 +535,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let preview = directory.path().join("preview.png");
+        super::extract_preview(&path, &preview).unwrap();
+        let image = image::open(preview).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (160, 90));
+        assert!(image.pixels().any(|pixel| pixel[0].abs_diff(pixel[2]) > 60));
         let player = Player::open(
             Source::File(path),
             PlayerConfig {

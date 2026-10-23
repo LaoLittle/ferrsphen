@@ -6,11 +6,6 @@ use gpui_kit::{
 };
 use std::path::PathBuf;
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
@@ -26,6 +21,8 @@ fn main() {
             }
         }
     }
+    let packet_log = ferrsphen::packet_log::init(&root).expect("初始化 packet 日志失败");
+    tracing::info!(path = %packet_log.display(), "Packet log");
     let mut backend = Backend::start(root);
     let receiver = backend.updates.take().expect("updates");
     let commands = backend.commands.clone();
@@ -41,6 +38,7 @@ fn main() {
             })
             .detach();
             gpui_kit::init(cx);
+            ferrsphen::window_chrome::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             cx.set_window_appearance(Some(WindowAppearance::Dark));
             Theme::update(cx, |theme| {
@@ -64,14 +62,8 @@ fn main() {
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(1240.), px(820.)), cx)),
-                    app_owns_titlebar_drag: true,
                     window_min_size: Some(size(px(880.), px(580.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("ferrsphen".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.), px(20.))),
-                    }),
-                    ..Default::default()
+                    ..ferrsphen::window_chrome::options("ferrsphen")
                 },
                 cx,
                 |window, cx| cx.new(|cx| view::AppView::new(commands, receiver, window, cx)),

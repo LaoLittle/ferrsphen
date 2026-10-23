@@ -66,10 +66,30 @@ struct ReplyJump {
     layout_frames: u8,
     motion: Option<(SpringState, Instant)>,
 }
+struct RecallTween {
+    original: gpui_kit::Size<Pixels>,
+    started: Instant,
+}
+impl RecallTween {
+    fn state(&self, now: Instant) -> SpringState {
+        SpringConfig::new(280., 30., 1.).step(
+            SpringState {
+                position: 0.,
+                velocity: 0.,
+            },
+            1.,
+            now.saturating_duration_since(self.started).as_secs_f32(),
+        )
+    }
+}
+#[derive(Clone)]
 struct TimelineAnchor {
+    conversation: String,
+    follow_tail: bool,
     message: String,
     top: Pixels,
     layout_frames: u8,
+    settle_frames: u8,
 }
 struct ConversationSwitch {
     destination: Conversation,
@@ -83,7 +103,7 @@ struct DetailWindow {
 }
 impl Render for DetailWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.owner.update(cx, |owner, cx| match self.kind {
+        let content = self.owner.update(cx, |owner, cx| match self.kind {
             DetailKind::Image => {
                 if owner.viewer.is_some() {
                     owner.image_viewer(window, cx)
@@ -95,7 +115,8 @@ impl Render for DetailWindow {
                 owner.advance_reply_jump(true, window, cx);
                 owner.forward_view(window, cx)
             }
-        })
+        });
+        ferrsphen::window_chrome::surface(content, window, cx)
     }
 }
 pub struct AppView {
@@ -106,9 +127,14 @@ pub struct AppView {
     expanded_images: HashSet<String>,
     card_textures: Entity<CardTextureCache>,
     bubble_sizes: Rc<RefCell<HashMap<String, gpui_kit::Size<Pixels>>>>,
+    visible_bubbles: Rc<RefCell<HashMap<String, gpui_kit::Size<Pixels>>>>,
+    recall_tweens: HashMap<String, RecallTween>,
+    recall_animating: bool,
+    recall_clock: BackgroundExecutor,
     viewer_window: Option<AnyWindowHandle>,
     video_windows: HashMap<String, AnyWindowHandle>,
     video_results: HashMap<String, Result<PathBuf, String>>,
+    voice_player: Entity<ferrsphen::audio::VoicePlayer>,
     forward_window: Option<AnyWindowHandle>,
     forward_key: Option<String>,
     forward_error: Option<String>,
@@ -119,6 +145,7 @@ pub struct AppView {
     account: Entity<InputState>,
     password: Entity<InputState>,
     search: Entity<InputState>,
+    search_index: RefCell<ferrsphen::search::SearchIndex>,
     composer: Entity<TextareaState>,
     challenge: Option<atri_qq::LoginChallenge>,
     ticket: Entity<InputState>,
@@ -131,6 +158,7 @@ pub struct AppView {
     assets: HashMap<String, PathBuf>,
     requested: HashSet<String>,
     scroll: ScrollHandle,
+    lazy_heights: Rc<RefCell<HashMap<String, Pixels>>>,
     bounce: Bounce,
     bounce_animating: bool,
     scroll_anchor: Option<TimelineAnchor>,
@@ -231,9 +259,12 @@ impl AppView {
         let message = groups.get(index)?.first()?;
         let bounds = self.scroll.bounds_for_item(index)?;
         Some(TimelineAnchor {
+            conversation: self.model.selected.clone()?,
+            follow_tail: false,
             message: message_key(message),
             top: bounds.top() + self.scroll.offset().y - self.scroll.bounds().top(),
             layout_frames: 1,
+            settle_frames: 6,
         })
     }
 
@@ -241,6 +272,9 @@ impl AppView {
         let Some(mut anchor) = self.scroll_anchor.take() else {
             return;
         };
+        if self.model.selected.as_ref() != Some(&anchor.conversation) {
+            return;
+        }
         if anchor.layout_frames > 0 {
             anchor.layout_frames -= 1;
             self.scroll_anchor = Some(anchor);
@@ -278,6 +312,17 @@ impl AppView {
             let y = (self.scroll.bounds().top() + anchor.top - bounds.top() - px(offset))
                 .clamp(-self.scroll.max_offset().y.max(px(0.)), px(0.));
             self.scroll.set_offset(point(self.scroll.offset().x, y));
+        }
+        if anchor.follow_tail {
+            self.scroll.set_offset(point(
+                self.scroll.offset().x,
+                -self.scroll.max_offset().y.max(px(0.)),
+            ));
+        }
+        if anchor.settle_frames > 0 {
+            anchor.settle_frames -= 1;
+            self.scroll_anchor = Some(anchor);
+            window.request_animation_frame();
         }
         self.request_assets();
     }
@@ -378,11 +423,7 @@ impl AppView {
     }
 
     fn reply_card(&self, message: &Message, cx: &mut Context<Self>) -> AnyElement {
-        let recalled = self.model.recalled.contains(&format!(
-            "{}:{}",
-            conversation_key(&message.conversation),
-            message.sequence
-        ));
+        let recalled = self.model.is_recalled(message);
         let images = if recalled {
             Vec::new()
         } else {
@@ -627,7 +668,9 @@ impl AppView {
         });
         let ticket = cx.new(|cx| InputState::new(window, cx).placeholder("ticket"));
         let captcha_random = cx.new(|cx| InputState::new(window, cx).placeholder("randstr"));
+        let voice_player = ferrsphen::audio::VoicePlayer::new(cx);
         let subscriptions = vec![
+            cx.observe(&voice_player, |_, _, cx| cx.notify()),
             cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
             cx.subscribe_in(&password, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -660,7 +703,20 @@ impl AppView {
             while let Some(update) = updates.recv().await {
                 if this
                     .update(cx, |this, cx| {
-                        this.apply(update);
+                        match update {
+                            Update::Voice { key, result } => this
+                                .voice_player
+                                .update(cx, |player, cx| player.complete(key, result, cx)),
+                            update => {
+                                if matches!(
+                                    update,
+                                    Update::Offline(_) | Update::Connecting | Update::LoginRequired
+                                ) {
+                                    this.voice_player.update(cx, |player, cx| player.stop(cx));
+                                }
+                                this.apply(update);
+                            }
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -677,9 +733,14 @@ impl AppView {
             expanded_images: HashSet::new(),
             card_textures: CardTextureCache::new(cx),
             bubble_sizes: Rc::new(RefCell::new(HashMap::new())),
+            visible_bubbles: Rc::new(RefCell::new(HashMap::new())),
+            recall_tweens: HashMap::new(),
+            recall_animating: false,
+            recall_clock: cx.background_executor().clone(),
             viewer_window: None,
             video_windows: HashMap::new(),
             video_results: HashMap::new(),
+            voice_player,
             forward_window: None,
             forward_key: None,
             forward_error: None,
@@ -690,6 +751,7 @@ impl AppView {
             account,
             password,
             search,
+            search_index: RefCell::default(),
             composer,
             challenge: None,
             ticket,
@@ -702,6 +764,7 @@ impl AppView {
             assets: HashMap::new(),
             requested: HashSet::new(),
             scroll: ScrollHandle::new(),
+            lazy_heights: Rc::default(),
             bounce: Bounce::default(),
             bounce_animating: false,
             scroll_anchor: None,
@@ -727,12 +790,93 @@ impl AppView {
             true
         }
     }
+    fn mark_recalled(&mut self, conversation: &Conversation, sequence: u64) {
+        let conversation = conversation_key(conversation);
+        if !self
+            .model
+            .recalled
+            .insert(format!("{conversation}:{sequence}"))
+        {
+            return;
+        }
+        if !matches!(self.phase, Phase::Chat)
+            || self.page != Page::Chat
+            || self.transition.is_some()
+            || self.model.selected.as_ref() != Some(&conversation)
+        {
+            return;
+        }
+        if let Some(message) = self
+            .model
+            .messages
+            .get(&conversation)
+            .and_then(|rows| rows.iter().find(|message| message.sequence == sequence))
+        {
+            let key = message_key(message);
+            if let Some(original) = self.visible_bubbles.borrow().get(&key).copied() {
+                self.recall_tweens.insert(
+                    key,
+                    RecallTween {
+                        original,
+                        started: self.recall_clock.now(),
+                    },
+                );
+            }
+        }
+    }
+    fn animate_recalls(&mut self, cx: &mut Context<Self>) {
+        if cx.reduce_motion()
+            || self.page != Page::Chat
+            || !matches!(self.phase, Phase::Chat)
+            || self.transition.is_some()
+        {
+            self.recall_tweens.clear();
+        }
+        let now = cx.background_executor().now();
+        self.recall_tweens.retain(|_, tween| {
+            !SpringConfig::new(280., 30., 1.).is_settled(tween.state(now), 1., 0.001)
+        });
+        if self.recall_animating || self.recall_tweens.is_empty() {
+            return;
+        }
+        self.recall_animating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let now = cx.background_executor().now();
+                        this.recall_tweens.retain(|key, tween| {
+                            this.visible_bubbles.borrow().contains_key(key)
+                                && !SpringConfig::new(280., 30., 1.).is_settled(
+                                    tween.state(now),
+                                    1.,
+                                    0.001,
+                                )
+                        });
+                        this.recall_animating = !this.recall_tweens.is_empty();
+                        cx.notify();
+                        this.recall_animating
+                    })
+                    .ok()
+                    != Some(true)
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     fn apply(&mut self, update: Update) {
         if matches!(
             &update,
             Update::Connecting | Update::LoginRequired | Update::Challenge(_)
         ) {
             self.transition = None;
+            self.recall_tweens.clear();
+            self.visible_bubbles.borrow_mut().clear();
             self.scroll_anchor = None;
             self.bounce = Bounce::default();
         }
@@ -782,6 +926,9 @@ impl AppView {
                     self.forward_error = None;
                     self.expanded_images.clear();
                     self.bubble_sizes.borrow_mut().clear();
+                    self.lazy_heights.borrow_mut().clear();
+                    self.recall_tweens.clear();
+                    self.visible_bubbles.borrow_mut().clear();
                     self.fades.clear();
                     self.reply_jump = None;
                     self.reply = None;
@@ -790,6 +937,7 @@ impl AppView {
                     self.details = None;
                     self.retries.clear();
                 }
+                self.requested.retain(|key| !key.starts_with("avatar-uid:"));
                 self.challenge = None;
                 self.phase = Phase::Chat;
                 self.model.profile = Some(profile);
@@ -802,6 +950,8 @@ impl AppView {
             }
             Update::Restored(model) => {
                 self.transition = None;
+                self.recall_tweens.clear();
+                self.visible_bubbles.borrow_mut().clear();
                 self.scroll_anchor = None;
                 self.reply_jump = None;
                 self.bounce = Bounce::default();
@@ -913,9 +1063,16 @@ impl AppView {
                     }
                 }
             },
+            Update::Voice { .. } => {}
             Update::Video { key, result } => {
                 self.video_results.insert(key, result);
             }
+            Update::UserUin { uid, result } => match result {
+                Ok(uin) => {
+                    self.model.resolved_uins.insert(uid, uin);
+                }
+                Err(error) => tracing::warn!(%uid, %error, "resolve avatar UIN failed"),
+            },
             Update::Asset { key, path } => {
                 self.assets.insert(key, path);
             }
@@ -935,9 +1092,7 @@ impl AppView {
                 conversation,
                 sequence,
             } => {
-                self.model
-                    .recalled
-                    .insert(format!("{}:{sequence}", conversation_key(&conversation)));
+                self.mark_recalled(&conversation, sequence);
             }
             Update::Notification(event) => {
                 if let PushEvent::Recall {
@@ -946,9 +1101,7 @@ impl AppView {
                     ..
                 } = &event
                 {
-                    self.model
-                        .recalled
-                        .insert(format!("{}:{sequence}", conversation_key(conversation)));
+                    self.mark_recalled(conversation, *sequence);
                 }
             }
             Update::Error(error) => self.error = Some(error),
@@ -966,7 +1119,7 @@ impl AppView {
         self.command(Command::SaveChats(self.model.chats.clone()));
     }
     fn asset(&mut self, key: String, url: String) {
-        if self.requested.contains(&key) {
+        if self.requested.contains(&key) || self.assets.contains_key(&key) {
             return;
         }
         if self.command(Command::Asset {
@@ -1042,13 +1195,24 @@ impl AppView {
         for (key, url) in chat_avatars {
             self.asset(key, url);
         }
-        if let Some(messages) = &self.forward {
-            avatars.extend(
-                messages
-                    .iter()
-                    .take(80)
-                    .map(|message| self.model.sender_uin(message)),
-            );
+        let avatar_senders = self
+            .forward
+            .iter()
+            .flatten()
+            .take(80)
+            .chain(self.visible_groups(false).into_iter().flatten())
+            .chain(self.visible_groups(true).into_iter().flatten())
+            .map(|message| (self.model.sender_uin(message), message.sender_uid.clone()))
+            .collect::<Vec<_>>();
+        for (uin, uid) in avatar_senders {
+            if uin > 0 {
+                avatars.push(uin);
+            } else if !uid.is_empty() {
+                let key = format!("avatar-uid:{uid}");
+                if !self.requested.contains(&key) && self.command(Command::ResolveUser { uid }) {
+                    self.requested.insert(key);
+                }
+            }
         }
         for uin in avatars {
             if uin > 0 {
@@ -1153,6 +1317,31 @@ impl AppView {
             .take(50)
             .chain(self.visible_groups(false).into_iter().flatten())
             .chain(self.visible_groups(true).into_iter().flatten())
+            .collect::<Vec<_>>();
+        let videos = visible
+            .iter()
+            .copied()
+            .chain(self.forward.iter().flatten().take(80))
+            .flat_map(|message| {
+                message
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, element)| {
+                        if let MessageElement::Video(reference) = element {
+                            Some((
+                                format!(
+                                    "preview:video:{}:{}:{index}",
+                                    conversation_key(&message.conversation),
+                                    message.sequence
+                                ),
+                                reference.clone(),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+            })
             .collect::<Vec<_>>();
         let mut quotes = visible
             .iter()
@@ -1291,6 +1480,16 @@ impl AppView {
                 self.requested.insert(key);
             }
         }
+        for (key, reference) in videos {
+            if !self.requested.contains(&key)
+                && self.command(Command::VideoPreview {
+                    key: key.clone(),
+                    reference,
+                })
+            {
+                self.requested.insert(key);
+            }
+        }
         for (key, reference) in previews {
             if !self.requested.contains(&key)
                 && self.command(Command::Preview {
@@ -1328,6 +1527,8 @@ impl AppView {
             cx.notify();
             return;
         }
+        self.recall_tweens.clear();
+        self.visible_bubbles.borrow_mut().clear();
         if self.model.selected.is_none() || cx.reduce_motion() {
             self.transition = None;
             self.commit_select(conversation, window, cx);
@@ -1357,6 +1558,8 @@ impl AppView {
     ) {
         self.bounce = Bounce::default();
         self.scroll_anchor = None;
+        self.recall_tweens.clear();
+        self.visible_bubbles.borrow_mut().clear();
         self.model.selected = Some(conversation_key(&conversation));
         if let Some(chat) = self.model.chats.iter_mut().find(|chat| {
             Some(&conversation_key(&chat.conversation)) == self.model.selected.as_ref()
@@ -1480,6 +1683,7 @@ impl AppView {
         }
         self.reply = None;
         self.reply_jump = None;
+        self.scroll_anchor = None;
         elements.push(MessageElement::Text(text.clone()));
         self.sequence += 1;
         let id = self.sequence;
@@ -1585,7 +1789,9 @@ impl AppView {
         self.avatar_for(&format!("avatar:{uin}"), name, cx)
     }
     fn avatar_for(&self, key: &str, name: &str, cx: &App) -> AnyElement {
+        let avatar_key = key.to_owned();
         let base = div()
+            .debug_selector(move || avatar_key.clone())
             .flex()
             .items_center()
             .justify_center()
@@ -1748,33 +1954,19 @@ impl AppView {
             .selected_chat()
             .is_some_and(|chat| matches!(chat.conversation, Conversation::Group { .. }))
     }
-    fn topbar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn topbar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let (profile_name, uin) = self
             .model
             .profile
             .as_ref()
             .map(|profile| (profile.nickname.clone(), profile.uin))
             .unwrap_or_default();
-        div()
-            .flex()
-            .h(rems(3.5))
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-            })
-            .flex_shrink_0()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
+        ferrsphen::window_chrome::title_bar(cx)
             .child(
                 div()
                     .w_72()
                     .flex_shrink_0()
-                    .pl(px(88.))
+                    .pl(ferrsphen::window_chrome::leading_inset(window))
                     .pr_3()
                     .flex()
                     .items_center()
@@ -1841,6 +2033,10 @@ impl AppView {
                             .accessibility_label(label)
                             .when(self.page == page, |button| button.bg(cx.theme().accent))
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.page != page {
+                                    this.recall_tweens.clear();
+                                    this.visible_bubbles.borrow_mut().clear();
+                                }
                                 this.page = page;
                                 window.blur(cx);
                                 cx.notify();
@@ -1853,82 +2049,24 @@ impl AppView {
 
     fn chat_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search.read(cx).value().to_lowercase();
-        let rows = self
+        let chats = self
             .model
             .sorted_chats()
             .into_iter()
-            .filter(|chat| chat.title.to_lowercase().contains(&query))
-            .map(|chat| {
-                let key = conversation_key(&chat.conversation);
-                let selected = self
-                    .transition
-                    .as_ref()
-                    .map(|transition| conversation_key(&transition.destination))
-                    .as_ref()
-                    .or(self.model.selected.as_ref())
-                    == Some(&key);
-                let conversation = chat.conversation.clone();
-                let preview = self
-                    .model
-                    .messages
-                    .get(&key)
-                    .and_then(|messages| messages.last())
-                    .map(|message| summary(&message.elements))
-                    .unwrap_or_default();
-                let uin = match conversation {
-                    Conversation::Friend { uin, .. } => uin,
-                    _ => 0,
-                };
-                Button::new(SharedString::from(format!("chat:{key}")))
-                    .ghost()
-                    .selected(selected)
-                    .when(selected, |button| button.bg(cx.theme().accent))
-                    .w_full()
-                    .h_auto()
-                    .p_3()
-                    .accessibility_label(format!("打开会话 {}", chat.title))
-                    .child(
-                        div()
-                            .flex()
-                            .w_full()
-                            .items_center()
-                            .gap_3()
-                            .child(match chat.conversation {
-                                Conversation::Group { uin } => {
-                                    self.avatar_for(&format!("group-avatar:{uin}"), &chat.title, cx)
-                                }
-                                _ => self.avatar(uin, &chat.title, cx),
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(div().text_sm().truncate().child(chat.title.clone()))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .truncate()
-                                            .child(preview),
-                                    ),
-                            )
-                            .when(chat.unread > 0, |row| {
-                                row.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().primary)
-                                        .child(chat.unread.to_string()),
-                                )
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select(conversation.clone(), window, cx)
-                    }))
-            })
+            .filter(|chat| self.search_index.borrow_mut().matches(&chat.title, &query))
+            .cloned()
             .collect::<Vec<_>>();
+        let owner = cx.entity();
+        let rows = uniform_list("chats", chats.len(), move |range, _, cx| {
+            owner.update(cx, |this, cx| {
+                range
+                    .map(|index| this.chat_row(&chats[index], cx))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flex_1()
+        .min_h_0()
+        .px_1();
         div()
             .flex()
             .flex_col()
@@ -1942,14 +2080,73 @@ impl AppView {
                     .p_3()
                     .child(Input::new(&self.search).aria_label("搜索会话")),
             )
+            .child(rows)
+            .into_any_element()
+    }
+    fn chat_row(&self, chat: &ferrsphen::model::Chat, cx: &mut Context<Self>) -> AnyElement {
+        let key = conversation_key(&chat.conversation);
+        let selected = self
+            .transition
+            .as_ref()
+            .map(|transition| conversation_key(&transition.destination))
+            .as_ref()
+            .or(self.model.selected.as_ref())
+            == Some(&key);
+        let conversation = chat.conversation.clone();
+        let preview = self.model.chat_preview(&chat.conversation);
+        let uin = match conversation {
+            Conversation::Friend { uin, .. } => uin,
+            _ => 0,
+        };
+        Button::new(SharedString::from(format!("chat:{key}")))
+            .ghost()
+            .selected(selected)
+            .when(selected, |button| button.bg(cx.theme().accent))
+            .w_full()
+            .h(px(72.))
+            .p_3()
+            .accessibility_label(format!("打开会话 {}", chat.title))
             .child(
                 div()
-                    .id("chats")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_1()
-                    .children(rows),
+                    .flex()
+                    .w_full()
+                    .items_center()
+                    .gap_3()
+                    .child(match chat.conversation {
+                        Conversation::Group { uin } => {
+                            self.avatar_for(&format!("group-avatar:{uin}"), &chat.title, cx)
+                        }
+                        _ => self.avatar(uin, &chat.title, cx),
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().truncate().child(chat.title.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(preview),
+                            ),
+                    )
+                    .when(chat.unread > 0, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().primary)
+                                .child(chat.unread.to_string()),
+                        )
+                    }),
+            )
+            .on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.select(conversation.clone(), window, cx)
+                }),
             )
             .into_any_element()
     }
@@ -2028,24 +2225,172 @@ impl AppView {
             }
             MessageElement::Video(reference) => {
                 let reference = reference.clone();
-                Button::new(SharedString::from(format!("video:{key}")))
-                    .ghost()
-                    .icon(gpui_kit::assets::IconName::Play)
-                    .label(format!("视频 · {} 秒", reference.duration))
+                let video_key = format!("video:{key}");
+                let preview = self.assets.get(&format!("preview:{video_key}")).cloned();
+                let size = ferrsphen::card_preview::fitted(reference.width, reference.height);
+                div()
+                    .id(SharedString::from(video_key.clone()))
+                    .debug_selector({
+                        let key = video_key.clone();
+                        move || key.clone()
+                    })
+                    .relative()
+                    .w(px(size.width))
+                    .h(px(size.height))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(gpui_kit::rgba(0x202228ff))
+                    .cursor_pointer()
+                    .when_some(preview, |view, path| {
+                        view.child(img(path).size_full().object_fit(ObjectFit::Contain))
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size_12()
+                                    .rounded_full()
+                                    .bg(gpui_kit::rgba(0x00000099))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path(gpui_kit::assets::IconName::Play.path())
+                                            .size_6()
+                                            .text_color(gpui_kit::rgb(0xffffff)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_2()
+                            .right_2()
+                            .px_2()
+                            .rounded_md()
+                            .bg(gpui_kit::rgba(0x00000099))
+                            .text_xs()
+                            .text_color(gpui_kit::rgb(0xffffff))
+                            .child(format!(
+                                "{}:{:02}",
+                                reference.duration / 60,
+                                reference.duration % 60
+                            )),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_video(format!("video:{key}"), reference.clone(), cx);
+                        this.open_video(video_key.clone(), reference.clone(), cx);
                     }))
+                    .context_menu(self.message_menu(message, cx, read_only, Some(index)))
                     .into_any_element()
             }
-            MessageElement::Voice(reference) | MessageElement::File(reference) => {
-                let reference = reference.clone();
-                let label = match element {
-                    MessageElement::Voice(_) => format!("▷ 语音 · {} 秒", reference.duration),
-                    _ => format!("文件 · {}", reference.name),
+            MessageElement::Voice(reference) => {
+                let key = format!("voice:{key}");
+                let player = self.voice_player.read(cx);
+                let active = player.key.as_ref() == Some(&key);
+                let loading = active && player.loading;
+                let playing = active && player.playing;
+                let failed = active && player.error.is_some();
+                let position = if active {
+                    player.position.as_secs_f32()
+                } else {
+                    0.
                 };
+                let duration = if active && !player.duration.is_zero() {
+                    player.duration.as_secs_f32()
+                } else {
+                    reference.duration as f32
+                };
+                let progress = if duration > 0. {
+                    (position / duration).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                let reference = reference.clone();
+                div()
+                    .id(SharedString::from(key.clone()))
+                    .debug_selector({
+                        let key = key.clone();
+                        move || key.clone()
+                    })
+                    .cursor_pointer()
+                    .w(px(180.))
+                    .py_1()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(if loading {
+                                Spinner::new().into_any_element()
+                            } else {
+                                svg()
+                                    .path(
+                                        if failed {
+                                            gpui_kit::assets::IconName::RefreshCw
+                                        } else if playing {
+                                            gpui_kit::assets::IconName::Pause
+                                        } else {
+                                            gpui_kit::assets::IconName::Play
+                                        }
+                                        .path(),
+                                    )
+                                    .size_5()
+                                    .into_any_element()
+                            })
+                            .child(div().text_sm().child(if failed {
+                                "重试".into()
+                            } else if active && position > 0. {
+                                format!("{} / {} 秒", position as u32, duration.ceil() as u32)
+                            } else {
+                                format!("{} 秒", reference.duration)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(px(2.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(gpui_kit::rgba(0x80808040))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(progress))
+                                    .rounded_full()
+                                    .bg(cx.theme().primary),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let download = this
+                            .voice_player
+                            .update(cx, |player, cx| player.toggle(key.clone(), cx));
+                        if download
+                            && !this.command(Command::Voice {
+                                key: key.clone(),
+                                reference: reference.clone(),
+                            })
+                        {
+                            this.voice_player.update(cx, |player, cx| {
+                                player.complete(key.clone(), Err("操作队列不可用".into()), cx)
+                            });
+                        }
+                    }))
+                    .context_menu(self.message_menu(message, cx, read_only, Some(index)))
+                    .into_any_element()
+            }
+            MessageElement::File(reference) => {
+                let reference = reference.clone();
                 Button::new(SharedString::from(format!("media:{key}")))
                     .ghost()
-                    .label(label)
+                    .label(format!("文件 · {}", reference.name))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.command(Command::OpenMedia(reference.clone()));
                         cx.notify();
@@ -2083,12 +2428,16 @@ impl AppView {
                     .p_0()
                     .child(
                         div()
-                            .w_64()
+                            .debug_selector({
+                                let key = key.clone();
+                                move || format!("forward-card:{key}")
+                            })
+                            .w_56()
                             .flex()
                             .flex_col()
                             .items_start()
-                            .gap_2()
-                            .p_3()
+                            .gap_1()
+                            .p_2()
                             .rounded_lg()
                             .bg(cx.theme().muted)
                             .child(
@@ -2108,8 +2457,8 @@ impl AppView {
                             .child(
                                 div()
                                     .w_full()
-                                    .mt_1()
-                                    .pt_2()
+                                    .mt(px(2.))
+                                    .pt(px(6.))
                                     .border_t_1()
                                     .border_color(cx.theme().border)
                                     .text_xs()
@@ -2182,11 +2531,7 @@ impl AppView {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + use<> {
         let message = message.clone();
         let owner = cx.entity().downgrade();
-        let recalled = self.model.recalled.contains(&format!(
-            "{}:{}",
-            conversation_key(&message.conversation),
-            message.sequence
-        ));
+        let recalled = self.model.is_recalled(&message);
         let has_image = message
             .elements
             .iter()
@@ -2563,11 +2908,7 @@ impl AppView {
         timestamp: bool,
     ) -> AnyElement {
         let key = message_key(message);
-        let recalled = self.model.recalled.contains(&format!(
-            "{}:{}",
-            conversation_key(&message.conversation),
-            message.sequence
-        ));
+        let recalled = self.model.is_recalled(message);
         let fade = self.fades.get(&key);
         let (from, to, generation) = fade
             .map(|fade| (fade.from, fade.to, fade.generation))
@@ -2683,11 +3024,7 @@ impl AppView {
         let message = &messages[0];
         let separate_messages = messages.len() > 1;
         let key = message_key(message);
-        let recalled = self.model.recalled.contains(&format!(
-            "{}:{}",
-            conversation_key(&message.conversation),
-            message.sequence
-        ));
+        let recalled = self.model.is_recalled(message);
         let image_only = image_only(message);
         let image_count = messages
             .iter()
@@ -2698,6 +3035,10 @@ impl AppView {
         if recalled {
             content.push(
                 div()
+                    .debug_selector({
+                        let key = key.clone();
+                        move || format!("recall-label:{key}")
+                    })
                     .text_size(window.rem_size() * 0.875)
                     .line_height(px(20.))
                     .font_family(cx.theme().font_family.clone())
@@ -2732,29 +3073,19 @@ impl AppView {
                 })
             })
             .children(content);
+        let tween = (!read_only).then(|| self.recall_tweens.get(&key)).flatten();
+        let progress = tween.map_or(1., |tween| {
+            tween
+                .state(cx.background_executor().now())
+                .position
+                .clamp(0., 1.)
+        });
         let body = if recalled {
             let target = recalled_size(window, cx);
-            let original = self
-                .bubble_sizes
-                .borrow()
-                .get(&key)
-                .copied()
-                .unwrap_or(target);
-            body.with_spring(
-                SharedString::from(format!("recall-width:{key}")),
-                SpringAnimation::new(SpringConfig::new(280., 30., 1.))
-                    .to(f32::from(target.width))
-                    .from(original.width.into()),
-                |body, width| body.w(px(width)),
-            )
-            .with_spring(
-                SharedString::from(format!("recall-height:{key}")),
-                SpringAnimation::new(SpringConfig::new(280., 30., 1.))
-                    .to(f32::from(target.height))
-                    .from(original.height.into()),
-                |body, height| body.map_element(|body| body.h(px(height))),
-            )
-            .into_any_element()
+            let original = tween.map_or(target, |tween| tween.original);
+            body.w(original.width + (target.width - original.width) * progress)
+                .h(original.height + (target.height - original.height) * progress)
+                .into_any_element()
         } else {
             body.into_any_element()
         };
@@ -2768,23 +3099,26 @@ impl AppView {
                 .into_any_element()
         };
         let measured = self.bubble_sizes.clone();
+        let visible = self.visible_bubbles.clone();
+        let scroll = self.scroll.clone();
         let measured_key = key.clone();
         let body = div()
             .child(body)
             .on_children_prepainted(move |bounds, _, _| {
-                if !recalled && let Some(bounds) = bounds.first() {
-                    measured
-                        .borrow_mut()
-                        .insert(measured_key.clone(), bounds.size);
+                if let Some(bounds) = bounds.first() {
+                    if !recalled {
+                        measured
+                            .borrow_mut()
+                            .insert(measured_key.clone(), bounds.size);
+                    }
+                    if !read_only && bounds.intersects(&scroll.bounds()) {
+                        visible
+                            .borrow_mut()
+                            .insert(measured_key.clone(), bounds.size);
+                    }
                 }
             })
-            .with_spring(
-                SharedString::from(format!("recall-alpha:{key}")),
-                SpringAnimation::new(SpringConfig::new(280., 30., 1.))
-                    .to(if recalled { 0.65 } else { 1. })
-                    .from(1.),
-                |body, alpha| body.opacity(alpha.clamp(0., 1.)),
-            );
+            .opacity(if recalled { 1. - 0.35 * progress } else { 1. });
         let fade = self.fades.get(&key);
         let (from, to, generation) = fade
             .map(|fade| (fade.from, fade.to, fade.generation))
@@ -2850,6 +3184,139 @@ impl AppView {
             )
             .into_any_element()
     }
+    fn lazy_message_rows(
+        &self,
+        messages: &[Message],
+        window: &Window,
+        cx: &mut Context<Self>,
+        read_only: bool,
+    ) -> Vec<AnyElement> {
+        let groups = message_groups(messages, &self.model.recalled);
+        let scroll = if read_only {
+            &self.forward_scroll
+        } else {
+            &self.scroll
+        };
+        let viewport = scroll.bounds();
+        let overscan = px(600.);
+        let visible = Bounds::new(
+            point(viewport.left(), viewport.top() - overscan),
+            size(viewport.size.width, viewport.size.height + overscan * 2.),
+        );
+        let initialized = viewport.size.height > px(0.);
+        let anchor = if !read_only && self.scroll_anchor.is_none() && initialized {
+            self.capture_timeline_anchor().map(|mut anchor| {
+                anchor.follow_tail = (scroll.offset().y + scroll.max_offset().y).abs() < px(80.);
+                anchor
+            })
+        } else {
+            None
+        };
+        groups
+            .iter()
+            .enumerate()
+            .map(|(index, messages)| {
+                let key = format!(
+                    "{}:{}",
+                    if read_only { "forward" } else { "chat" },
+                    message_key(&messages[0])
+                );
+                let in_view = scroll
+                    .bounds_for_item(index)
+                    .map(|mut bounds| {
+                        bounds.origin.y += scroll.offset().y;
+                        bounds.intersects(&visible)
+                    })
+                    .unwrap_or_else(|| {
+                        if read_only {
+                            index < 20
+                        } else {
+                            index + 20 >= groups.len()
+                        }
+                    });
+                if in_view
+                    || !initialized
+                        && (if read_only {
+                            index < 20
+                        } else {
+                            index + 20 >= groups.len()
+                        })
+                {
+                    let cache = self.lazy_heights.clone();
+                    let owner = cx.entity().downgrade();
+                    let anchor = anchor.clone();
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .child(self.message_row(messages, window, cx, read_only))
+                        .on_children_prepainted(move |bounds, _, cx| {
+                            if let Some(bounds) = bounds.first() {
+                                let old = cache
+                                    .borrow_mut()
+                                    .insert(key.clone(), bounds.size.height)
+                                    .unwrap_or(px(100.));
+                                if (old - bounds.size.height).abs() > px(0.5)
+                                    && let Some(anchor) = anchor.clone()
+                                {
+                                    let owner = owner.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = owner.update(cx, |this, cx| {
+                                            if this.scroll_anchor.is_none()
+                                                && this.reply_jump.is_none()
+                                                && this.model.selected.as_ref()
+                                                    == Some(&anchor.conversation)
+                                            {
+                                                this.scroll_anchor = Some(anchor);
+                                                cx.notify();
+                                            }
+                                        });
+                                    });
+                                }
+                            }
+                        })
+                        .into_any_element()
+                } else {
+                    let height = self
+                        .lazy_heights
+                        .borrow()
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(px(100.));
+                    let owner = cx.entity().downgrade();
+                    let scroll = scroll.clone();
+                    div()
+                        .w_full()
+                        .h(height)
+                        .flex_shrink_0()
+                        .child(
+                            canvas(
+                                move |bounds, _, cx| {
+                                    let viewport = scroll.bounds();
+                                    let visible = Bounds::new(
+                                        point(viewport.left(), viewport.top() - overscan),
+                                        size(
+                                            viewport.size.width,
+                                            viewport.size.height + overscan * 2.,
+                                        ),
+                                    );
+                                    if bounds.intersects(&visible) {
+                                        cx.defer(move |cx| {
+                                            let _ = owner.update(cx, |_, cx| cx.notify());
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .relative()
+                        .into_any_element()
+                }
+            })
+            .collect()
+    }
+
     fn conversation(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(chat) = self.model.selected_chat() else {
             return div().flex_1().into_any_element();
@@ -2858,17 +3325,16 @@ impl AppView {
         let history = self.model.history.get(&key);
         let loading = history.is_some_and(|history| history.loading);
         let error = history.and_then(|history| history.error.clone());
-        let rows = self
-            .model
-            .messages
-            .get(&key)
-            .map(|rows| {
-                message_groups(rows, &self.model.recalled)
-                    .into_iter()
-                    .map(|messages| self.message_row(messages, window, cx, false))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let rows = self.lazy_message_rows(
+            self.model
+                .messages
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            window,
+            cx,
+            false,
+        );
         let pending = self
             .model
             .pending
@@ -3317,13 +3783,7 @@ impl AppView {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(960.), px(680.)), cx)),
                     window_min_size: Some(size(px(520.), px(360.))),
-                    app_owns_titlebar_drag: true,
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("视频".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.), px(20.))),
-                    }),
-                    ..Default::default()
+                    ..ferrsphen::window_chrome::options("视频")
                 },
                 cx,
                 move |window, cx| {
@@ -3390,7 +3850,7 @@ impl AppView {
             }
             let dimensions = match kind {
                 DetailKind::Image => size(px(960.), px(760.)),
-                DetailKind::Forward => size(px(680.), px(820.)),
+                DetailKind::Forward => size(px(600.), px(720.)),
             };
             let title = match kind {
                 DetailKind::Image => "图片",
@@ -3401,13 +3861,7 @@ impl AppView {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::centered(dimensions, cx)),
                     window_min_size: Some(size(px(420.), px(360.))),
-                    app_owns_titlebar_drag: true,
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(title.into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.), px(20.))),
-                    }),
-                    ..Default::default()
+                    ..ferrsphen::window_chrome::options(title)
                 },
                 cx,
                 move |window, cx| {
@@ -3459,6 +3913,7 @@ impl AppView {
                 is_group,
             });
         }
+        self.request_assets();
         self.open_detail_window(DetailKind::Forward, cx);
     }
     fn forward_view(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3469,30 +3924,19 @@ impl AppView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                div()
-                    .h(rems(3.5))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, |event, window, _| {
-                        if event.click_count == 2 {
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    })
-                    .child(div().text_sm().child("聊天记录")),
+                ferrsphen::window_chrome::title_bar(cx)
+                    .child(div().flex_1().text_center().text_sm().child("聊天记录")),
             )
             .child(
                 div()
                     .id("forward-messages")
                     .track_scroll(&self.forward_scroll)
-                    .on_scroll_wheel(cx.listener(|this, _, _, _| {
+                    .on_scroll_wheel(cx.listener(|this, _, window, cx| {
                         this.reply_jump = None;
+                        cx.defer_in(window, |this, _, cx| {
+                            this.request_assets();
+                            cx.notify();
+                        });
                     }))
                     .flex_1()
                     .min_h_0()
@@ -3520,14 +3964,12 @@ impl AppView {
                             )
                         },
                     )
-                    .children(
-                        message_groups(
-                            self.forward.as_deref().unwrap_or_default(),
-                            &self.model.recalled,
-                        )
-                        .into_iter()
-                        .map(|messages| self.message_row(messages, window, cx, true)),
-                    ),
+                    .children(self.lazy_message_rows(
+                        self.forward.as_deref().unwrap_or_default(),
+                        window,
+                        cx,
+                        true,
+                    )),
             )
             .into_any_element()
     }
@@ -3724,32 +4166,27 @@ impl AppView {
                 cx.notify();
             }))
             .child(
-                div()
-                    .h(rems(3.5))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .pl(px(88.))
-                    .pr_3()
+                ferrsphen::window_chrome::title_bar(cx)
+                    .pl(ferrsphen::window_chrome::leading_inset(window))
                     .gap_3()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .child(div().flex_1().min_w_0().text_sm().truncate().child(name))
                     .child(
                         div()
                             .flex()
                             .gap_1()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Button::new("viewer-close")
-                                    .ghost()
-                                    .icon(gpui_kit::assets::IconName::X)
-                                    .tooltip("关闭")
-                                    .accessibility_label("关闭图片")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_image(window, cx)
-                                    })),
-                            ),
+                            .when(cfg!(target_os = "macos"), |bar| {
+                                bar.child(
+                                    Button::new("viewer-close")
+                                        .ghost()
+                                        .icon(gpui_kit::assets::IconName::X)
+                                        .tooltip("关闭")
+                                        .accessibility_label("关闭图片")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_image(window, cx)
+                                        })),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -3941,12 +4378,14 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.advance_transition(window, cx);
+        self.animate_recalls(cx);
+        self.visible_bubbles.borrow_mut().clear();
         self.advance_timeline_anchor(window);
         self.advance_reply_jump(false, window, cx);
         if cx.reduce_motion() {
             self.bounce = Bounce::default();
         }
-        div()
+        let content = div()
             .relative()
             .flex()
             .flex_col()
@@ -3954,19 +4393,10 @@ impl Render for AppView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(if matches!(self.phase, Phase::Chat) {
-                self.topbar(cx)
+                self.topbar(window, cx)
             } else {
-                div()
-                    .h(rems(3.5))
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, |event, window, _| {
-                        if event.click_count == 2 {
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    })
+                ferrsphen::window_chrome::title_bar(cx)
+                    .child(div().flex_1())
                     .into_any_element()
             })
             .when_some(self.error.clone(), |view, error| {
@@ -4027,7 +4457,8 @@ impl Render for AppView {
                         })
                 }
             })
-            .when(self.details.is_some(), |view| view.child(self.overlay(cx)))
+            .when(self.details.is_some(), |view| view.child(self.overlay(cx)));
+        ferrsphen::window_chrome::surface(content, window, cx)
     }
 }
 fn message_key(message: &Message) -> String {
@@ -4067,7 +4498,7 @@ fn image_message_offset(messages: &[Message], position: usize) -> f32 {
         .sum()
 }
 fn card_key(source: &str, slot: usize, width: u32, height: u32) -> String {
-    format!("card-sheet:v3:{source}:{slot}:{width}:{height}")
+    format!("card-sheet:v4:{source}:{slot}:{width}:{height}")
 }
 fn image_key(message: &Message, index: usize) -> String {
     format!("preview:{}:{index}", message_key(message))
@@ -4132,6 +4563,7 @@ mod ui_tests {
         let (commands, command_receiver) = mpsc::channel(128);
         let (window, view) = cx.update(|cx| {
             gpui_kit::init(cx);
+            ferrsphen::window_chrome::init(cx);
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -4214,6 +4646,205 @@ mod ui_tests {
         .unwrap();
     }
     #[gpui::test]
+    fn fullscreen_shortcut_reaches_main_and_detail_windows(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.composer
+                    .update(cx, |composer, cx| composer.focus(window, cx));
+                cx.notify();
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        cx.simulate_keystrokes(main, "f11");
+        assert!(
+            cx.update_window(main, |_, window, _| window.is_fullscreen())
+                .unwrap()
+        );
+        cx.simulate_keystrokes(main, "f11");
+        assert!(
+            !cx.update_window(main, |_, window, _| window.is_fullscreen())
+                .unwrap()
+        );
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.forward = Some(vec![text_message(2)]);
+                view.open_detail_window(DetailKind::Forward, cx);
+            })
+        });
+        cx.run_until_parked();
+        let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
+        draw(cx, forward);
+        cx.simulate_keystrokes(forward, "f11");
+        assert!(
+            cx.update_window(forward, |_, window, _| window.is_fullscreen())
+                .unwrap()
+        );
+        cx.simulate_keystrokes(forward, "f11");
+        assert!(
+            !cx.update_window(forward, |_, window, _| window.is_fullscreen())
+                .unwrap()
+        );
+    }
+    #[gpui::test]
+    fn forward_card_and_window_are_smaller_while_avatars_keep_their_size(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Forward(
+                    atri_qq::messages::ForwardReference {
+                        resource_id: "record".into(),
+                        count: 1,
+                        light_app_json: None,
+                        raw_element: None,
+                    },
+                )];
+                view.model.receive(message, false);
+                view.forward_cache
+                    .insert("group:42:1:0".into(), vec![text_message(2)]);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let card = visual.debug_bounds("forward-card:group:42:1:0").unwrap();
+        assert_eq!(card.size.width, px(224.));
+        visual.simulate_click(card.center(), Default::default());
+        cx.run_until_parked();
+        let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
+        draw(cx, forward);
+        let dimensions = cx
+            .update_window(forward, |_, window, _| {
+                window.window_bounds().get_bounds().size
+            })
+            .unwrap();
+        assert_eq!(dimensions, size(px(600.), px(720.)));
+        let avatar = VisualTestContext::from_window(forward, cx)
+            .debug_bounds("avatar:7")
+            .unwrap();
+        assert_eq!(avatar.size, size(px(36.), px(36.)));
+    }
+    #[gpui::test]
+    fn forwarded_uid_resolves_once_and_shares_the_uin_avatar_cache(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                let mut first = text_message(1);
+                first.sender_uin = 0;
+                first.sender_uid = "forwarded-peer".into();
+                let mut second = first.clone();
+                second.sequence = 2;
+                view.forward = Some(vec![first, second]);
+                view.request_assets();
+                view.request_assets();
+            })
+        });
+        let resolves = std::iter::from_fn(|| commands.try_recv().ok()).filter(|command| matches!(command, Command::ResolveUser { uid } if uid == "forwarded-peer")).count();
+        assert_eq!(resolves, 1);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::UserUin {
+                    uid: "forwarded-peer".into(),
+                    result: Ok(77),
+                })
+            })
+        });
+        let avatars = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(|command| matches!(command, Command::Asset { key, .. } if key == "avatar:77"))
+            .count();
+        assert_eq!(avatars, 1);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::Asset {
+                    key: "avatar:77".into(),
+                    path: "/cached/avatar.png".into(),
+                });
+                view.request_assets();
+                assert_eq!(
+                    view.model.sender_uin(&view.forward.as_ref().unwrap()[0]),
+                    77
+                );
+            })
+        });
+        assert!(commands.try_recv().is_err());
+        let _ = main;
+    }
+    #[gpui::test]
+    fn forward_scrolling_fetches_avatars_beyond_the_initial_prefetch(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.forward = Some(
+                    (1..=110)
+                        .map(|sequence| {
+                            let mut message = text_message(sequence);
+                            message.sender_uin = sequence + 100;
+                            message.sender_uid = format!("peer-{sequence}");
+                            message
+                        })
+                        .collect(),
+                );
+                view.request_assets();
+                view.open_detail_window(DetailKind::Forward, cx);
+            })
+        });
+        cx.run_until_parked();
+        while commands.try_recv().is_ok() {}
+        let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
+        draw(cx, forward);
+        cx.update(|cx| view.update(cx, |view, _| view.forward_scroll.scroll_to_top_of_item(100)));
+        draw(cx, forward);
+        let position = cx.update(|cx| view.read(cx).forward_scroll.bounds().center());
+        wheel(cx, forward, position, -10., TouchPhase::Moved);
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok()).any(
+                |command| matches!(command, Command::Asset { key, .. } if key == "avatar:201")
+            )
+        );
+        let _ = main;
+    }
+    #[gpui::test]
+    fn large_timeline_builds_only_nearby_message_bodies(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                for sequence in 1..=2000 {
+                    view.model.receive(text_message(sequence), false);
+                }
+                view.scroll.scroll_to_bottom();
+                cx.notify();
+            })
+        });
+        frames(cx, main, 8);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(
+                view.lazy_heights.borrow().len() < 100,
+                "offscreen bodies were rendered"
+            );
+            assert!(
+                view.bubble_sizes
+                    .borrow()
+                    .contains_key("group:42:2000:2000")
+            );
+            view.scroll.scroll_to_top_of_item(0);
+        });
+        frames(cx, main, 8);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.bubble_sizes.borrow().contains_key("group:42:1:1"));
+            assert!(view.lazy_heights.borrow().len() < 150);
+        });
+    }
+
+    #[gpui::test]
     fn reaching_top_loads_once_and_history_preserves_visible_message(cx: &mut TestAppContext) {
         let (main, view, _updates, mut commands) = fixture(cx);
         cx.update(|cx| {
@@ -4232,7 +4863,9 @@ mod ui_tests {
         let position = cx.update(|cx| view.read(cx).scroll.bounds().center());
         wheel(cx, main, position, 80., TouchPhase::Started);
         assert!(matches!(
-            commands.try_recv().unwrap(),
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|command| matches!(command, Command::History { .. }))
+                .unwrap(),
             Command::History {
                 cursor: Some(Cursor::Group(30)),
                 ..
@@ -4834,6 +5467,78 @@ mod ui_tests {
         });
     }
     #[gpui::test]
+    fn video_surface_outside_play_icon_opens_player_and_requests_preview_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                let mut video =
+                    MediaReference::new(MediaKind::Video, MediaConversation::Group { uin: 42 });
+                video.width = 320;
+                video.height = 180;
+                video.duration = 90;
+                message.elements = vec![MessageElement::Video(video)];
+                view.model.receive(message, false);
+                view.request_assets();
+                view.request_assets();
+                cx.notify();
+            })
+        });
+        let previews = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| {
+                if let Command::VideoPreview { key, .. } = command {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(previews, ["preview:video:group:42:1:0"]);
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let preview = visual.debug_bounds("video:group:42:1:0").unwrap();
+        visual.simulate_click(preview.origin + point(px(12.), px(12.)), Default::default());
+        cx.run_until_parked();
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::ViewVideo { key, .. } if key == "video:group:42:1:0")
+        );
+        cx.update(|cx| assert_eq!(cx.windows().len(), 2));
+    }
+    #[gpui::test]
+    fn clicking_voice_requests_internal_playback_and_can_cancel(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                let mut voice =
+                    MediaReference::new(MediaKind::Voice, MediaConversation::Group { uin: 42 });
+                voice.duration = 3;
+                message.elements = vec![MessageElement::Voice(voice)];
+                view.model.receive(message, false);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let voice = visual.debug_bounds("voice:group:42:1:0").unwrap();
+        visual.simulate_click(voice.center(), Default::default());
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::Voice { key, .. } if key == "voice:group:42:1:0")
+        );
+        draw(cx, main);
+        VisualTestContext::from_window(main, cx).simulate_click(voice.center(), Default::default());
+        cx.update(|cx| {
+            assert!(view.read(cx).voice_player.read(cx).key.is_none());
+            assert_eq!(cx.windows().len(), 1);
+        });
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[gpui::test]
     fn video_window_is_deferred_reused_and_displays_download_failure(cx: &mut TestAppContext) {
         let (main, view, _updates, mut commands) = fixture(cx);
         let reference = MediaReference::new(MediaKind::Video, MediaConversation::Group { uin: 42 });
@@ -4925,6 +5630,224 @@ mod ui_tests {
         let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
         assert_eq!(cx.windows().len(), 2);
         draw(cx, forward);
+    }
+    #[gpui::test]
+    fn visible_recall_animates_once_and_navigation_does_not_replay_it(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Text("long message ".repeat(30))];
+                view.model.receive(message, false);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let target = cx
+            .update_window(main, |_, window, cx| recalled_size(window, cx))
+            .unwrap();
+        let original = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-bubble:group:42:1:1")
+            .unwrap();
+        assert!(original.size.width > target.width + px(50.));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.visible_bubbles.borrow().contains_key("group:42:1:1"));
+                view.apply(Update::Recalled {
+                    conversation: Conversation::Group { uin: 42 },
+                    sequence: 1,
+                });
+                assert_eq!(view.recall_tweens.len(), 1);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        frames(cx, main, 5);
+        let intermediate = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-bubble:group:42:1:1")
+            .unwrap();
+        assert!(
+            intermediate.size.width > target.width + px(1.)
+                && intermediate.size.width < original.size.width
+        );
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                let started = view.recall_tweens["group:42:1:1"].started;
+                view.apply(Update::Notification(atri_qq::messages::PushEvent::Recall {
+                    conversation: Conversation::Group { uin: 42 },
+                    sequence: 1,
+                    random: None,
+                    time: None,
+                    author_uid: "peer".into(),
+                    operator_uid: None,
+                    tip: String::new(),
+                }));
+                assert_eq!(view.recall_tweens["group:42:1:1"].started, started);
+            })
+        });
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let settings = visual.debug_bounds("nav-settings").unwrap();
+        visual.simulate_click(settings.center(), Default::default());
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let chat = visual.debug_bounds("nav-chat").unwrap();
+        visual.simulate_click(chat.center(), Default::default());
+        draw(cx, main);
+        let restored = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-bubble:group:42:1:1")
+            .unwrap();
+        assert!((restored.size.width - target.width).abs() < px(1.));
+        assert!((restored.size.height - target.height).abs() < px(1.));
+        cx.update(|cx| assert!(view.read(cx).recall_tweens.is_empty()));
+        frames(cx, main, 3);
+        let restored = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-bubble:group:42:1:1")
+            .unwrap();
+        assert!((restored.size.width - target.width).abs() < px(1.));
+    }
+    #[gpui::test]
+    fn background_and_offscreen_recalls_never_arm_a_tween(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                for sequence in 1..=35 {
+                    view.model.receive(text_message(sequence), false);
+                }
+                let mut other = text_message(100);
+                other.conversation = Conversation::Group { uin: 43 };
+                view.model.receive(other, false);
+                view.scroll.scroll_to_bottom();
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.visible_bubbles.borrow().contains_key("group:42:1:1"));
+                view.apply(Update::Recalled {
+                    conversation: Conversation::Group { uin: 42 },
+                    sequence: 1,
+                });
+                view.apply(Update::Recalled {
+                    conversation: Conversation::Group { uin: 43 },
+                    sequence: 100,
+                });
+                assert!(view.recall_tweens.is_empty());
+                cx.notify();
+            })
+        });
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_select(Conversation::Group { uin: 43 }, window, cx)
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        let target = cx
+            .update_window(main, |_, window, cx| recalled_size(window, cx))
+            .unwrap();
+        let actual = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-bubble:group:43:100:100")
+            .unwrap();
+        assert!((actual.size.width - target.width).abs() < px(1.));
+        cx.update(|cx| assert!(view.read(cx).recall_tweens.is_empty()));
+    }
+    #[gpui::test]
+    fn completed_recall_tween_is_consumed_without_input(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Recalled {
+                    conversation: Conversation::Group { uin: 42 },
+                    sequence: 1,
+                });
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).recall_tweens.is_empty());
+            assert!(!view.read(cx).recall_animating);
+        });
+    }
+    #[gpui::test]
+    fn private_recall_push_updates_a_legacy_cached_bubble(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.conversation = Conversation::Friend {
+                    uin: 7,
+                    uid: "peer".into(),
+                };
+                message.sequence = 444;
+                message.client_sequence = 333;
+                message.raw = vec![
+                    0x0a, 2, 8, 7, 0x12, 9, 8, 0xa6, 1, 0x28, 0xbc, 3, 0x58, 0xcd, 2,
+                ];
+                view.model.receive(message, false);
+                view.apply(Update::Notification(atri_qq::messages::PushEvent::Recall {
+                    conversation: Conversation::Friend {
+                        uin: 0,
+                        uid: "peer".into(),
+                    },
+                    sequence: 333,
+                    random: Some(666),
+                    time: None,
+                    author_uid: "peer".into(),
+                    operator_uid: Some("peer".into()),
+                    tip: String::new(),
+                }));
+                assert!(
+                    view.model
+                        .is_recalled(&view.model.messages["dm:uid:peer"][0])
+                );
+                cx.notify();
+            })
+        });
+        frames(cx, main, 120);
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("recall-label:dm:uid:peer:333:1")
+                .is_some()
+        );
+    }
+    #[gpui::test]
+    fn server_history_tombstone_renders_recall_label(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.elements.clear();
+                message.raw = vec![0x0a, 6, 8, 7, 0x42, 2, 8, 42, 0x12, 4, 8, 82, 0x28, 1];
+                view.apply(Update::History {
+                    key: "group:42".into(),
+                    result: Ok((vec![message], None)),
+                });
+                cx.notify();
+            })
+        });
+        frames(cx, main, 120);
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("recall-label:group:42:1:1")
+                .is_some()
+        );
+        cx.update(|cx| assert!(view.read(cx).model.recalled.contains("group:42:1")));
     }
     #[gpui::test]
     fn recalled_bubble_settles_to_label_width_not_original_message_width(cx: &mut TestAppContext) {

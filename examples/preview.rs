@@ -14,6 +14,7 @@ fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     app.run(|cx| {
         gpui_kit::init(cx);
+        ferrsphen::window_chrome::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         cx.set_window_appearance(Some(WindowAppearance::Dark));
         Theme::update(cx, |theme| {
@@ -124,13 +125,7 @@ fn main() {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1240.), px(820.)), cx)),
-                app_owns_titlebar_drag: true,
-                titlebar: Some(TitlebarOptions {
-                    title: Some("ferrsphen · preview".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(12.), px(20.))),
-                }),
-                ..Default::default()
+                ..ferrsphen::window_chrome::options("ferrsphen · preview")
             },
             cx,
             |window, cx| cx.new(|cx| view::AppView::new(commands, receiver, window, cx)),
