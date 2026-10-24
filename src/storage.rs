@@ -339,7 +339,7 @@ impl Database {
 
 fn decode_stored_message(bytes: &[u8], account: u64) -> Result<Message> {
     use atri_qq::{
-        messages::{MessageElement, decode_elements},
+        messages::decode_elements,
         proto::{decode, messages::CommonMessage},
     };
     let mut message: Message = crate::proto::decode(bytes)?;
@@ -351,18 +351,13 @@ fn decode_stored_message(bytes: &[u8], account: u64) -> Result<Message> {
     }
     match decode_elements(&common.message_body, &message.conversation, account) {
         Ok(content) => {
-            let media = |element: &MessageElement| {
-                matches!(element, MessageElement::Voice(_) | MessageElement::Video(_))
-            };
-            if message.elements.iter().any(media) || content.elements.iter().any(media) {
-                message.elements = content.elements;
-                message.metadata = content.metadata;
-            }
+            message.elements = content.elements;
+            message.metadata = content.metadata;
         }
         Err(error) => tracing::warn!(
             ?error,
             sequence = message.sequence,
-            "refresh cached media failed"
+            "refresh cached message failed"
         ),
     }
     Ok(message)
@@ -398,7 +393,7 @@ mod migration_tests {
                 o3_xwid_switch: Some(0),
                 qr_sig: vec![5; 16],
                 key_exchange_key: vec![7; 16],
-                login_cookie: "transient".into(),
+                login_cookie: vec![0xff, 0x00, 0xc0, 0x80],
                 ..Default::default()
             },
             machine_id: "machine".into(),

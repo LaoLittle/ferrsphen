@@ -1,10 +1,3 @@
-use anyhow::Result;
-use image::{ImageDecoder as _, ImageReader, RgbaImage, imageops::FilterType};
-use std::path::Path;
-
-pub const FRAMES: usize = 25;
-pub const RASTER_SCALE: u32 = 2;
-pub const COLUMNS: u32 = 5;
 pub const ACTION_HEIGHT: f32 = 32.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,9 +89,6 @@ pub fn collapsed(sizes: &[CardSize]) -> CollapsedCards {
     layout
 }
 
-pub fn frame(progress: f32) -> usize {
-    (progress.clamp(0., 1.) * (FRAMES - 1) as f32).round() as usize
-}
 pub fn bounds(size: CardSize, angle: f32) -> CardSize {
     let (sine, cosine) = angle.sin_cos();
     CardSize {
@@ -107,50 +97,22 @@ pub fn bounds(size: CardSize, angle: f32) -> CardSize {
     }
 }
 
-pub fn render(source: &Path, output: &Path, slot: usize, width: u32, height: u32) -> Result<()> {
-    let mut reader = ImageReader::open(source)?.with_guessed_format()?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    reader.limits(limits);
-    let mut decoder = reader.into_decoder()?;
-    let orientation = decoder.orientation()?;
-    let mut image = image::DynamicImage::from_decoder(decoder)?;
-    image.apply_orientation(orientation);
-    let picture = image
-        .resize_exact(
-            width.max(1) * RASTER_SCALE,
-            height.max(1) * RASTER_SCALE,
-            FilterType::Lanczos3,
-        )
-        .to_rgba8();
-    let (cell_width, cell_height) = (
-        picture.width() + 40 * RASTER_SCALE,
-        picture.height() + 40 * RASTER_SCALE,
-    );
-    let mut sheet = RgbaImage::new(cell_width * COLUMNS, cell_height * COLUMNS);
-    for index in 0..FRAMES {
-        let angle = angle(slot) * (1. - index as f32 / (FRAMES - 1) as f32);
-        let card = tilt(&picture, angle);
-        image::imageops::replace(
-            &mut sheet,
-            &card,
-            i64::from(index as u32 % COLUMNS * cell_width),
-            i64::from(index as u32 / COLUMNS * cell_height),
-        );
-    }
-    sheet.save_with_format(output, image::ImageFormat::Png)?;
-    Ok(())
-}
-
-fn tilt(picture: &RgbaImage, angle: f32) -> RgbaImage {
+pub fn tilt(picture: &image::RgbaImage, angle: f32) -> image::RgbaImage {
     let (width, height) = picture.dimensions();
-    let padding = 40 * RASTER_SCALE;
-    let mut output = RgbaImage::new(width + padding, height + padding);
+    let rotated = bounds(
+        CardSize {
+            width: width as f32,
+            height: height as f32,
+        },
+        angle,
+    );
+    let (out_width, out_height) = (rotated.width.ceil() as u32, rotated.height.ceil() as u32);
+    let mut output = image::RgbaImage::new(out_width, out_height);
     let (sine, cosine) = angle.sin_cos();
-    let radius = ((8 * RASTER_SCALE) as f32).min(width.min(height) as f32 / 2.);
+    let radius = 16f32.min(width.min(height) as f32 / 2.);
     for (x, y, pixel) in output.enumerate_pixels_mut() {
-        let dx = x as f32 + 0.5 - (width + padding) as f32 / 2.;
-        let dy = y as f32 + 0.5 - (height + padding) as f32 / 2.;
+        let dx = x as f32 + 0.5 - out_width as f32 / 2.;
+        let dy = y as f32 + 0.5 - out_height as f32 / 2.;
         let sx = cosine * dx + sine * dy + width as f32 / 2.;
         let sy = -sine * dx + cosine * dy + height as f32 / 2.;
         let qx = (sx - width as f32 / 2.).abs() - (width as f32 / 2. - radius);
@@ -240,33 +202,18 @@ mod tests {
     }
 
     #[test]
-    fn rotation_sheet_has_distinct_intermediate_frames_and_preserves_source() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("original.png");
-        let preview = directory.path().join("sheet.png");
-        image::RgbaImage::from_pixel(80, 120, image::Rgba([20, 80, 180, 255]))
-            .save(&source)
-            .unwrap();
-        let bytes = std::fs::read(&source).unwrap();
-        super::render(&source, &preview, 2, 80, 120).unwrap();
-        assert_eq!(std::fs::read(source).unwrap(), bytes);
-        let sheet = image::open(preview).unwrap().to_rgba8();
-        assert_eq!(sheet.dimensions(), (1200, 1600));
-        let cell = |index: u32| {
-            image::imageops::crop_imm(&sheet, index % 5 * 240, index / 5 * 320, 240, 320).to_image()
-        };
-        let tilted = cell(0);
+    fn live_rotation_preserves_color_and_antialiases_edges() {
+        let source = image::RgbaImage::from_pixel(160, 240, image::Rgba([20, 80, 180, 255]));
+        let tilted = super::tilt(&source, 0.105);
+        let middle = super::tilt(&source, 0.0525);
+        let straight = super::tilt(&source, 0.);
+        assert_ne!(tilted.dimensions(), middle.dimensions());
+        assert_ne!(middle.dimensions(), straight.dimensions());
         let edge = tilted
             .pixels()
-            .filter(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            .filter(|p| p[3] > 0 && p[3] < 255)
             .collect::<Vec<_>>();
-        assert!(edge.len() > 100, "rotated edges need fractional coverage");
-        assert!(
-            edge.iter()
-                .all(|pixel| pixel[0] == 20 && pixel[1] == 80 && pixel[2] == 180)
-        );
-        assert_ne!(cell(0), cell(12));
-        assert_ne!(cell(12), cell(24));
-        assert_eq!(super::frame(0.5), 12);
+        assert!(edge.len() > 100);
+        assert!(edge.iter().all(|p| p[0] == 20 && p[1] == 80 && p[2] == 180));
     }
 }

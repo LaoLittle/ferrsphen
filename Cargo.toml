@@ -1,6 +1,6 @@
 [package]
 name = "ferrsphen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 default-run = "ferrsphen"
 license = "MIT OR Apache-2.0"
@@ -10,38 +10,44 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:gpui-kit", "dep:alhazen-core"]
+desktop = ["dep:gpui-kit", "dep:alhazen-core", "dep:gpui-webview", "dep:wry"]
 ui-tests = ["desktop", "dep:gpui"]
 
 [dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.9", optional = true, features = ["test-support"] }
-atri_qq = { git = "https://github.com/LaoLittle/atri_qq", rev = "634f23ad019f96352a26019fb3fede9cd844de1c", default-features = false }
-gpui-kit = { version = "=0.8.0", optional = true }
+gpui = { package = "gpui-pre", version = "0.3", optional = true, features = ["test-support"] }
+atri_qq = { git = "https://github.com/LaoLittle/atri_qq", default-features = false }
+gpui-kit = { version = "0.8", optional = true }
 alhazen-core = { version = "0.6", optional = true }
-surrealkv = "=1.0.0"
+surrealkv = "1"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-value = "0.7"
 ciborium = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "process"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-rand = "0.8"
+rand = "0.10"
 hex = "0.4"
+md-5 = "0.11"
+sha1_smol = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-toml = "1.1"
+toml = "1"
 anyhow = "1"
 open = "5"
-base64 = "0.22"
+base64 = "0.23"
 tempfile = "3"
 qrcode = { version = "0.14", default-features = false }
 prost = "0.14"
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
-dirs = "6"
-rust-i18n = "4.2"
+dirs = "7"
+rust-i18n = "4"
 sys-locale = "0.3"
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+gpui-webview = { version = "0.8", optional = true }
+wry = { package = "lb-wry", version = "0.53", optional = true }
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7", default-features = false, features = ["clipboard", "file_selector", "image_picker", "url_launcher", "path_provider", "camera", "video_player"] }
@@ -61,9 +67,6 @@ tempfile = "3"
 name = "ferrsphen"
 path = "src/main.rs"
 required-features = ["desktop"]
-
-[profile.dev]
-debug = 0
 
 [[example]]
 name = "preview"

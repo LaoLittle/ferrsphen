@@ -2,10 +2,10 @@ use atri_qq::{
     contacts::GroupMember,
     messages::{Conversation, Mention, Message, MessageElement, PushEvent, Reply},
 };
-use ferrsphen::ui_motion::{CardTextureCache, card_frame};
 use ferrsphen::{
     backend::{AttachmentKind, Command, ComposePart, Update},
     model::{Model, conversation_key, image_only, message_groups, reply_target, summary},
+    settings::{Appearance, Language, Preferences},
     ui_motion::{Bounce, ENTRANCE_SPAN, ENTRANCE_ZOOM, EXIT_SPAN, TimelineViewport, page_progress},
     viewer::{ImageItem, Viewer},
 };
@@ -13,7 +13,7 @@ use gpui_kit::{
     component::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
-        menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
         popover::Popover,
         spinner::Spinner,
         *,
@@ -23,7 +23,7 @@ use gpui_kit::{
 };
 use rust_i18n::t;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
@@ -38,6 +38,12 @@ const REACTION_CHOICES: [u32; 12] = [66, 76, 77, 13, 0, 32, 28, 5, 21, 49, 89, 7
 enum Page {
     Chat,
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Appearance,
 }
 
 struct PendingCopy {
@@ -84,6 +90,27 @@ struct SendScroll {
     from: Pixels,
     target: Pixels,
     started: Instant,
+}
+struct OutgoingFlight {
+    source: Bounds<Pixels>,
+    target: Rc<Cell<Option<Bounds<Pixels>>>>,
+    text: String,
+}
+struct MessageArrival {
+    conversation: String,
+    started: Instant,
+    flight: Option<OutgoingFlight>,
+}
+impl MessageArrival {
+    fn progress(&self, now: Instant) -> f32 {
+        let span = if self.flight.is_some() {
+            ferrsphen::ui_motion::MESSAGE_SEND_SPAN
+        } else {
+            ferrsphen::ui_motion::MESSAGE_ARRIVAL_SPAN
+        };
+        (now.saturating_duration_since(self.started).as_secs_f32() / span.as_secs_f32())
+            .clamp(0., 1.)
+    }
 }
 struct RecallTween {
     original: gpui_kit::Size<Pixels>,
@@ -144,10 +171,11 @@ pub struct AppView {
     viewer_focus: FocusHandle,
     fades: HashMap<String, Fade>,
     expanded_images: HashSet<String>,
-    card_textures: Entity<CardTextureCache>,
     bubble_sizes: Rc<RefCell<HashMap<String, gpui_kit::Size<Pixels>>>>,
     visible_bubbles: Rc<RefCell<HashMap<String, gpui_kit::Size<Pixels>>>>,
     recall_tweens: HashMap<String, RecallTween>,
+    message_arrivals: HashMap<String, MessageArrival>,
+    arrival_animating: bool,
     recall_animating: bool,
     recall_clock: BackgroundExecutor,
     viewer_window: Option<AnyWindowHandle>,
@@ -160,6 +188,9 @@ pub struct AppView {
     forward_cache: HashMap<String, Vec<Message>>,
     phase: Phase,
     page: Page,
+    settings_section: SettingsSection,
+    preferences: Preferences,
+    applied_locale: String,
     mobile_platform: bool,
     desktop_windows: bool,
     window_kind: crate::window_chrome::AppWindowKind,
@@ -190,6 +221,8 @@ pub struct AppView {
     confirmation: Option<AttachmentConfirmation>,
     confirmation_focus: FocusHandle,
     challenge: Option<atri_qq::LoginChallenge>,
+    captcha_id: u64,
+    captcha_pending: bool,
     ticket: Entity<InputState>,
     captcha_random: Entity<InputState>,
     qr: Option<Arc<Image>>,
@@ -197,6 +230,7 @@ pub struct AppView {
     status: String,
     error: Option<String>,
     sidebar: bool,
+    failed_assets: HashSet<String>,
     assets: HashMap<String, PathBuf>,
     requested: HashSet<String>,
     scroll: ScrollHandle,
@@ -598,30 +632,15 @@ impl AppView {
             .pl_2()
             .py_1()
             .children(images.into_iter().map(|(index, path)| {
-                div()
-                    .size_12()
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(cx.theme().muted)
-                    .child(match path {
-                        Some(path) => img(path)
-                            .id(SharedString::from(format!(
-                                "quote-image:{}:{index}",
-                                message_key(message)
-                            )))
-                            .size_full()
-                            .object_fit(ObjectFit::Cover)
-                            .into_any_element(),
-                        None => div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .child(t!("common.image"))
-                            .into_any_element(),
-                    })
+                div().size_12().flex_shrink_0().bg(cx.theme().muted).child(
+                    ferrsphen::image_loading::LoadingImage::new(
+                        SharedString::from(format!("quote-image:{}:{index}", message_key(message))),
+                        path,
+                    )
+                    .square()
+                    .failed(self.failed_assets.contains(&image_key(message, index)))
+                    .size_full(),
+                )
             }))
             .child(
                 div()
@@ -814,6 +833,10 @@ impl AppView {
                 if this
                     .update(cx, |this, cx| {
                         match update {
+                            Update::Preferences(preferences) => {
+                                this.preferences = preferences;
+                                ferrsphen::settings::apply(preferences, cx);
+                            }
                             Update::Voice { key, result } => this
                                 .voice_player
                                 .update(cx, |player, cx| player.complete(key, result, cx)),
@@ -842,10 +865,11 @@ impl AppView {
             viewer_focus: cx.focus_handle(),
             fades: HashMap::new(),
             expanded_images: HashSet::new(),
-            card_textures: CardTextureCache::new(cx),
             bubble_sizes: Rc::new(RefCell::new(HashMap::new())),
             visible_bubbles: Rc::new(RefCell::new(HashMap::new())),
             recall_tweens: HashMap::new(),
+            message_arrivals: HashMap::new(),
+            arrival_animating: false,
             recall_animating: false,
             recall_clock: cx.background_executor().clone(),
             viewer_window: None,
@@ -862,6 +886,9 @@ impl AppView {
             window_kind: crate::window_chrome::AppWindowKind::Login,
             window_switch_pending: false,
             page: Page::Chat,
+            settings_section: SettingsSection::General,
+            preferences: Preferences::default(),
+            applied_locale: crate::i18n::locale().to_string(),
             phone,
             phone_conversation: false,
             phone_qr_login: false,
@@ -888,6 +915,8 @@ impl AppView {
             confirmation: None,
             confirmation_focus: cx.focus_handle(),
             challenge: None,
+            captcha_id: 0,
+            captcha_pending: false,
             ticket,
             captcha_random,
             qr: None,
@@ -895,6 +924,7 @@ impl AppView {
             status: String::new(),
             error: None,
             sidebar: true,
+            failed_assets: HashSet::new(),
             assets: HashMap::new(),
             requested: HashSet::new(),
             scroll: ScrollHandle::new(),
@@ -922,7 +952,17 @@ impl AppView {
     }
     fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let owner = cx.entity().downgrade();
+        let appearance_owner = owner.clone();
         self._subscriptions = vec![
+            window.observe_window_appearance(move |window, cx| {
+                let appearance = window.appearance();
+                let owner = appearance_owner.clone();
+                cx.defer(move |cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.system_appearance_changed(appearance, cx);
+                    });
+                });
+            }),
             cx.on_window_closed(move |cx, closed| {
                 let owner = owner.clone();
                 cx.defer(move |cx| {
@@ -1149,7 +1189,97 @@ impl AppView {
         })
         .detach();
     }
+    fn animate_message_arrivals(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        self.message_arrivals.retain(|_, arrival| {
+            !cx.reduce_motion()
+                && matches!(self.phase, Phase::Chat)
+                && self.page == Page::Chat
+                && (!self.phone || self.phone_conversation)
+                && self.transition.is_none()
+                && self.model.selected.as_ref() == Some(&arrival.conversation)
+                && arrival.progress(now) < 1.
+        });
+        if self.arrival_animating || self.message_arrivals.is_empty() {
+            return;
+        }
+        self.arrival_animating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let now = cx.background_executor().now();
+                        this.message_arrivals
+                            .retain(|_, arrival| arrival.progress(now) < 1.);
+                        this.arrival_animating = !this.message_arrivals.is_empty();
+                        cx.notify();
+                        this.arrival_animating
+                    })
+                    .ok()
+                    != Some(true)
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    fn message_flights(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let now = cx.background_executor().now();
+        self.message_arrivals
+            .iter()
+            .filter_map(|(key, arrival)| {
+                let flight = arrival.flight.as_ref()?;
+                let text = flight.text.clone();
+                let mut background = cx.theme().accent;
+                let foreground = cx.theme().foreground;
+                let font = cx.theme().font_family.clone();
+                let selector = format!("message-flight:{key}");
+                Some(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .child(ferrsphen::ui_motion::MessageFlight {
+                            source: flight.source,
+                            target: flight.target.clone(),
+                            progress: arrival.progress(now),
+                            render: Some(Box::new(move |bounds, progress| {
+                                let shell = (progress / 0.28).clamp(0., 1.);
+                                background.a *= shell;
+                                div()
+                                    .debug_selector(move || selector.clone())
+                                    .w(bounds.size.width)
+                                    .h(bounds.size.height)
+                                    .rounded_lg()
+                                    .overflow_hidden()
+                                    .bg(background)
+                                    .text_color(foreground)
+                                    .font_family(font)
+                                    .text_sm()
+                                    .px(px(12. * page_progress(progress)))
+                                    .py(px(8. * page_progress(progress)))
+                                    .child(text)
+                                    .into_any_element()
+                            })),
+                        })
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
     fn apply(&mut self, update: Update) {
+        if matches!(
+            &update,
+            Update::Connecting | Update::LoginRequired | Update::Online(_) | Update::Offline(_)
+        ) {
+            self.cancel_captcha();
+            self.challenge = None;
+        }
         let identity_changed = matches!(
             &update,
             Update::Online(_)
@@ -1180,6 +1310,7 @@ impl AppView {
         let paginating =
             matches!(&update, Update::History { key, .. } if self.loading_more.contains(key));
         match update {
+            Update::Preferences(preferences) => self.preferences = preferences,
             Update::Activity(record) => self.apply_activity(record),
             Update::ReactionDone {
                 group,
@@ -1194,9 +1325,31 @@ impl AppView {
                 }
             }
             Update::Connecting => self.phase = Phase::Connecting,
+            Update::Captcha { id, result } => {
+                if id == self.captcha_id && self.captcha_pending {
+                    self.captcha_pending = false;
+                    match result {
+                        Ok(Some(ticket)) => {
+                            if self.command(Command::SubmitCaptcha {
+                                ticket: ticket.ticket,
+                                random: ticket.randstr,
+                            }) {
+                                self.challenge = None;
+                                self.phase = Phase::Connecting;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => self.error = Some(t!("login.verification_failed").into_owned()),
+                    }
+                }
+            }
             Update::Challenge(challenge) => {
+                self.cancel_captcha();
                 self.challenge = Some(challenge);
                 self.phase = Phase::Login;
+                if !cfg!(any(target_os = "android", target_os = "ios")) {
+                    self.open_captcha();
+                }
             }
             Update::LoginRequired => self.phase = Phase::Login,
             Update::Account(uin) => {
@@ -1305,6 +1458,27 @@ impl AppView {
             }
             Update::Message(message) => {
                 let visible = self.page == Page::Chat && (!self.phone || self.phone_conversation);
+                let key = conversation_key(&message.conversation);
+                let identity = message_key(&message);
+                let already_present = self
+                    .model
+                    .messages
+                    .get(&key)
+                    .is_some_and(|rows| rows.iter().any(|row| message_key(row) == identity));
+                if visible
+                    && matches!(self.phase, Phase::Chat)
+                    && self.transition.is_none()
+                    && self.model.selected.as_ref() == Some(&key)
+                    && !already_present
+                {
+                    self.message_arrivals
+                        .entry(identity)
+                        .or_insert(MessageArrival {
+                            conversation: key,
+                            started: self.recall_clock.now(),
+                            flight: None,
+                        });
+                }
                 self.model.receive_visible(message, true, visible);
                 self.persist();
             }
@@ -1378,6 +1552,7 @@ impl AppView {
             }
             Update::Image { key, result } => match result {
                 Ok(path) => {
+                    self.failed_assets.remove(&key);
                     self.assets.insert(key, path);
                 }
                 Err(error) => {
@@ -1411,7 +1586,11 @@ impl AppView {
                 }
                 Err(error) => tracing::warn!(%uid, %error, "resolve avatar UIN failed"),
             },
+            Update::AssetFailed { key } => {
+                self.failed_assets.insert(key);
+            }
             Update::Asset { key, path } => {
+                self.failed_assets.remove(&key);
                 self.assets.insert(key, path);
             }
             Update::Forward { key, messages } => {
@@ -1664,7 +1843,11 @@ impl AppView {
                         .flat_map(|message| {
                             message.elements.iter().enumerate().filter_map(
                                 move |(index, element)| {
-                                    if let MessageElement::Image(reference) = element {
+                                    if let MessageElement::Image(reference) = element
+                                        && (!message.is_self
+                                            || !reference.message_info.is_empty()
+                                            || reference.download_url.is_some())
+                                    {
                                         Some((image_key(message, index), reference.clone()))
                                     } else {
                                         None
@@ -1679,7 +1862,11 @@ impl AppView {
             previews.extend(messages.iter().take(80).flat_map(|message| {
                 message.elements.iter().enumerate().filter_map(
                     move |(index, element)| match element {
-                        MessageElement::Image(reference) => {
+                        MessageElement::Image(reference)
+                            if !message.is_self
+                                || !reference.message_info.is_empty()
+                                || reference.download_url.is_some() =>
+                        {
                             Some((image_key(message, index), reference.clone()))
                         }
                         _ => None,
@@ -1797,69 +1984,16 @@ impl AppView {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, element)| match element {
-                        MessageElement::Image(reference) => {
+                        MessageElement::Image(reference)
+                            if !message.is_self
+                                || !reference.message_info.is_empty()
+                                || reference.download_url.is_some() =>
+                        {
                             Some((image_key(message, index), reference.clone()))
                         }
                         _ => None,
                     }),
             );
-        }
-        let mut cards = Vec::new();
-        for group in self
-            .visible_groups(false)
-            .into_iter()
-            .chain(self.visible_groups(true))
-        {
-            if !image_only(&group[0]) {
-                continue;
-            }
-            let count = group
-                .iter()
-                .map(|message| {
-                    message
-                        .elements
-                        .iter()
-                        .filter(|element| matches!(element, MessageElement::Image(_)))
-                        .count()
-                })
-                .sum::<usize>();
-            for (slot, (message, index, reference)) in group
-                .iter()
-                .flat_map(|message| {
-                    message
-                        .elements
-                        .iter()
-                        .enumerate()
-                        .filter_map(move |(index, element)| match element {
-                            MessageElement::Image(reference) => Some((message, index, reference)),
-                            _ => None,
-                        })
-                })
-                .take(if count <= 5 { 5 } else { 3 })
-                .enumerate()
-                .skip(1)
-            {
-                let source = image_key(message, index);
-                let size = ferrsphen::card_preview::fitted(reference.width, reference.height);
-                let (width, height) = (size.width.round() as u32, size.height.round() as u32);
-                let key = card_key(&source, slot, width, height);
-                if !self.requested.contains(&key)
-                    && let Some(path) = self.assets.get(&source)
-                {
-                    cards.push((key, path.clone(), slot, width, height));
-                }
-            }
-        }
-        for (key, path, slot, width, height) in cards {
-            if self.command(Command::CardPreview {
-                key: key.clone(),
-                path,
-                slot,
-                width,
-                height,
-            }) {
-                self.requested.insert(key);
-            }
         }
         for (key, reference) in videos {
             if !self.requested.contains(&key)
@@ -1872,7 +2006,8 @@ impl AppView {
             }
         }
         for (key, reference) in previews {
-            if !self.requested.contains(&key)
+            if !self.assets.contains_key(&key)
+                && !self.requested.contains(&key)
                 && self.command(Command::Preview {
                     key: key.clone(),
                     reference,
@@ -2090,6 +2225,15 @@ impl AppView {
         if text.trim().is_empty() {
             return;
         }
+        let flight_source = input.range_to_bounds(&(0..text.len())).and_then(|bounds| {
+            let line_height = input.cursor_layout().map_or(px(20.), |(_, height)| height);
+            let bounds = if bounds.size.height > line_height + px(1.) {
+                input.text_bounds().unwrap_or(bounds)
+            } else {
+                bounds
+            };
+            (bounds.size.width > px(0.) && bounds.size.height > px(0.)).then_some(bounds)
+        });
         let tokens = input.tokens().to_vec();
         let mut parts = Vec::new();
         let mut cursor = 0;
@@ -2202,6 +2346,28 @@ impl AppView {
                 elements,
                 nonce,
                 chrono::Utc::now().timestamp(),
+            );
+            let flight = if !cx.reduce_motion()
+                && staged
+                    .elements
+                    .iter()
+                    .all(|element| matches!(element, MessageElement::Text(_)))
+            {
+                flight_source.map(|source| OutgoingFlight {
+                    source,
+                    target: Rc::new(Cell::new(None)),
+                    text: text.clone(),
+                })
+            } else {
+                None
+            };
+            self.message_arrivals.insert(
+                message_key(&staged),
+                MessageArrival {
+                    conversation: conversation_key(&conversation),
+                    started: cx.background_executor().now(),
+                    flight,
+                },
             );
             for (index, path) in images {
                 self.assets.insert(image_key(&staged, index), path);
@@ -2631,32 +2797,46 @@ impl AppView {
                                             );
                                             this.asset(key.clone(), item.url);
                                             let path = this.assets.get(&key).cloned();
+                                            let preview =
+                                                ferrsphen::image_loading::LoadingImage::new(
+                                                    SharedString::from(format!(
+                                                        "favorite-image:{key}"
+                                                    )),
+                                                    path.clone(),
+                                                )
+                                                .failed(this.failed_assets.contains(&key))
+                                                .absolute()
+                                                .left(px(3.))
+                                                .top(px(3.))
+                                                .size(px(46.));
+                                            let selector = key.clone();
                                             let mut button =
                                                 Button::new(SharedString::from(key.clone()))
-                                                    .debug_selector(move || key.clone())
                                                     .ghost()
+                                                    .absolute()
+                                                    .inset_0()
+                                                    .opacity(0.)
                                                     .size(px(52.))
                                                     .disabled(path.is_none())
                                                     .accessibility_label(t!(
                                                         "expressions.favorite"
                                                     ));
                                             if let Some(path) = path {
-                                                button = button
-                                                    .child(
-                                                        img(path.clone())
-                                                            .size(px(46.))
-                                                            .object_fit(ObjectFit::Contain),
-                                                    )
-                                                    .on_click(cx.listener(
-                                                        move |this, _, window, cx| {
-                                                            this.emoji_open = false;
-                                                            this.insert_favorite(&path, window, cx);
-                                                        },
-                                                    ));
-                                            } else {
-                                                button = button.child(Spinner::new());
+                                                button = button.on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.emoji_open = false;
+                                                        this.insert_favorite(&path, window, cx);
+                                                    },
+                                                ));
                                             }
-                                            cells.push(button);
+                                            cells.push(
+                                                div()
+                                                    .debug_selector(move || selector.clone())
+                                                    .relative()
+                                                    .size(px(52.))
+                                                    .child(preview)
+                                                    .child(button),
+                                            );
                                         }
                                         div()
                                             .flex()
@@ -3301,7 +3481,7 @@ impl AppView {
                     .bg(cx.theme().primary_foreground)
                     .rounded_lg()
                     .map(|element| match &self.qr {
-                        Some(image) => element.child(img(image.clone()).size_full()),
+                        Some(image) => element.child(img(image.clone()).size_full().rounded_lg()),
                         None => element.child(
                             div()
                                 .text_sm()
@@ -3341,6 +3521,27 @@ impl AppView {
             )
             .into_any_element()
     }
+    fn cancel_captcha(&mut self) {
+        if self.captcha_pending {
+            self.command(Command::CancelCaptcha);
+        }
+        self.captcha_pending = false;
+        self.captcha_id = self.captcha_id.wrapping_add(1);
+    }
+    fn open_captcha(&mut self) {
+        let Some(atri_qq::LoginChallenge::Captcha { url }) = &self.challenge else {
+            return;
+        };
+        let request = crate::captcha::Request {
+            url: url.clone(),
+            preferences: self.preferences,
+        };
+        self.cancel_captcha();
+        self.captcha_pending = self.command(Command::OpenCaptcha {
+            id: self.captcha_id,
+            request,
+        });
+    }
     fn challenge_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(challenge) = &self.challenge else {
             return div().into_any_element();
@@ -3358,35 +3559,48 @@ impl AppView {
             .child(
                 Button::new("verify-link")
                     .ghost()
-                    .label(t!("login.open_verification"))
-                    .on_click(move |_, _, _| {
-                        let _ = open::that(&url);
-                    }),
+                    .label(if self.captcha_pending {
+                        t!("common.loading")
+                    } else {
+                        t!("login.open_verification")
+                    })
+                    .disabled(self.captcha_pending)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if captcha && !cfg!(any(target_os = "android", target_os = "ios")) {
+                            this.open_captcha();
+                        } else {
+                            let _ = open::that(&url);
+                        }
+                        cx.notify();
+                    })),
             )
-            .when(captcha, |view| {
-                view.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(Input::new(&self.ticket).aria_label("ticket"))
-                        .child(Input::new(&self.captcha_random).aria_label("randstr")),
-                )
-                .child(
-                    Button::new("submit-verification")
-                        .primary()
-                        .label(t!("login.submit_verification"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let ticket = this.ticket.read(cx).value().to_string();
-                            let random = this.captcha_random.read(cx).value().to_string();
-                            if ticket.is_empty() || random.is_empty() {
-                                this.error = Some(t!("login.enter_verification").into_owned());
-                            } else {
-                                this.command(Command::SubmitCaptcha { ticket, random });
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
+            .when(
+                captcha && cfg!(any(target_os = "android", target_os = "ios")),
+                |view| {
+                    view.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(Input::new(&self.ticket).aria_label("ticket"))
+                            .child(Input::new(&self.captcha_random).aria_label("randstr")),
+                    )
+                    .child(
+                        Button::new("submit-verification")
+                            .primary()
+                            .label(t!("login.submit_verification"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let ticket = this.ticket.read(cx).value().to_string();
+                                let random = this.captcha_random.read(cx).value().to_string();
+                                if ticket.is_empty() || random.is_empty() {
+                                    this.error = Some(t!("login.enter_verification").into_owned());
+                                } else {
+                                    this.command(Command::SubmitCaptcha { ticket, random });
+                                }
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
             .into_any_element()
     }
 
@@ -3445,14 +3659,305 @@ impl AppView {
             .child(div().w_3())
             .into_any_element()
     }
+    fn system_appearance_changed(&self, appearance: WindowAppearance, cx: &mut Context<Self>) {
+        if self.preferences.appearance == Appearance::System {
+            ferrsphen::settings::apply_theme(Appearance::System, appearance, cx);
+            cx.refresh_windows();
+        }
+    }
+
+    fn set_preferences(
+        &mut self,
+        preferences: Preferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preferences = preferences;
+        ferrsphen::settings::apply(preferences, cx);
+        if preferences.appearance == Appearance::System {
+            ferrsphen::settings::apply_theme(Appearance::System, window.appearance(), cx);
+        }
+        self.command(Command::SavePreferences(preferences));
+        cx.notify();
+    }
+
+    fn settings_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let categories = div()
+            .debug_selector(|| "settings-categories".into())
+            .w(px(if self.phone { 112. } else { 196. }))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .children(
+                [
+                    (
+                        SettingsSection::General,
+                        "settings-general",
+                        "settings.general",
+                    ),
+                    (
+                        SettingsSection::Appearance,
+                        "settings-appearance",
+                        "settings.appearance",
+                    ),
+                ]
+                .into_iter()
+                .map(|(section, id, label)| {
+                    div().debug_selector(move || id.into()).child(
+                        Button::new(id)
+                            .ghost()
+                            .w_full()
+                            .justify_start()
+                            .label(t!(label))
+                            .when(self.settings_section == section, |button| {
+                                button.bg(cx.theme().accent)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings_section = section;
+                                cx.notify();
+                            })),
+                    )
+                }),
+            );
+        let heading = match self.settings_section {
+            SettingsSection::General => "settings.general",
+            SettingsSection::Appearance => "settings.appearance",
+        };
+        let details = div()
+            .id("settings-details")
+            .debug_selector(|| "settings-details".into())
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .overflow_y_scroll()
+            .p(px(if self.phone { 16. } else { 32. }))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(720.))
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(t!(heading)),
+                    )
+                    .child(match self.settings_section {
+                        SettingsSection::General => self.language_settings(cx),
+                        SettingsSection::Appearance => self.appearance_settings(cx),
+                    }),
+            );
+        div()
+            .debug_selector(|| "settings-page".into())
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .child(categories)
+            .child(details)
+            .into_any_element()
+    }
+
+    fn language_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity();
+        let selected = self.preferences.language;
+        let label = if selected == Language::System {
+            t!("settings.system").into_owned()
+        } else {
+            selected.native_name().to_owned()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(t!("settings.language")),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "language-dropdown".into())
+                    .w_full()
+                    .max_w(px(400.))
+                    .child(
+                        Button::new("language-select")
+                            .w_full()
+                            .justify_between()
+                            .label(label)
+                            .icon(gpui_kit::assets::IconName::ChevronDown)
+                            .accessibility_label(t!("settings.language"))
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for language in Language::ALL {
+                                    let label = if language == Language::System {
+                                        t!("settings.system").into_owned()
+                                    } else {
+                                        language.native_name().to_owned()
+                                    };
+                                    let owner = owner.clone();
+                                    menu =
+                                        menu.item(
+                                            PopupMenuItem::element(move |_, _| {
+                                                div()
+                                                    .debug_selector(move || language.id().into())
+                                                    .child(label.clone())
+                                            })
+                                            .checked(language == selected)
+                                            .on_click(move |_, window, cx| {
+                                                owner.update(cx, |this, cx| {
+                                                    this.set_preferences(
+                                                        Preferences {
+                                                            language,
+                                                            ..this.preferences
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        );
+                                }
+                                menu
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn appearance_thumbnail(dark: bool) -> Div {
+        let background = rgb(if dark { 0x202020 } else { 0xf7f7f7 });
+        let muted = rgb(if dark { 0x383838 } else { 0xe3e3e3 });
+        let accent = rgb(if dark { 0x426b9a } else { 0x94bdf0 });
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .bg(background)
+            .child(
+                div()
+                    .w(px(30.))
+                    .h_full()
+                    .p_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(muted)
+                    .child(div().w_full().h_2().rounded_sm().bg(accent))
+                    .child(div().w_full().h_2().rounded_sm().bg(background)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().w(px(26.)).h_3().rounded_sm().bg(muted))
+                    .child(div().w(px(30.)).h_3().self_end().rounded_sm().bg(accent)),
+            )
+    }
+
+    fn appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(t!("settings.theme")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .children(Appearance::ALL.into_iter().map(|appearance| {
+                        let selected = self.preferences.appearance == appearance;
+                        let preview = div()
+                            .w_full()
+                            .h(px(96.))
+                            .flex()
+                            .overflow_hidden()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .when(appearance != Appearance::Dark, |preview| {
+                                preview.child(Self::appearance_thumbnail(false))
+                            })
+                            .when(appearance != Appearance::Light, |preview| {
+                                preview.child(Self::appearance_thumbnail(true))
+                            });
+                        div().debug_selector(move || appearance.id().into()).child(
+                            Button::new(appearance.id())
+                                .ghost()
+                                .w(px(168.))
+                                .h_auto()
+                                .p_2()
+                                .border_2()
+                                .rounded_lg()
+                                .border_color(if selected {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().border
+                                })
+                                .accessibility_label(t!(appearance.label_key()))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(preview)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(if appearance == Appearance::Dark {
+                                                    gpui_kit::assets::IconName::Moon
+                                                } else if appearance == Appearance::Light {
+                                                    gpui_kit::assets::IconName::Sun
+                                                } else {
+                                                    gpui_kit::assets::IconName::Palette
+                                                })
+                                                .child(t!(appearance.label_key())),
+                                        ),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_preferences(
+                                        Preferences {
+                                            appearance,
+                                            ..this.preferences
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn main_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let body = div().flex().flex_1().min_h_0().min_w_0();
         let page = if self.page == Page::Settings {
-            div()
-                .debug_selector(|| "settings-page".into())
-                .flex_1()
-                .h_full()
-                .into_any_element()
+            self.settings_page(cx)
         } else if self.phone {
             if self.phone_conversation {
                 self.conversation_panel(window, cx)
@@ -3726,39 +4231,42 @@ impl AppView {
                 let reference = reference.clone();
                 let viewer_key = image_key(message, index);
                 let preview = self.assets.get(&image_key(message, index)).cloned();
-                Button::new(SharedString::from(format!("image:{key}")))
-                    .ghost()
-                    .h_auto()
-                    .p_0()
-                    .accessibility_label(t!("image.open"))
-                    .child(match preview {
-                        Some(path) => img(path)
-                            .id(SharedString::from(format!("animation:{key}")))
-                            .when(reference.width > 0 && reference.height > 0, |image| {
+                div()
+                    .relative()
+                    .child(
+                        ferrsphen::image_loading::LoadingImage::new(
+                            SharedString::from(format!("animation:{key}")),
+                            preview,
+                        )
+                        .failed(self.failed_assets.contains(&viewer_key))
+                        .fit_within(size(px(384.), px(352.)))
+                        .when(
+                            reference.width > 0 && reference.height > 0,
+                            |image| {
                                 let factor = (384. / reference.width as f32)
                                     .min(352. / reference.height as f32)
                                     .min(1.);
                                 image
                                     .w(px(reference.width as f32 * factor))
                                     .h(px(reference.height as f32 * factor))
-                            })
-                            .max_w(rems(24.))
-                            .max_h(rems(22.))
-                            .object_fit(ObjectFit::Contain)
-                            .into_any_element(),
-                        None => div()
-                            .w_48()
-                            .h_24()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(t!("common.image"))
-                            .into_any_element(),
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_image(viewer_key.clone(), reference.clone(), window, cx);
-                        cx.notify();
-                    }))
+                            },
+                        ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("image:{key}")))
+                            .debug_selector(|| "image-hit-target".into())
+                            .ghost()
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .p_0()
+                            .opacity(0.)
+                            .accessibility_label(t!("image.open"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_image(viewer_key.clone(), reference.clone(), window, cx);
+                                cx.notify();
+                            })),
+                    )
                     .context_menu(self.message_menu(message, cx, read_only, Some(index)))
                     .into_any_element()
             }
@@ -3781,7 +4289,12 @@ impl AppView {
                     .bg(gpui_kit::rgba(0x202228ff))
                     .cursor_pointer()
                     .when_some(preview, |view, path| {
-                        view.child(img(path).size_full().object_fit(ObjectFit::Contain))
+                        view.child(
+                            img(path)
+                                .size_full()
+                                .rounded_lg()
+                                .object_fit(ObjectFit::Contain),
+                        )
                     })
                     .child(
                         div()
@@ -4361,16 +4874,7 @@ impl AppView {
                 top += size.height + action_height + 8.;
                 let source_key = image_key(message, *index);
                 let path = self.assets.get(&source_key).cloned();
-                let sheet = self
-                    .assets
-                    .get(&card_key(
-                        &source_key,
-                        order,
-                        size.width.round() as u32,
-                        size.height.round() as u32,
-                    ))
-                    .cloned();
-                let cache = self.card_textures.clone();
+                let failed = self.failed_assets.contains(&source_key);
                 let reference = (*reference).clone();
                 let stack_key = key.clone();
                 let expand_key = key.clone();
@@ -4436,6 +4940,15 @@ impl AppView {
                             this.set_message_hover(&move_key, true, cx);
                         }
                     }));
+                let arrival = if !read_only && !self.message_arrivals.contains_key(&key) {
+                    self.message_arrivals
+                        .get(&message_key(message))
+                        .map_or(1., |arrival| {
+                            page_progress(arrival.progress(cx.background_executor().now()))
+                        })
+                } else {
+                    1.
+                };
                 let self_side = message.is_self;
                 let draw_key = key.clone();
                 card.with_spring(
@@ -4445,11 +4958,7 @@ impl AppView {
                         .from(if expanded { 1. } else { 0. }),
                     move |card, progress| {
                         let progress = progress.clamp(0., 1.);
-                        let angle = if sheet.is_some() {
-                            card_preview::angle(order) * (1. - progress)
-                        } else {
-                            0.
-                        };
+                        let angle = card_preview::angle(order) * (1. - progress);
                         let scale = collapsed_scale + (1. - collapsed_scale) * progress;
                         let displayed_size = card_preview::CardSize {
                             width: size.width * scale,
@@ -4466,22 +4975,13 @@ impl AppView {
                             - rotated.width / 2.;
                         let top = collapsed_y + (expanded_y - collapsed_y) * progress
                             - rotated.height / 2.;
-                        let visual = if let Some(sheet) = sheet.filter(|_| angle.abs() > 0.0001) {
-                            card_frame(sheet, card_preview::frame(progress), cache, scale)
-                        } else if let Some(path) = path {
-                            img(path)
-                                .id(SharedString::from(format!("stack-gif:{draw_key}:{order}")))
-                                .size_full()
-                                .rounded_lg()
-                                .object_fit(ObjectFit::Contain)
-                                .into_any_element()
-                        } else {
-                            div()
-                                .size_full()
-                                .rounded_lg()
-                                .bg(gpui_kit::rgba(0x80808020))
-                                .into_any_element()
-                        };
+                        let visual = ferrsphen::image_loading::LoadingImage::new(
+                            SharedString::from(format!("stack-gif:{draw_key}:{order}")),
+                            path,
+                        )
+                        .failed(failed)
+                        .rotation(angle, size.width, size.height)
+                        .size_full();
                         let trigger = trigger
                             .w(px(rotated.width))
                             .h(px(rotated.height))
@@ -4492,7 +4992,8 @@ impl AppView {
                             trigger.context_menu(menu).into_any_element()
                         };
                         card.left(px(left))
-                            .top(px(top))
+                            .top(px(top + 14. * (1. - arrival)))
+                            .opacity(arrival * if order >= visible_cards { progress } else { 1. })
                             .w(px(rotated.width + if interactive { 16. } else { 0. }))
                             .h(px(
                                 rotated.height + if interactive { action_height + 16. } else { 0. }
@@ -4501,7 +5002,6 @@ impl AppView {
                             .when(order >= visible_cards && progress <= 0.001, |card| {
                                 card.invisible()
                             })
-                            .when(order >= visible_cards, |card| card.opacity(progress))
                             .child(trigger)
                             .when_some(actions, |card, actions| {
                                 card.child(div().h(px(action_height)).child(actions))
@@ -4830,6 +5330,9 @@ impl AppView {
         } else {
             let mut stacked = false;
             for (index, element) in message.elements.iter().enumerate() {
+                if !ferrsphen::message_content::is_visible(element, &message.elements) {
+                    continue;
+                }
                 if image_only && image_count > 1 && matches!(element, MessageElement::Image(_)) {
                     if !stacked {
                         content.push(self.image_stack(messages, cx, read_only));
@@ -4846,7 +5349,7 @@ impl AppView {
             .flex_col()
             .gap_2()
             .rounded_lg()
-            .when(image_only || recalled, |body| body.overflow_hidden())
+            .when(recalled, |body| body.overflow_hidden())
             .when(!image_only || recalled, |body| {
                 body.px_3().py_2().bg(if message.is_self {
                     cx.theme().accent
@@ -4884,10 +5387,20 @@ impl AppView {
         let visible = self.visible_bubbles.clone();
         let scroll = self.scroll.clone();
         let measured_key = key.clone();
+        let arrival = (!read_only)
+            .then(|| self.message_arrivals.get(&key))
+            .flatten();
+        let flight_target = arrival
+            .and_then(|arrival| arrival.flight.as_ref())
+            .map(|flight| flight.target.clone());
+        let flying = flight_target.is_some();
         let body = div()
             .child(body)
             .on_children_prepainted(move |bounds, _, _| {
                 if let Some(bounds) = bounds.first() {
+                    if let Some(target) = &flight_target {
+                        target.set(Some(*bounds));
+                    }
                     if !recalled {
                         measured
                             .borrow_mut()
@@ -4900,14 +5413,34 @@ impl AppView {
                     }
                 }
             })
-            .opacity(if recalled { 1. - 0.35 * progress } else { 1. });
+            .opacity(if flying {
+                0.
+            } else if recalled {
+                1. - 0.35 * progress
+            } else {
+                1.
+            });
         let fade = self.fades.get(&key);
         let (from, to, generation) = fade
             .map(|fade| (fade.from, fade.to, fade.generation))
             .unwrap_or((0., 0., 0));
         let hover_key = key.clone();
         let actions = self.message_actions(message, cx, read_only, false);
+        let arrival_progress = arrival.map_or(1., |arrival| {
+            page_progress(arrival.progress(cx.background_executor().now()))
+        });
         div()
+            .debug_selector({
+                let key = key.clone();
+                move || format!("message-arrival:{key}")
+            })
+            .relative()
+            .top(px(if flying {
+                0.
+            } else {
+                14. * (1. - arrival_progress)
+            }))
+            .opacity(if flying { 1. } else { arrival_progress })
             .id(SharedString::from(key.clone()))
             .flex()
             .w_full()
@@ -5480,6 +6013,7 @@ impl AppView {
                                                             |view, path| {
                                                                 view.child(
                                                                     img(path)
+                                                                        .rounded_md()
                                                                         .size_full()
                                                                         .object_fit(
                                                                             ObjectFit::Contain,
@@ -6046,7 +6580,7 @@ impl AppView {
         let image_width = fit.0 * viewer.zoom;
         let image_height = fit.1 * viewer.zoom;
         let image = match path {
-            Some(path) => {
+            path if path.is_some() || viewer.error.is_none() => {
                 let file = path.clone();
                 div()
                     .absolute()
@@ -6055,21 +6589,28 @@ impl AppView {
                     .w(px(image_width))
                     .h(px(image_height))
                     .child(
-                        img(path)
-                            .id(SharedString::from(format!("viewer:{}", item.key)))
-                            .size_full()
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .context_menu(move |menu, _, _| {
-                        let file = file.clone();
-                        menu.item(
-                            PopupMenuItem::new(t!("common.local_file"))
-                                .on_click(move |_, _, cx| cx.reveal_path(&file)),
+                        ferrsphen::image_loading::LoadingImage::new(
+                            SharedString::from(format!("viewer:{}", item.key)),
+                            path,
                         )
+                        .square()
+                        .size_full(),
+                    )
+                    .map(|view| match file {
+                        Some(file) => view
+                            .context_menu(move |menu, _, _| {
+                                let file = file.clone();
+                                menu.item(
+                                    PopupMenuItem::new(t!("common.local_file"))
+                                        .on_click(move |_, _, cx| cx.reveal_path(&file)),
+                                )
+                            })
+                            .into_any_element(),
+                        None => view.into_any_element(),
                     })
                     .into_any_element()
             }
-            None => div()
+            _ => div()
                 .flex()
                 .size_full()
                 .items_center()
@@ -6329,6 +6870,22 @@ impl AppView {
 }
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locale = crate::i18n::locale().to_string();
+        if self.applied_locale != locale {
+            self.applied_locale = locale;
+            self.account.update(cx, |input, cx| {
+                input.set_placeholder(t!("login.account"), window, cx)
+            });
+            self.password.update(cx, |input, cx| {
+                input.set_placeholder(t!("login.password"), window, cx)
+            });
+            self.search.update(cx, |input, cx| {
+                input.set_placeholder(t!("chat.search"), window, cx)
+            });
+            self.composer.update(cx, |input, cx| {
+                input.set_placeholder(t!("chat.input"), window, cx)
+            });
+        }
         self.sync_desktop_window(window, cx);
         let phone = self.mobile_platform && phone_layout(window.viewport_size());
         if self.phone != phone {
@@ -6342,6 +6899,7 @@ impl Render for AppView {
         self.sync_favorites_refresh(cx);
         self.advance_transition(window, cx);
         self.animate_recalls(cx);
+        self.animate_message_arrivals(cx);
         self.visible_bubbles.borrow_mut().clear();
         self.advance_timeline_anchor(window);
         self.advance_reply_jump(false, window, cx);
@@ -6407,6 +6965,7 @@ impl Render for AppView {
                         })
                 }
             })
+            .children(self.message_flights(cx))
             .when(self.details.is_some(), |view| view.child(self.overlay(cx)))
             .when(self.confirmation.is_some(), |view| {
                 view.child(self.confirmation_view(cx))
@@ -6450,9 +7009,6 @@ fn image_message_offset(messages: &[Message], position: usize) -> f32 {
         })
         .sum()
 }
-fn card_key(source: &str, slot: usize, width: u32, height: u32) -> String {
-    format!("card-sheet:v4:{source}:{slot}:{width}:{height}")
-}
 fn image_key(message: &Message, index: usize) -> String {
     format!("preview:{}:{index}", message_key(message))
 }
@@ -6490,18 +7046,20 @@ fn recalled_size(window: &Window, cx: &App) -> gpui_kit::Size<Pixels> {
 
 #[cfg(all(test, feature = "ui-tests"))]
 mod ui_tests {
-    use super::{AppView, DetailKind, Page, Phase, recalled_size};
+    use super::{AppView, DetailKind, Page, Phase, SettingsSection, recalled_size};
     use atri_qq::{
         media::{MediaConversation, MediaKind, MediaReference},
         messages::{Conversation, Message, MessageElement, Reply},
     };
     use ferrsphen::backend::{AttachmentKind, Command, ComposePart, Update};
     use ferrsphen::model::Cursor;
+    use ferrsphen::settings::{Appearance, Language, Preferences};
     use gpui::{
         AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, VisualTestContext,
         WindowBounds, WindowOptions, point, px, size,
     };
     use gpui::{PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use gpui_kit::component::{ActiveTheme, ThemeMode};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -7641,6 +8199,246 @@ mod ui_tests {
         draw(cx, main);
     }
     #[gpui::test]
+    fn captcha_success_submits_once_and_stale_windows_cannot_submit(cx: &mut TestAppContext) {
+        let (_main, view, _updates, mut commands) = fixture(cx);
+        let challenge = || atri_qq::LoginChallenge::Captcha {
+            url: "https://ssl.captcha.qq.com/template/test".into(),
+        };
+        cx.update(|cx| view.update(cx, |view, _| view.apply(Update::Challenge(challenge()))));
+        let first = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| match command {
+                Command::OpenCaptcha { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        cx.update(|cx| view.update(cx, |view, _| view.apply(Update::Challenge(challenge()))));
+        let second = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| match command {
+                Command::OpenCaptcha { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(first, second);
+        let ticket = || crate::captcha::Ticket {
+            ticket: "ticket".into(),
+            randstr: "random".into(),
+        };
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::Captcha {
+                    id: first,
+                    result: Ok(Some(ticket())),
+                })
+            })
+        });
+        assert!(commands.try_recv().is_err());
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::Captcha {
+                    id: second,
+                    result: Ok(Some(ticket())),
+                })
+            })
+        });
+        assert!(
+            matches!(commands.try_recv().unwrap(),Command::SubmitCaptcha{ticket,random} if ticket=="ticket"&&random=="random")
+        );
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                assert!(view.challenge.is_none());
+                assert!(!view.captcha_pending);
+                view.apply(Update::Captcha {
+                    id: second,
+                    result: Ok(Some(ticket())),
+                });
+            })
+        });
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    fn closing_captcha_allows_retry_and_login_changes_cancel_it(cx: &mut TestAppContext) {
+        let (_main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::Challenge(atri_qq::LoginChallenge::Captcha {
+                    url: "https://ssl.captcha.qq.com/template/test".into(),
+                }))
+            })
+        });
+        let id = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| match command {
+                Command::OpenCaptcha { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::Captcha {
+                    id,
+                    result: Ok(None),
+                });
+                assert!(view.challenge.is_some());
+                assert!(!view.captcha_pending);
+                assert!(view.error.is_none());
+                view.open_captcha();
+                view.apply(Update::Connecting);
+                assert!(!view.captcha_pending);
+                assert!(view.challenge.is_none());
+            })
+        });
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::CancelCaptcha))
+        );
+    }
+
+    #[gpui::test]
+    fn settings_language_and_appearance_apply_immediately_and_enqueue_persistence(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        let original_locale = crate::i18n::locale().to_string();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.page = Page::Settings;
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("language-ja").is_none());
+        let dropdown = visual.debug_bounds("language-dropdown").unwrap();
+        visual.simulate_click(dropdown.center(), Default::default());
+        frames(cx, main, 2);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let japanese = visual.debug_bounds("language-ja").unwrap();
+        visual.simulate_click(japanese.center(), Default::default());
+        frames(cx, main, 2);
+        assert_eq!(&*crate::i18n::locale(), "ja");
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("language-ja")
+                .is_none()
+        );
+        cx.update(|cx| assert_eq!(view.read(cx).preferences.language, Language::Japanese));
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::SavePreferences(Preferences {
+                    language: Language::Japanese,
+                    ..
+                })
+            ))
+        );
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let category = visual.debug_bounds("settings-appearance").unwrap();
+        visual.simulate_click(category.center(), Default::default());
+        frames(cx, main, 2);
+        for (selector, mode) in [
+            ("appearance-dark", ThemeMode::Dark),
+            ("appearance-light", ThemeMode::Light),
+        ] {
+            let mut visual = VisualTestContext::from_window(main, cx);
+            let card = visual.debug_bounds(selector).unwrap();
+            assert!(card.size.width >= px(160.) && card.size.height >= px(120.));
+            visual.simulate_click(card.center(), Default::default());
+            frames(cx, main, 2);
+            cx.update(|cx| assert_eq!(cx.theme().mode, mode));
+        }
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let card = visual.debug_bounds("appearance-system").unwrap();
+        visual.simulate_click(card.center(), Default::default());
+        frames(cx, main, 2);
+        cx.update(|cx| assert_eq!(view.read(cx).preferences.appearance, Appearance::System));
+        crate::i18n::set_locale(&original_locale);
+    }
+
+    #[gpui::test]
+    fn startup_preferences_restore_language_and_theme(cx: &mut TestAppContext) {
+        let (main, view, updates, _commands) = fixture(cx);
+        let original_locale = crate::i18n::locale().to_string();
+        let preferences = Preferences {
+            language: Language::Korean,
+            appearance: Appearance::Light,
+        };
+        updates.try_send(Update::Preferences(preferences)).unwrap();
+        cx.run_until_parked();
+        frames(cx, main, 2);
+        assert_eq!(&*crate::i18n::locale(), "ko");
+        cx.update(|cx| {
+            assert_eq!(view.read(cx).preferences, preferences);
+            assert_eq!(cx.theme().mode, ThemeMode::Light);
+        });
+        crate::i18n::set_locale(&original_locale);
+    }
+
+    #[gpui::test]
+    fn system_theme_tracks_window_appearance_and_explicit_mode_stays_fixed(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        for (appearance, mode) in [
+            (gpui::WindowAppearance::Dark, ThemeMode::Dark),
+            (gpui::WindowAppearance::Light, ThemeMode::Light),
+        ] {
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.system_appearance_changed(appearance, cx)
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(cx.theme().mode, mode));
+        }
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_preferences(
+                    Preferences {
+                        appearance: Appearance::Dark,
+                        ..view.preferences
+                    },
+                    window,
+                    cx,
+                );
+            })
+        })
+        .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.system_appearance_changed(gpui::WindowAppearance::Light, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.theme().mode, ThemeMode::Dark));
+    }
+
+    #[gpui::test]
+    fn phone_settings_keep_categories_and_cards_inside_available_width(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(390.), px(844.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.page = Page::Settings;
+                view.settings_section = SettingsSection::Appearance;
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let details = visual.debug_bounds("settings-details").unwrap();
+        let category = visual.debug_bounds("settings-categories").unwrap();
+        assert_eq!(details.left(), category.right());
+        for mode in Appearance::ALL {
+            let card = visual.debug_bounds(mode.id()).unwrap();
+            assert!(card.left() >= details.left());
+            assert!(card.right() <= details.right());
+        }
+        assert!(visual.debug_bounds("navigation").is_some());
+    }
+
+    #[gpui::test]
     fn phone_login_defaults_to_password_and_switches_to_qr(cx: &mut TestAppContext) {
         let (main, view, _updates, mut commands) = fixture(cx);
         cx.simulate_window_resize(main, size(px(320.), px(568.)));
@@ -7887,6 +8685,226 @@ mod ui_tests {
             px(844.)
         );
         assert!(visual.debug_bounds("chat-list").is_some());
+    }
+
+    #[gpui::test]
+    fn self_image_receipt_uses_local_original_and_waits_for_a_download_locator(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _, mut commands) = fixture(cx);
+        let mut message = picture_message(1, 160, 120);
+        message.is_self = true;
+        message.random = 12345;
+        let key = super::image_key(&message, 0);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(message.clone(), false);
+                view.request_assets();
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::Preview { .. }))
+        );
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                assert!(!view.failed_assets.contains(&key));
+                assert!(!view.requested.contains(&key));
+                if let MessageElement::Image(reference) = &mut message.elements[0] {
+                    reference.download_url = Some("https://example.com/image.png".into());
+                }
+                view.apply(Update::Message(message.clone()));
+                view.request_assets();
+            })
+        });
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(
+            |command| matches!(command, Command::Preview { key: requested, .. } if requested == key)
+        ));
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.requested.remove(&key);
+                view.assets.insert(key.clone(), "local-original.png".into());
+                view.request_assets();
+            })
+        });
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::Preview { .. }))
+        );
+        cx.update(|cx| {
+            assert_eq!(
+                view.read(cx).assets[&key],
+                std::path::PathBuf::from("local-original.png")
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn live_arrival_animates_once_and_history_never_replays(cx: &mut TestAppContext) {
+        let (main, view, _, _) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 4);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Message(text_message(2)));
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let initial = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-arrival:group:42:2:2")
+            .unwrap();
+        let started = cx.update(|cx| view.read(cx).message_arrivals["group:42:2:2"].started);
+        frames(cx, main, 5);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Message(text_message(2)));
+                assert_eq!(view.message_arrivals["group:42:2:2"].started, started);
+                view.apply(Update::CachedMessages {
+                    key: "group:42".into(),
+                    messages: vec![text_message(3)],
+                });
+                assert!(!view.message_arrivals.contains_key("group:42:3:3"));
+                cx.notify();
+            })
+        });
+        frames(cx, main, 20);
+        let settled = VisualTestContext::from_window(main, cx)
+            .debug_bounds("message-arrival:group:42:2:2")
+            .unwrap();
+        assert!(initial.top() > settled.top() + px(5.));
+        cx.update(|cx| assert!(view.read(cx).message_arrivals.is_empty()));
+    }
+
+    #[gpui::test]
+    fn outgoing_text_flies_from_composer_then_hands_off_to_the_same_message(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 4);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.composer
+                    .update(cx, |input, cx| input.set_value("从输入框发送", window, cx));
+                cx.notify();
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.send(window, cx);
+                assert!(view.composer.read(cx).value().is_empty());
+                assert_eq!(view.model.messages["group:42"].len(), 2);
+            })
+        })
+        .unwrap();
+        let (id, nonce) = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, nonce, .. } => Some((id, nonce)),
+                _ => None,
+            })
+            .unwrap();
+        let key = format!("group:42:self:{nonce}");
+        let flight_selector: &'static str =
+            Box::leak(format!("message-flight:{key}").into_boxed_str());
+        let bubble_selector: &'static str =
+            Box::leak(format!("message-bubble:{key}").into_boxed_str());
+        draw(cx, main);
+        let source = VisualTestContext::from_window(main, cx)
+            .debug_bounds(flight_selector)
+            .unwrap();
+        frames(cx, main, 6);
+        let during = VisualTestContext::from_window(main, cx)
+            .debug_bounds(flight_selector)
+            .unwrap();
+        assert!(during.top() < source.top());
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                let mut receipt = text_message(2);
+                receipt.is_self = true;
+                receipt.random = nonce;
+                receipt.elements = vec![MessageElement::Text("从输入框发送".into())];
+                let started = view.message_arrivals[&key].started;
+                view.apply(Update::Sent {
+                    id,
+                    result: Ok(receipt.clone()),
+                });
+                view.apply(Update::Message(receipt));
+                assert_eq!(view.message_arrivals[&key].started, started);
+                assert_eq!(view.model.messages["group:42"].len(), 2);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 30);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds(flight_selector).is_none());
+        assert!(visual.debug_bounds(bubble_selector).is_some());
+        cx.update(|cx| assert!(view.read(cx).message_arrivals.is_empty()));
+    }
+
+    #[gpui::test]
+    fn reduced_motion_keeps_sent_and_received_messages_immediately_visible(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.apply(Update::Message(text_message(2)));
+                cx.notify();
+            });
+        });
+        draw(cx, main);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.composer
+                    .update(cx, |input, cx| input.set_value("直接显示", window, cx));
+                view.send(window, cx);
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.message_arrivals.is_empty());
+            assert_eq!(view.model.messages["group:42"].len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn leaving_conversation_cancels_message_arrivals(cx: &mut TestAppContext) {
+        let (main, view, _, _) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.apply(Update::Message(text_message(2)));
+                assert_eq!(view.message_arrivals.len(), 1);
+                view.page = super::Page::Settings;
+                cx.notify();
+            })
+        });
+        frames(cx, main, 2);
+        cx.update(|cx| assert!(view.read(cx).message_arrivals.is_empty()));
     }
 
     #[gpui::test]
@@ -8711,6 +9729,39 @@ mod ui_tests {
         });
     }
     #[gpui::test]
+    fn exhausted_history_preserves_rows_clears_error_and_stops_paging(cx: &mut TestAppContext) {
+        let (_main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(100), false);
+                view.model.selected = Some("group:42".into());
+                let state = view.model.history.entry("group:42".into()).or_default();
+                state.loaded = true;
+                state.loading = true;
+                state.cursor = Some(ferrsphen::model::Cursor::Group(99));
+                state.error = Some("previous failure".into());
+                view.loading_more.insert("group:42".into());
+                view.apply(Update::History {
+                    key: "group:42".into(),
+                    result: Ok((Vec::new(), None)),
+                });
+                let state = &view.model.history["group:42"];
+                assert!(state.loaded);
+                assert!(!state.loading);
+                assert!(state.cursor.is_none());
+                assert!(state.error.is_none());
+                assert!(!view.loading_more.contains("group:42"));
+                assert_eq!(view.model.messages["group:42"].len(), 1);
+                view.load_history(true);
+            })
+        });
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::History { .. }))
+        );
+    }
+    #[gpui::test]
     fn short_finished_timeline_bounces_without_requesting_history(cx: &mut TestAppContext) {
         let (main, view, _updates, mut commands) = fixture(cx);
         cx.update(|cx| {
@@ -9147,40 +10198,68 @@ mod ui_tests {
         });
     }
     #[gpui::test]
-    fn card_rotation_and_position_pass_through_intermediate_geometry(cx: &mut TestAppContext) {
+    fn image_click_target_still_opens_viewer_with_exterior_effects(cx: &mut TestAppContext) {
         let (main, view, _updates, _commands) = fixture(cx);
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("original.png");
-        let sheet = directory.path().join("sheet.png");
-        image::RgbaImage::from_pixel(80, 160, image::Rgba([20, 80, 180, 255]))
-            .save(&source)
-            .unwrap();
-        ferrsphen::card_preview::render(&source, &sheet, 1, 80, 160).unwrap();
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 view.phase = Phase::Chat;
-                view.model.receive(picture_message(1, 160, 90), false);
-                let second = picture_message(2, 80, 160);
-                let source_key = super::image_key(&second, 0);
-                view.assets.insert(source_key.clone(), source);
-                view.assets
-                    .insert(super::card_key(&source_key, 1, 80, 160), sheet);
-                view.model.receive(second, false);
+                view.model.receive(picture_message(1, 160, 120), false);
                 cx.notify();
             })
         });
         draw(cx, main);
         let mut visual = VisualTestContext::from_window(main, cx);
+        let target = visual.debug_bounds("image-hit-target").unwrap();
+        visual.simulate_click(target.center(), Default::default());
+        cx.run_until_parked();
+        cx.update(|cx| assert!(view.read(cx).viewer_window.is_some()));
+    }
+
+    #[gpui::test]
+    fn card_rotation_and_position_pass_through_intermediate_geometry(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.png");
+        image::RgbaImage::from_pixel(80, 160, image::Rgba([20, 80, 180, 255]))
+            .save(&source)
+            .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let first = picture_message(1, 160, 90);
+                view.assets
+                    .insert(super::image_key(&first, 0), source.clone());
+                view.model.receive(first, false);
+                let second = picture_message(2, 80, 160);
+                let source_key = super::image_key(&second, 0);
+                view.assets.insert(source_key.clone(), source);
+                view.model.receive(second, false);
+                cx.notify();
+            })
+        });
+        // Both cards must finish loading so their independent reveal animations
+        // do not advance the test clock while sampling the stack spring.
+        frames(cx, main, 40);
+        let mut visual = VisualTestContext::from_window(main, cx);
         let before = visual.debug_bounds("stack-card:group:42:1:1:1").unwrap();
         cx.update(|cx| view.update(cx, |view, cx| view.change_stack("group:42:1:1", true, cx)));
-        frames(cx, main, 5);
-        let during = visual.debug_bounds("stack-card:group:42:1:1:1").unwrap();
-        frames(cx, main, 70);
-        let after = visual.debug_bounds("stack-card:group:42:1:1:1").unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..75 {
+            frames(cx, main, 1);
+            samples.push(visual.debug_bounds("stack-card:group:42:1:1:1").unwrap());
+        }
+        let after = *samples.last().unwrap();
         let aspect = |bounds: gpui::Bounds<gpui::Pixels>| {
             f32::from(bounds.size.width) / f32::from(bounds.size.height)
         };
-        assert!(aspect(before) > aspect(during) && aspect(during) > aspect(after));
+        let during = samples
+            .into_iter()
+            .find(|sample| aspect(before) > aspect(*sample) && aspect(*sample) > aspect(after))
+            .expect("rotation must render an intermediate aspect ratio before settling");
+        assert!(
+            aspect(before) > aspect(during) && aspect(during) > aspect(after),
+            "before={before:?}, during={during:?}, after={after:?}"
+        );
         assert!(before.top() < during.top() && during.top() < after.top());
         assert!((after.size.width - px(80.)).abs() < px(1.));
     }

@@ -1,0 +1,29 @@
+syntax = "proto3";
+package ferrsphen.message_presentation;
+
+// Read-only projections of auxiliary fields retained by the protocol decoder.
+message Envelope {
+  repeated TextAttributes text = 1;
+  repeated ReplyAttributes reply = 45;
+  repeated CommonAttributes common = 53;
+}
+message TextAttributes {
+  optional bytes attr6 = 3;
+  optional bytes attr7 = 4;
+  optional bytes reserve = 12;
+}
+message TextReserve {
+  optional uint32 field11 = 11;
+}
+message ReplyAttributes {
+  optional uint64 recipient = 10;
+}
+message CommonAttributes {
+  optional uint64 service = 1;
+  bytes payload = 2;
+  optional uint64 business = 3;
+}
+message ReactionAttributes {
+  optional bytes reaction = 1;
+  optional bytes reply = 2;
+}

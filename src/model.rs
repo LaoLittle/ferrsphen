@@ -73,7 +73,14 @@ impl Model {
         let Some(message) = self
             .messages
             .get(&conversation_key(conversation))
-            .and_then(|rows| rows.last())
+            .and_then(|rows| {
+                rows.iter().rev().find(|message| {
+                    message.is_recalled()
+                        || crate::message_content::visible_elements(&message.elements)
+                            .next()
+                            .is_some()
+                })
+            })
         else {
             return String::new();
         };
@@ -398,11 +405,8 @@ pub fn reply_target<'a>(messages: &'a [Message], reply: &Reply) -> Option<&'a Me
 }
 
 pub fn image_only(message: &Message) -> bool {
-    !message.elements.is_empty()
-        && message
-            .elements
-            .iter()
-            .all(|element| matches!(element, MessageElement::Image(_)))
+    let mut elements = crate::message_content::visible_elements(&message.elements).peekable();
+    elements.peek().is_some() && elements.all(|element| matches!(element, MessageElement::Image(_)))
 }
 
 pub fn message_groups<'a>(
@@ -411,7 +415,7 @@ pub fn message_groups<'a>(
 ) -> Vec<&'a [Message]> {
     let eligible = |message: &Message| {
         image_only(message)
-            && message.elements.len() == 1
+            && crate::message_content::visible_elements(&message.elements).count() == 1
             && !recalled.contains(&format!(
                 "{}:{}",
                 conversation_key(&message.conversation),
@@ -427,7 +431,19 @@ pub fn message_groups<'a>(
             && messages[index - 1].conversation == messages[index].conversation
             && same_sender(&messages[index - 1], &messages[index]);
         if !join {
-            groups.push(&messages[start..index]);
+            if messages[start..index].iter().any(|message| {
+                message.is_recalled()
+                    || recalled.contains(&format!(
+                        "{}:{}",
+                        conversation_key(&message.conversation),
+                        message.sequence
+                    ))
+                    || crate::message_content::visible_elements(&message.elements)
+                        .next()
+                        .is_some()
+            }) {
+                groups.push(&messages[start..index]);
+            }
             start = index;
         }
     }
@@ -463,8 +479,7 @@ pub fn display_name(
         .unwrap_or_else(|| uin.to_string())
 }
 pub fn summary(elements: &[MessageElement]) -> String {
-    elements
-        .iter()
+    crate::message_content::visible_elements(elements)
         .map(|element| match element {
             MessageElement::Text(text) => text.clone(),
             MessageElement::Mention(m) => format!("@{}", m.display),

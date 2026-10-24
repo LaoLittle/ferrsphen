@@ -961,3 +961,119 @@ async fn session_keystore_reads_legacy_rows_and_persists_server_o3_policy() {
     );
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn legacy_non_media_message_refreshes_metadata_from_retained_wire() {
+    use atri_qq::proto::messages as pb;
+    use prost::Message as _;
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    let mut item = message();
+    let flags = pb::Elem {
+        general_flags: vec![vec![8, 1].into()],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let unknown = pb::Elem {
+        common: vec![
+            pb::CommonElem {
+                service_type: Some(999),
+                payload: b"unknown".to_vec().into(),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    item.raw = pb::CommonMessage {
+        message_body: pb::MessageBody {
+            rich_text: pb::RichText {
+                elems: vec![
+                    pb::Elem {
+                        text: vec![
+                            pb::Text {
+                                text: Some("hello".into()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec()
+                            .into(),
+                        ],
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                    .into(),
+                    flags.clone().into(),
+                    unknown.clone().into(),
+                ],
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    item.elements = vec![
+        MessageElement::Text("hello".into()),
+        MessageElement::Opaque(OpaqueElement {
+            scope: OpaqueScope::Element,
+            field: 37,
+            payload: flags.clone(),
+        }),
+    ];
+    item.metadata.clear();
+    db.save_message(1, &item).await.unwrap();
+    db.close().await.unwrap();
+    drop(db);
+    let db = Database::open(root.path()).unwrap();
+    let rows = db
+        .messages(1, &conversation_key(&item.conversation), 10)
+        .unwrap();
+    let restored = &rows[0];
+    assert_eq!(restored.raw, item.raw);
+    assert_eq!(restored.metadata.len(), 1);
+    assert_eq!(restored.metadata[0].payload, flags);
+    assert!(
+        matches!(&restored.elements[1], MessageElement::Opaque(record) if record.payload == unknown)
+    );
+    assert_eq!(
+        ferrsphen::message_content::visible_elements(&restored.elements).count(),
+        2
+    );
+    let model = db.restore(1).unwrap();
+    assert_eq!(
+        model.messages[&conversation_key(&item.conversation)][0]
+            .metadata
+            .len(),
+        1
+    );
+    db.close().await.unwrap();
+}
+
+#[test]
+fn auxiliary_fields_do_not_break_image_stacks_or_create_empty_rows() {
+    use ferrsphen::model::{image_only, message_groups};
+    let mut first = picture(1, 7);
+    first.elements.push(MessageElement::Opaque(OpaqueElement {
+        scope: OpaqueScope::Element,
+        field: 53,
+        payload: hex::decode("aa030f082612090a070a0508041091091801").unwrap(),
+    }));
+    let mut auxiliary = message();
+    auxiliary.elements = vec![MessageElement::Opaque(OpaqueElement {
+        scope: OpaqueScope::Element,
+        field: 45,
+        payload: hex::decode("ea02025000").unwrap(),
+    })];
+    assert!(image_only(&first));
+    let rows = vec![first, picture(2, 7), auxiliary];
+    let groups = message_groups(&rows, &Default::default());
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].len(), 2);
+    assert_eq!(rows[0].elements.len(), 2, "stored elements retain sidecars");
+}

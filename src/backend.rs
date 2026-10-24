@@ -35,6 +35,12 @@ pub enum ComposePart {
 }
 #[derive(Clone)]
 pub enum Command {
+    OpenCaptcha {
+        id: u64,
+        request: crate::captcha::Request,
+    },
+    CancelCaptcha,
+    SavePreferences(crate::settings::Preferences),
     Reaction {
         group: u64,
         sequence: u64,
@@ -54,13 +60,6 @@ pub enum Command {
     Preview {
         key: String,
         reference: MediaReference,
-    },
-    CardPreview {
-        key: String,
-        path: PathBuf,
-        slot: usize,
-        width: u32,
-        height: u32,
     },
     Login {
         uin: u64,
@@ -133,6 +132,14 @@ pub enum Command {
     SaveChats(Vec<Chat>),
 }
 pub enum Update {
+    Captcha {
+        id: u64,
+        result: Result<Option<crate::captcha::Ticket>, String>,
+    },
+    AssetFailed {
+        key: String,
+    },
+    Preferences(crate::settings::Preferences),
     Activity(crate::activity::ActivityRecord),
     ReactionDone {
         group: u64,
@@ -289,10 +296,21 @@ async fn run(
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<()> {
     let db = Database::open(&root)?;
+    let obsolete_cards = root.join("cache/cards");
+    if obsolete_cards.is_dir()
+        && let Err(error) = tokio::fs::remove_dir_all(&obsolete_cards).await
+    {
+        tracing::warn!(?error, "remove obsolete card images failed");
+    }
     let migrated = db.migrate_legacy().await?;
     if migrated != 0 {
         tracing::info!(records = migrated, "migrated database records to protobuf");
     }
+    emit(
+        &sender,
+        Update::Preferences(db.get(crate::settings::STORAGE_KEY)?.unwrap_or_default()),
+    )
+    .await?;
     let mut session = db.session()?.unwrap_or_else(|| Session {
         keystore: Keystore::default(),
         machine_id: hex::encode(rand::random::<[u8; 16]>()),
@@ -300,6 +318,7 @@ async fn run(
     });
     db.save_session(&session).await?;
     emit(&sender, Update::Account(session.keystore.uin)).await?;
+    let image_cache = Arc::new(crate::image_cache::ImageCache::new(&root.join("cache")));
     let mut password = None;
     let mut active_client = None;
     let work = async {
@@ -337,6 +356,7 @@ async fn run(
             let mut login_running = true;
             let mut online = false;
             let mut jobs = tokio::task::JoinSet::<Update>::new();
+            let mut captcha_job: Option<tokio::task::AbortHandle> = None;
             let outcome=async {
                 loop {
                     tokio::select! {
@@ -387,7 +407,11 @@ async fn run(
                             Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                         },
                         job=jobs.join_next(),if !jobs.is_empty()=>{
-                            let update=job.expect("pending job").unwrap_or_else(|error|Update::Error(error.to_string()));
+                            let update=match job.expect("pending job") {
+                                Ok(update)=>update,
+                                Err(error) if error.is_cancelled()=>continue,
+                                Err(error)=>Update::Error(error.to_string()),
+                            };
                             match &update {
                                 Update::Message(message)|Update::Sent{result:Ok(message),..}=>db.save_message(session.keystore.uin,message).await?,
                                 Update::ReplyHistory{result:Ok(messages),..}=>{for message in messages{db.save_message(session.keystore.uin,message).await?;}},
@@ -455,9 +479,19 @@ async fn run(
                                 });
                             }
                             Some(Command::Asset{key,url})=>{
-                                let path=root.join("cache");jobs.spawn(async move{match fetch_asset(&path,&key,&url).await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load asset failed");Update::Status(String::new())}}});
+                                let path=root.join("cache");let cache=image_cache.clone();jobs.spawn(async move{match async {let path=fetch_image(&path,&key,&url).await?;cache.remember(&path).await}.await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load asset failed");Update::AssetFailed{key}}}});
                             }
+                            Some(Command::OpenCaptcha{id,request})=>{
+                                if let Some(job)=captcha_job.take(){job.abort();}
+                                captcha_job=Some(jobs.spawn(async move {
+                                    let result=crate::captcha::verify(request).await.map_err(|error|format!("{error:#}"));
+                                    if let Err(error)=&result {tracing::warn!(%error,"open captcha failed");}
+                                    Update::Captcha{id,result}
+                                }));
+                            }
+                            Some(Command::CancelCaptcha)=>{if let Some(job)=captcha_job.take(){job.abort();}}
                             Some(Command::SubmitCaptcha{ticket,random})=>{let client=client.clone();jobs.spawn(async move{match client.submit_captcha(ticket,random).await{Ok(())=>Update::Status("正在验证".into()),Err(error)=>Update::Error(error.to_string())}});}
+                            Some(Command::SavePreferences(preferences))=>{db.put(crate::settings::STORAGE_KEY,&preferences).await?;}
                             Some(Command::SaveChats(chats))=>{db.put(&format!("chats/{}",session.keystore.uin),&chats).await?;}
                             Some(Command::ResolveUser{uid})=>{
                                 if let Some(uin)=db.user_uin(session.keystore.uin,&uid)? {
@@ -486,11 +520,10 @@ async fn run(
                             Some(Command::History{conversation,cursor})=>{let operations=operations.clone();let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=load_history(&operations,&messaging,&conversation,cursor).await.map_err(|error|error.to_string());Update::History{key,result}});}
                             Some(Command::LocateReply{conversation,reply})=>{let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=locate_reply(&messaging,&conversation,&reply).await.map_err(|error|format!("{error:#}"));Update::ReplyHistory{key,reply,result}});}
                             Some(Command::Send{id,nonce,conversation,elements})=>{let messaging=messaging.clone();jobs.spawn(async move{Update::Sent{id,result:messaging.send_with_nonce(conversation,elements,nonce).await.map_err(|error|error.to_string())}});}
-                            Some(Command::Compose{id,nonce,conversation,parts})=>{let messaging=messaging.clone();let media=media.clone();jobs.spawn(async move{Update::Sent{id,result:send_composed(&messaging,&media,conversation,parts,nonce).await.map_err(|error|format!("{error:#}"))}});}
-                            Some(Command::Attachment{id,nonce,conversation,path,kind})=>{let messaging=messaging.clone();let media=media.clone();jobs.spawn(async move{Update::Sent{id,result:send_attachment(&messaging,&media,conversation,path,kind,nonce).await.map_err(|error|error.to_string())}});}
-                            Some(Command::CardPreview{key,path,slot,width,height})=>{let cache=root.join("cache/cards");jobs.spawn(async move{let result=tokio::task::spawn_blocking(move||prepare_card(&cache,&key,&path,slot,width,height).map(|path|(key,path))).await;match result { Ok(Ok((key,path)))=>Update::Asset{key,path}, Ok(Err(error))=>{tracing::warn!(?error,"prepare stacked card failed");Update::Status(String::new())},Err(error)=>Update::Error(error.to_string()) }});}
-                            Some(Command::Preview{key,reference})=>{let media=media.clone();let path=root.join("cache");jobs.spawn(async move{let result=async{let url=media.download_url(&reference).await?;fetch_asset(&path,&key,&url).await}.await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::Status(String::new())}}});}
-                            Some(Command::ViewImage{key,reference})=>{let media=media.clone();let root=root.join("cache");jobs.spawn(async move{let result=async {let url=media.download_url(&reference).await?;fetch_asset(&root,&key,&url).await}.await.map_err(|error:anyhow::Error|error.to_string());Update::Image{key,result}});}
+                            Some(Command::Compose{id,nonce,conversation,parts})=>{let messaging=messaging.clone();let media=media.clone();let cache=image_cache.clone();jobs.spawn(async move{for part in &parts {if let ComposePart::Image(path)=part && let Err(error)=cache.remember(path).await {tracing::debug!(%error,"cache outgoing image failed");}}Update::Sent{id,result:send_composed(&messaging,&media,conversation,parts,nonce).await.map_err(|error|format!("{error:#}"))}});}
+                            Some(Command::Attachment{id,nonce,conversation,path,kind})=>{let messaging=messaging.clone();let media=media.clone();let cache=image_cache.clone();jobs.spawn(async move{if kind==AttachmentKind::Image && let Err(error)=cache.remember(&path).await {tracing::debug!(%error,"cache outgoing image failed");}Update::Sent{id,result:send_attachment(&messaging,&media,conversation,path,kind,nonce).await.map_err(|error|error.to_string())}});}
+                            Some(Command::Preview{key,reference})=>{let media=media.clone();let cache=image_cache.clone();let path=root.join("cache");jobs.spawn(async move{let result=load_image(&media,&cache,&reference,&path,&key).await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::AssetFailed{key}}}});}
+                            Some(Command::ViewImage{key,reference})=>{let media=media.clone();let cache=image_cache.clone();let root=root.join("cache");jobs.spawn(async move{let result=load_image(&media,&cache,&reference,&root,&key).await.map_err(|error:anyhow::Error|error.to_string());Update::Image{key,result}});}
                             Some(Command::ViewVideo{key,reference})=>{let media=media.clone();let root=root.join("cache/videos");jobs.spawn(async move{let result=download_video(&media,&reference,&root,&key).await.map_err(|error|format!("{error:#}"));if let Err(error)=&result{tracing::error!(%error,asset=key,"download video failed");}Update::Video{key,result}});}
                             Some(Command::Voice{key,reference})=>{let media=media.clone();let root=root.join("cache/voices");jobs.spawn(async move{let result=download_voice(&media,&reference,&root,&key).await.map_err(|error|format!("{error:#}"));if let Err(error)=&result{tracing::error!(%error,asset=key,"prepare voice failed");}Update::Voice{key,result}});}
                             Some(Command::VideoPreview{key,reference})=>{let media=media.clone();let root=root.join("cache");jobs.spawn(async move{match video_preview(&media,&reference,&root,&key).await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(?error,asset=key,"load video preview failed");Update::Status(String::new())}}});}
@@ -550,8 +583,10 @@ async fn load_history(
                 return Ok((Vec::new(), None));
             }
             let start = end.saturating_sub(29).max(1);
-            let rows = messaging.history_group(*uin, start, end).await?;
-            Ok((rows, (start > 1).then_some(Cursor::Group(start - 1))))
+            match group_history(messaging, *uin, start, end).await? {
+                Some(rows) => Ok((rows, (start > 1).then_some(Cursor::Group(start - 1)))),
+                None => Ok((Vec::new(), None)),
+            }
         }
         Conversation::Friend { uid, .. } => {
             let (time, random) = match cursor {
@@ -587,6 +622,21 @@ async fn load_history(
         _ => bail!("临时会话暂不支持历史记录"),
     }
 }
+async fn group_history(
+    messaging: &Messaging,
+    group: u64,
+    start: u64,
+    end: u64,
+) -> Result<Option<Vec<Message>>> {
+    match messaging.history_group(group, start, end).await {
+        Ok(messages) => Ok(Some(messages)),
+        Err(atri_qq::Error::Server { code: 4, .. }) => {
+            tracing::info!(group, start, end, "group history exhausted");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 async fn locate_reply(
     messaging: &Messaging,
     conversation: &Conversation,
@@ -600,9 +650,14 @@ async fn locate_reply(
                 .copied()
                 .filter(|sequence| *sequence != 0)
                 .context("回复缺少消息序号")?;
-            Ok(messaging
-                .history_group(*uin, sequence.saturating_sub(29).max(1), sequence)
-                .await?)
+            Ok(group_history(
+                messaging,
+                *uin,
+                sequence.saturating_sub(29).max(1),
+                sequence,
+            )
+            .await?
+            .unwrap_or_default())
         }
         Conversation::Friend { uid, .. } => {
             let page = messaging
@@ -622,30 +677,82 @@ async fn locate_reply(
         _ => bail!("临时会话暂不支持历史记录"),
     }
 }
-fn prepare_card(
+async fn load_image(
+    media: &Media,
+    cache: &crate::image_cache::ImageCache,
+    reference: &MediaReference,
     root: &Path,
     key: &str,
-    source: &Path,
-    slot: usize,
-    width: u32,
-    height: u32,
 ) -> Result<PathBuf> {
+    let _guard = cache.lock(reference, key).await;
+    if let Some(path) = cache.find(reference).await? {
+        return Ok(path);
+    }
+    // A per-message cache entry can also predate the content index.
+    let path = if let Some(path) = cached_image(root, key) {
+        path
+    } else {
+        let url = media.download_url(reference).await?;
+        fetch_image(root, key, &url).await?
+    };
+    cache.remember(&path).await
+}
+fn cached_image(root: &Path, key: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
-    let path = root.join(format!("{:016x}.png", hash.finish()));
-    if path.is_file() {
+    let name = format!("{:016x}", hash.finish());
+    [
+        "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "ico", "qoi",
+    ]
+    .into_iter()
+    .map(|extension| root.join("images").join(format!("{name}.{extension}")))
+    .find(|path| path.is_file())
+}
+async fn fetch_image(root: &Path, key: &str, url: &str) -> Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    let name = format!("{:016x}", hash.finish());
+    let directory = root.join("images");
+    let cached = || {
+        [
+            "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "ico", "qoi",
+        ]
+        .into_iter()
+        .map(|extension| directory.join(format!("{name}.{extension}")))
+        .find(|path| path.is_file())
+    };
+    if let Some(path) = cached() {
         return Ok(path);
     }
-    std::fs::create_dir_all(root)?;
-    let temporary = root.join(format!(".{:016x}.part", rand::random::<u64>()));
-    if let Err(error) = crate::card_preview::render(source, &temporary, slot, width, height) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
+    let legacy = fetch_asset(root, key, url).await?;
+    let bytes = match tokio::fs::read(&legacy).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if let Some(path) = cached() {
+                return Ok(path);
+            }
+            return Err(error.into());
+        }
+    };
+    let format = image::guess_format(&bytes).context("图片格式无法识别")?;
+    let extension = format
+        .extensions_str()
+        .first()
+        .copied()
+        .context("图片格式没有文件后缀")?;
+    tokio::fs::create_dir_all(&directory).await?;
+    let path = directory.join(format!("{name}.{extension}"));
+    if let Err(error) = tokio::fs::rename(&legacy, &path).await {
+        if !path.is_file() {
+            return Err(error.into());
+        }
+        let _ = tokio::fs::remove_file(&legacy).await;
     }
-    std::fs::rename(temporary, &path)?;
     Ok(path)
 }
+
 async fn fetch_asset(root: &Path, key: &str, url: &str) -> Result<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1381,6 +1488,231 @@ mod session_tests {
                     && fresh.a2.is_empty()
                     && fresh.d2.is_empty()
                     && fresh.qr_sig.is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_status_tests {
+    use super::*;
+    struct HistoryClient(i32);
+    #[async_trait::async_trait]
+    impl ServiceClient for HistoryClient {
+        async fn request(
+            &self,
+            command: &str,
+            _: bytes::Bytes,
+            _: atri_qq::RequestType,
+            _: atri_qq::Encryption,
+            _: Duration,
+        ) -> atri_qq::Result<bytes::Bytes> {
+            assert_eq!(
+                command,
+                "trpc.msg.register_proxy.RegisterProxy.SsoGetGroupMsg"
+            );
+            use atri_qq::proto::messages::{GroupHistoryBody, GroupHistoryResponse};
+            use prost::Message as _;
+            Ok(GroupHistoryResponse {
+                code: 0,
+                error: None,
+                body: Some(GroupHistoryBody {
+                    code: i64::from(self.0),
+                    group_uin: Some(42),
+                    ..Default::default()
+                }),
+            }
+            .encode_to_vec()
+            .into())
+        }
+        async fn snapshot(&self) -> atri_qq::SessionState {
+            unreachable!()
+        }
+        async fn replace_state(&self, _: atri_qq::SessionState) {
+            unreachable!()
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<atri_qq::IncomingPacket> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+    #[tokio::test]
+    async fn group_history_code_four_exhausts_cursor_and_other_errors_still_fail() {
+        for code in [4, 5] {
+            let client: Arc<dyn ServiceClient> = Arc::new(HistoryClient(code));
+            let operations = Operations::new(client.clone());
+            let messaging = Messaging::new(client.clone(), Arc::new(Media::new(client)));
+            let result = load_history(
+                &operations,
+                &messaging,
+                &Conversation::Group { uin: 42 },
+                Some(Cursor::Group(100)),
+            )
+            .await;
+            if code == 4 {
+                let (messages, cursor) = result.unwrap();
+                assert!(messages.is_empty());
+                assert!(cursor.is_none());
+            } else {
+                assert!(matches!(
+                    result.unwrap_err().downcast_ref::<atri_qq::Error>(),
+                    Some(atri_qq::Error::Server { code: 5, .. })
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_cache_tests {
+    use super::fetch_image;
+    #[tokio::test]
+    async fn received_images_reuse_content_before_resolving_any_download_url() {
+        use atri_qq::media::{MediaConversation, MediaKind, MediaReference};
+        use md5::{Digest, Md5};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("sent.gif");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            12,
+            image::Rgba([20, 80, 180, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Gif)
+        .unwrap();
+        std::fs::write(&source, bytes.get_ref()).unwrap();
+        let cache = crate::image_cache::ImageCache::new(root.path());
+        let original = cache.remember(&source).await.unwrap();
+        let client = atri_qq::Client::new(Default::default(), Default::default()).unwrap();
+        let media = atri_qq::media::Media::new(client);
+        for (key, conversation, md5) in [
+            (
+                "preview:dm:other:99",
+                MediaConversation::Friend {
+                    uid: "other".into(),
+                },
+                true,
+            ),
+            (
+                "preview:group:123:100",
+                MediaConversation::Group { uin: 123 },
+                false,
+            ),
+        ] {
+            let mut reference = MediaReference::new(MediaKind::Image, conversation);
+            if md5 {
+                reference.md5 = Md5::digest(bytes.get_ref()).to_vec();
+            } else {
+                reference.sha1 = sha1_smol::Sha1::from(bytes.get_ref())
+                    .digest()
+                    .bytes()
+                    .to_vec();
+            }
+            // No URL or MsgInfo: asking the protocol to resolve this would fail.
+            let path = super::load_image(&media, &cache, &reference, root.path(), key)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes.get_ref());
+            assert!(path.is_file());
+        }
+        assert!(original.is_file());
+    }
+    #[tokio::test]
+    async fn concurrent_messages_with_the_same_hash_download_only_once() {
+        use atri_qq::media::{MediaConversation, MediaKind, MediaReference};
+        use md5::{Digest, Md5};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            12,
+            image::Rgba([20, 80, 180, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+        let bytes = bytes.into_inner();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let response = bytes.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 8192);
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let cache = crate::image_cache::ImageCache::new(root.path());
+        let client = atri_qq::Client::new(Default::default(), Default::default()).unwrap();
+        let media = atri_qq::media::Media::new(client);
+        let mut reference =
+            MediaReference::new(MediaKind::Image, MediaConversation::Group { uin: 123 });
+        reference.md5 = Md5::digest(&bytes).to_vec();
+        reference.download_url = Some(format!("http://{address}/image"));
+        let (first, second) = tokio::join!(
+            super::load_image(&media, &cache, &reference, root.path(), "message-one"),
+            super::load_image(&media, &cache, &reference, root.path(), "message-two"),
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+        // A new cache instance must also hit the persisted content index offline.
+        reference.download_url = None;
+        super::load_image(
+            &media,
+            &crate::image_cache::ImageCache::new(root.path()),
+            &reference,
+            root.path(),
+            "after-restart",
+        )
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_images_move_into_images_with_detected_extensions_without_reencoding() {
+        use std::hash::{Hash, Hasher};
+        for format in [image::ImageFormat::Png, image::ImageFormat::Gif] {
+            let directory = tempfile::tempdir().unwrap();
+            let key = "preview:group:42:1:0";
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hash);
+            let legacy = directory.path().join(format!("{:016x}", hash.finish()));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                16,
+                12,
+                image::Rgba([20, 80, 180, 255]),
+            ))
+            .write_to(&mut bytes, format)
+            .unwrap();
+            std::fs::write(&legacy, bytes.get_ref()).unwrap();
+            let path = fetch_image(directory.path(), key, "http://127.0.0.1:1/offline")
+                .await
+                .unwrap();
+            assert_eq!(path.parent().unwrap(), directory.path().join("images"));
+            assert_eq!(path.extension().unwrap(), format.extensions_str()[0]);
+            assert!(!legacy.exists());
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes.get_ref());
+            assert_eq!(
+                fetch_image(directory.path(), key, "http://127.0.0.1:1/offline")
+                    .await
+                    .unwrap(),
+                path
             );
         }
     }

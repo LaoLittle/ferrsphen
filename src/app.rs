@@ -1,8 +1,5 @@
 use crate::{backend::Backend, view};
-use gpui_kit::{
-    component::{Theme, ThemeMode},
-    *,
-};
+use gpui_kit::*;
 use std::path::PathBuf;
 
 pub fn default_data_dir() -> PathBuf {
@@ -38,15 +35,7 @@ pub fn run(root: PathBuf) {
             rust_i18n::extend!(gpui_component);
             gpui_kit::init(cx);
             ferrsphen::window_chrome::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
-            cx.set_window_appearance(Some(WindowAppearance::Dark));
-            Theme::update(cx, |theme| {
-                theme.colors.background = rgb(0x202020).into();
-                theme.colors.muted = rgb(0x303030).into();
-                theme.colors.border = rgb(0x343434).into();
-                theme.colors.accent = rgb(0x2d3f52).into();
-                theme.colors.primary = rgb(0x508be8).into();
-            });
+            crate::settings::apply(crate::settings::Preferences::default(), cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

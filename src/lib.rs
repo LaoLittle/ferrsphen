@@ -1,15 +1,21 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
+pub mod captcha;
 pub mod i18n;
+pub mod settings;
 
 extern crate self as ferrsphen;
 
 pub mod backend;
+mod image_cache;
+pub mod message_content;
 pub mod model;
 pub mod storage;
 pub mod voice;
 
 pub mod card_preview;
+#[cfg(feature = "desktop")]
+pub mod image_loading;
 #[cfg(feature = "desktop")]
 pub mod ui_motion;
 pub mod viewer;

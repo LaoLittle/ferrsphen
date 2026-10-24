@@ -1,97 +1,8 @@
 use gpui_kit::*;
 use std::{
-    collections::HashMap,
-    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
-
-#[derive(Default)]
-pub struct CardTextureCache {
-    clock: u64,
-    entries: HashMap<PathBuf, (u64, ImageCacheItem)>,
-}
-impl CardTextureCache {
-    pub fn new(cx: &mut App) -> Entity<Self> {
-        let cache = cx.new(|_| Self::default());
-        cx.observe_release(&cache, |cache, cx| {
-            for (_, (_, item)) in cache.entries.drain() {
-                if let Some(Ok(image)) = item.get() {
-                    cx.drop_image(image, None);
-                }
-            }
-        })
-        .detach();
-        cache
-    }
-    fn load(
-        &mut self,
-        path: &PathBuf,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<std::sync::Arc<RenderImage>> {
-        self.clock += 1;
-        if !self.entries.contains_key(path)
-            && self.entries.len() >= 12
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (used, _))| *used)
-                .map(|(path, _)| path.clone())
-            && let Some((_, item)) = self.entries.remove(&oldest)
-            && let Some(Ok(image)) = item.get()
-        {
-            cx.drop_image(image, Some(window));
-        }
-        let (used, item) = self
-            .entries
-            .entry(path.clone())
-            .or_insert_with(|| (0, ImageCacheItem::new(&Resource::from(path.clone()), cx)));
-        *used = self.clock;
-        item.use_image(window).and_then(Result::ok)
-    }
-}
-
-pub fn card_frame(
-    path: PathBuf,
-    index: usize,
-    cache: Entity<CardTextureCache>,
-    scale: f32,
-) -> AnyElement {
-    canvas(
-        move |bounds, window, cx| {
-            if !bounds.intersects(&window.content_mask().bounds) {
-                return None;
-            }
-            cache.update(cx, |cache, cx| cache.load(&path, window, cx))
-        },
-        move |bounds, image, window, _| {
-            let Some(image) = image else {
-                return;
-            };
-            let dimensions = image.size(0);
-            let columns = crate::card_preview::COLUMNS as f32;
-            let width = dimensions.width.0 as f32 / columns * scale
-                / crate::card_preview::RASTER_SCALE as f32;
-            let height = dimensions.height.0 as f32 / columns * scale
-                / crate::card_preview::RASTER_SCALE as f32;
-            let image_bounds = Bounds::new(
-                point(
-                    bounds.center().x - px(width / 2. + index as f32 % columns * width),
-                    bounds.center().y - px(height / 2. + (index as f32 / columns).floor() * height),
-                ),
-                size(px(width * columns), px(height * columns)),
-            );
-            if let Err(error) =
-                window.paint_image(bounds, image_bounds, Corners::default(), image, 0, false)
-            {
-                tracing::warn!(?error, "paint image card failed");
-            }
-        },
-    )
-    .size_full()
-    .into_any_element()
-}
 
 pub const EXIT_SPAN: Duration = Duration::from_millis(120);
 pub const ENTRANCE_SPAN: Duration = Duration::from_millis(250);
@@ -105,6 +16,89 @@ pub fn page_progress(progress: f32) -> f32 {
         y2: 1.,
     }
     .sample(progress)
+}
+
+pub const MESSAGE_ARRIVAL_SPAN: Duration = Duration::from_millis(240);
+pub const MESSAGE_SEND_SPAN: Duration = Duration::from_millis(420);
+
+pub fn message_flight_bounds(
+    from: Bounds<Pixels>,
+    to: Bounds<Pixels>,
+    progress: f32,
+) -> Bounds<Pixels> {
+    let progress = page_progress(((progress - 0.08) / 0.92).clamp(0., 1.));
+    Bounds::new(
+        from.origin + (to.origin - from.origin) * progress,
+        size(
+            from.size.width + (to.size.width - from.size.width) * progress,
+            from.size.height + (to.size.height - from.size.height) * progress,
+        ),
+    )
+}
+
+type FlightRenderer = Box<dyn FnOnce(Bounds<Pixels>, f32) -> AnyElement>;
+
+/// Paints above the timeline mask while the real row retains its final layout.
+pub struct MessageFlight {
+    pub source: Bounds<Pixels>,
+    pub target: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    pub progress: f32,
+    pub render: Option<FlightRenderer>,
+}
+impl IntoElement for MessageFlight {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+impl Element for MessageFlight {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<AnyElement>;
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (window.request_layout(Style::default(), [], cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let target = self.target.get()?;
+        let bounds = message_flight_bounds(self.source, target, self.progress);
+        let mut child = self.render.take()?(bounds, self.progress);
+        child.layout_as_root(bounds.size.map(AvailableSpace::Definite), window, cx);
+        child.prepaint_at(bounds.origin, window, cx);
+        Some(child)
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        child: &mut Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = child {
+            child.paint(window, cx);
+        }
+    }
 }
 
 #[derive(Default)]

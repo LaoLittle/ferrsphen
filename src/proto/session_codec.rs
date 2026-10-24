@@ -103,7 +103,7 @@ impl TryFrom<wire::Keystore> for Keystore {
             qr_sig: Vec::new(),
             key_exchange_ticket: Vec::new(),
             key_exchange_key: Vec::new(),
-            login_cookie: String::new(),
+            login_cookie: Vec::new(),
         })
     }
 }

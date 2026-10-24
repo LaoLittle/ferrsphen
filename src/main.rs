@@ -7,6 +7,14 @@ fn main() {
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            Some("--captcha-window") => {
+                if let Err(error) = ferrsphen::captcha::run_window() {
+                    eprintln!("{error:#}");
+                    std::process::exit(1);
+                }
+                return;
+            }
             Some("--data-dir") => root = args.next().map(PathBuf::from).expect("--data-dir PATH"),
             Some("--help" | "-h") => {
                 println!("ferrsphen [--data-dir PATH]");
