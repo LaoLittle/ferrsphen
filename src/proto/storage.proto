@@ -1,0 +1,48 @@
+syntax = "proto3";
+package ferrsphen.storage;
+
+message Record {
+  uint32 schema_version = 1;
+  Value value = 2;
+}
+
+message Empty {}
+message Sequence { repeated Value values = 1; }
+message Map { repeated Entry entries = 1; }
+message IntegerByteSequence {
+  bytes values = 1;
+  uint32 element_bits = 2;
+}
+message Entry {
+  Value key = 1;
+  Value value = 2;
+}
+
+// Values preserve the Serde data model used by the QQ API's public types.
+message Value {
+  oneof kind {
+    bool boolean = 1;
+    uint32 u8 = 2;
+    uint32 u16 = 3;
+    uint32 u32 = 4;
+    uint64 u64 = 5;
+    sint32 i8 = 6;
+    sint32 i16 = 7;
+    sint32 i32 = 8;
+    sint64 i64 = 9;
+    float f32 = 10;
+    double f64 = 11;
+    string character = 12;
+    string string = 13;
+    Empty unit = 14;
+    Empty none = 15;
+    Value some = 16;
+    Value newtype = 17;
+    Sequence sequence = 18;
+    Map map = 19;
+    bytes bytes = 20;
+    // Compact representation of a sequence of unsigned octets.
+    bytes byte_sequence = 21;
+    IntegerByteSequence integer_byte_sequence = 22;
+  }
+}

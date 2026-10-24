@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context as _, Result, bail};
 use atri_qq::{
     Client, ClientConfig, Keystore, LoginEvent, ServiceClient, UserInfo,
+    admin::Admin,
     contacts::{Friend, Group, GroupAnnouncement, GroupMember, Operations},
     media::{Media, MediaInput, MediaReference},
     messages::{
@@ -20,7 +21,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
     File,
@@ -28,7 +29,24 @@ pub enum AttachmentKind {
     Video,
 }
 #[derive(Clone)]
+pub enum ComposePart {
+    Element(Box<MessageElement>),
+    Image(PathBuf),
+}
+#[derive(Clone)]
 pub enum Command {
+    Reaction {
+        group: u64,
+        sequence: u64,
+        code: String,
+        added: bool,
+    },
+    Favorites,
+    Poke {
+        conversation: Conversation,
+        target: u64,
+        uid: String,
+    },
     SubmitCaptcha {
         ticket: String,
         random: String,
@@ -63,6 +81,12 @@ pub enum Command {
         nonce: u32,
         conversation: Conversation,
         elements: Vec<MessageElement>,
+    },
+    Compose {
+        id: u64,
+        nonce: u32,
+        conversation: Conversation,
+        parts: Vec<ComposePart>,
     },
     Attachment {
         id: u64,
@@ -109,6 +133,17 @@ pub enum Command {
     SaveChats(Vec<Chat>),
 }
 pub enum Update {
+    Activity(crate::activity::ActivityRecord),
+    ReactionDone {
+        group: u64,
+        sequence: u64,
+        code: String,
+        result: Result<crate::activity::ActivityRecord, String>,
+    },
+    Favorites {
+        cached: bool,
+        result: Result<Vec<crate::expressions::Favorite>, String>,
+    },
     LoginRequired,
     Challenge(atri_qq::LoginChallenge),
     Account(u64),
@@ -237,6 +272,7 @@ fn fresh_device(old: &Keystore) -> Keystore {
         device_name: old.device_name.clone(),
         android_id: old.android_id.clone(),
         qimei: old.qimei.clone(),
+        o3_xwid_switch: old.o3_xwid_switch,
         ..Keystore::default()
     }
 }
@@ -253,6 +289,10 @@ async fn run(
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<()> {
     let db = Database::open(&root)?;
+    let migrated = db.migrate_legacy().await?;
+    if migrated != 0 {
+        tracing::info!(records = migrated, "migrated database records to protobuf");
+    }
     let mut session = db.session()?.unwrap_or_else(|| Session {
         keystore: Keystore::default(),
         machine_id: hex::encode(rand::random::<[u8; 16]>()),
@@ -341,7 +381,7 @@ async fn run(
                         },
                         packet=packets.recv(),if online=>match packet {
                             Ok(packet)=>for event in messaging.decode_push(packet).await {
-                                match event {PushEvent::Message{message}=>{db.save_message(session.keystore.uin,&message).await?;emit(&sender,Update::Message(message)).await?;},event=>{if let PushEvent::Recall{conversation,sequence,..}=&event {tracing::info!(?event,"QQ recall received");db.save_recall(session.keystore.uin,conversation,*sequence).await?;}db.put(&format!("notification/{}/{:020}",session.keystore.uin,now_millis()),&event).await?;emit(&sender,Update::Notification(event)).await?;}}
+                                match event {PushEvent::Message{message}=>{db.save_message(session.keystore.uin,&message).await?;emit(&sender,Update::Message(message)).await?;},event=>{if let PushEvent::Recall{conversation,sequence,..}=&event {tracing::info!(?event,"QQ recall received");db.save_recall(session.keystore.uin,conversation,*sequence).await?;}let record=db.save_notification(session.keystore.uin,&event).await?;if matches!(event,PushEvent::Poke{..}|PushEvent::Reaction{..}){emit(&sender,Update::Activity(record)).await?;}else{emit(&sender,Update::Notification(event)).await?;}}}
                             },
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(count))=>emit(&sender,Update::Error(format!("消息事件丢失 {count}"))).await?,
                             Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
@@ -353,6 +393,10 @@ async fn run(
                                 Update::ReplyHistory{result:Ok(messages),..}=>{for message in messages{db.save_message(session.keystore.uin,message).await?;}},
                                 Update::History{result:Ok((messages,_)),..}=>{for message in messages{db.save_message(session.keystore.uin,message).await?;}},
                                 Update::Contacts{friends,groups}=>{db.put(&format!("friends/{}",session.keystore.uin),friends).await?;db.put(&format!("groups/{}",session.keystore.uin),groups).await?;},
+                                Update::ReactionDone{result:Ok(record),..}=>db.save_activity(session.keystore.uin,record).await?,
+                                Update::ReactionDone{result:Err(error),..}=>tracing::error!(%error,"set group reaction failed"),
+                                Update::Favorites{cached:false,result:Ok(items)}=>db.put(&format!("favorites/{}",session.keystore.uin),items).await?,
+                                Update::Favorites{result:Err(error),..}=>tracing::error!(%error,"fetch favorite expressions failed"),
                                 Update::Announcements{group,result:Ok(items)}=>db.put(&format!("announcements/{}/{group}",session.keystore.uin),items).await?,
                                 Update::Announcements{result:Err(error),..}=>tracing::error!(%error,"fetch group announcements"),
                                 Update::UserUin{uid,result:Ok(uin)}=>db.save_user_uin(session.keystore.uin,uid,*uin).await?,
@@ -371,6 +415,45 @@ async fn run(
                             None=>break,
                             Some(Command::Login{uin,password:input})=>{session.keystore=fresh_device(&session.keystore);session.keystore.uin=uin;password=Some(input);return Ok::<bool,anyhow::Error>(true);}
                             Some(Command::Qr)=>{session.keystore=fresh_device(&session.keystore);return Ok(true);}
+                            Some(Command::Favorites)=>{
+                                if let Some(items)=db.get::<Vec<crate::expressions::Favorite>>(&format!("favorites/{}",session.keystore.uin))? {emit(&sender,Update::Favorites{cached:true,result:Ok(items)}).await?;}
+                                if !online {emit(&sender,Update::Favorites{cached:false,result:Err("账号离线".into())}).await?;continue;}
+                                let client=client.clone();
+                                jobs.spawn(async move {Update::Favorites{cached:false,result:crate::expressions::fetch_favorites(client.as_ref()).await.map_err(|error|format!("{error:#}"))}});
+                            }
+                            Some(Command::Poke{conversation,target,uid})=>{
+                                if !online {emit(&sender,Update::Error("账号离线".into())).await?;continue;}
+                                let operations=operations.clone();
+                                jobs.spawn(async move {
+                                    let result=async {
+                                        let target=if target!=0 {target} else {operations.resolve_uin(&uid).await?};
+                                        anyhow::ensure!(target!=0,"无法识别用户");
+                                        let admin=Admin::from_operations(operations.clone());
+                                        match conversation {
+                                            Conversation::Group{uin}=>admin.send_group_nudge(uin,target).await?,
+                                            Conversation::Friend{uin,uid}=>{let peer=if uin!=0{uin}else{operations.resolve_uin(&uid).await?};admin.send_friend_nudge(peer,Some(target)).await?;},
+                                            _=>bail!("临时会话暂不支持戳一戳"),
+                                        }
+                                        Ok::<_,anyhow::Error>(())
+                                    }.await;
+                                    match result {Ok(())=>Update::Status(String::new()),Err(error)=>{tracing::error!(?error,"poke failed");Update::Error(format!("{error:#}"))}}
+                                });
+                            }
+                            Some(Command::Reaction{group,sequence,code,added})=>{
+                                if !online {emit(&sender,Update::ReactionDone{group,sequence,code,result:Err("账号离线".into())}).await?;continue;}
+                                let operations=operations.clone();
+                                let client=client.clone();
+                                jobs.spawn(async move {
+                                    let result=async {
+                                        anyhow::ensure!(group!=0&&sequence!=0,"消息尚未确认");
+                                        let operator_uid=client.snapshot().await.keystore.uid;
+                                        anyhow::ensure!(!operator_uid.is_empty(),"账号未登录");
+                                        Admin::from_operations(operations).set_group_reaction(group,sequence,&code,added).await?;
+                                        Ok(crate::activity::ActivityRecord::new(crate::activity::ActivityEvent::ReactionConfirmed{group,sequence,code:code.clone(),added,operator_uid}))
+                                    }.await.map_err(|error:anyhow::Error|format!("{error:#}"));
+                                    Update::ReactionDone{group,sequence,code,result}
+                                });
+                            }
                             Some(Command::Asset{key,url})=>{
                                 let path=root.join("cache");jobs.spawn(async move{match fetch_asset(&path,&key,&url).await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load asset failed");Update::Status(String::new())}}});
                             }
@@ -403,6 +486,7 @@ async fn run(
                             Some(Command::History{conversation,cursor})=>{let operations=operations.clone();let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=load_history(&operations,&messaging,&conversation,cursor).await.map_err(|error|error.to_string());Update::History{key,result}});}
                             Some(Command::LocateReply{conversation,reply})=>{let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=locate_reply(&messaging,&conversation,&reply).await.map_err(|error|format!("{error:#}"));Update::ReplyHistory{key,reply,result}});}
                             Some(Command::Send{id,nonce,conversation,elements})=>{let messaging=messaging.clone();jobs.spawn(async move{Update::Sent{id,result:messaging.send_with_nonce(conversation,elements,nonce).await.map_err(|error|error.to_string())}});}
+                            Some(Command::Compose{id,nonce,conversation,parts})=>{let messaging=messaging.clone();let media=media.clone();jobs.spawn(async move{Update::Sent{id,result:send_composed(&messaging,&media,conversation,parts,nonce).await.map_err(|error|format!("{error:#}"))}});}
                             Some(Command::Attachment{id,nonce,conversation,path,kind})=>{let messaging=messaging.clone();let media=media.clone();jobs.spawn(async move{Update::Sent{id,result:send_attachment(&messaging,&media,conversation,path,kind,nonce).await.map_err(|error|error.to_string())}});}
                             Some(Command::CardPreview{key,path,slot,width,height})=>{let cache=root.join("cache/cards");jobs.spawn(async move{let result=tokio::task::spawn_blocking(move||prepare_card(&cache,&key,&path,slot,width,height).map(|path|(key,path))).await;match result { Ok(Ok((key,path)))=>Update::Asset{key,path}, Ok(Err(error))=>{tracing::warn!(?error,"prepare stacked card failed");Update::Status(String::new())},Err(error)=>Update::Error(error.to_string()) }});}
                             Some(Command::Preview{key,reference})=>{let media=media.clone();let path=root.join("cache");jobs.spawn(async move{let result=async{let url=media.download_url(&reference).await?;fetch_asset(&path,&key,&url).await}.await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::Status(String::new())}}});}
@@ -597,13 +681,30 @@ async fn fetch_asset(root: &Path, key: &str, url: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
+fn media_cache_path(root: &Path, key: &str, extension: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    root.join(format!("{:016x}.{extension}", hash.finish()))
+}
 async fn download_video(
     media: &Media,
     reference: &MediaReference,
     root: &Path,
     key: &str,
 ) -> Result<PathBuf> {
-    download_cached(media, reference, root, key, "mp4").await
+    let path = media_cache_path(root, key, "mp4");
+    if path.is_file() {
+        return Ok(path);
+    }
+    let url = media
+        .download_url(reference)
+        .await
+        .context("获取视频下载地址失败")?;
+    let mut download = reference.clone();
+    download.message_info.clear();
+    download.download_url = Some(url);
+    download_cached(media, &download, root, key, "mp4").await
 }
 async fn download_cached(
     media: &Media,
@@ -612,10 +713,7 @@ async fn download_cached(
     key: &str,
     extension: &str,
 ) -> Result<PathBuf> {
-    use std::hash::{Hash, Hasher};
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hash);
-    let path = root.join(format!("{:016x}.{extension}", hash.finish()));
+    let path = media_cache_path(root, key, extension);
     if path.is_file() {
         return Ok(path);
     }
@@ -642,7 +740,7 @@ async fn download_voice(
     let path = download_cached(media, reference, root, key, "audio")
         .await
         .with_context(|| format!("下载语音失败：{reference:?}"))?;
-    let wave_path = path.with_extension("wav");
+    let wave_path = path.with_extension("decoded-v2.wav");
     if wave_path.is_file() {
         return Ok(wave_path);
     }
@@ -699,7 +797,10 @@ async fn video_preview(
 ) -> Result<PathBuf> {
     // The video service signs the thumbnail's own index.
     match media.video_thumbnail_url(reference).await {
-        Ok(url) => return fetch_asset(root, key, &url).await,
+        Ok(url) => match fetch_asset(root, key, &url).await {
+            Ok(path) => return Ok(path),
+            Err(error) => tracing::debug!(?error, "video thumbnail download failed"),
+        },
         Err(error) => tracing::debug!(?error, "video thumbnail unavailable"),
     }
     #[cfg(feature = "desktop")]
@@ -751,6 +852,38 @@ async fn download_open(media: &Media, reference: &MediaReference, root: &Path) -
     open::that(path)?;
     Ok(())
 }
+async fn send_composed(
+    messaging: &Messaging,
+    media: &Media,
+    conversation: Conversation,
+    parts: Vec<ComposePart>,
+    nonce: u32,
+) -> Result<Message> {
+    anyhow::ensure!(!parts.is_empty(), "消息为空");
+    anyhow::ensure!(
+        !parts.iter().any(|part| matches!(
+            part,
+            ComposePart::Element(element) if matches!(element.as_ref(), MessageElement::File(_) | MessageElement::Voice(_))
+        )),
+        "文件和语音需要单独发送"
+    );
+    let target = conversation.media_conversation()?;
+    let mut elements = Vec::new();
+    for part in parts {
+        elements.push(match part {
+            ComposePart::Element(element) => *element,
+            ComposePart::Image(path) => MessageElement::Image(
+                media
+                    .upload_image(MediaInput::File { path }, target.clone(), "")
+                    .await?,
+            ),
+        });
+    }
+    Ok(messaging
+        .send_with_nonce(conversation, elements, nonce)
+        .await?)
+}
+
 async fn send_attachment(
     messaging: &Messaging,
     media: &Media,
@@ -793,38 +926,7 @@ async fn send_attachment(
         }
         AttachmentKind::File => MessageElement::File(media.upload_file(input, target, "/").await?),
         AttachmentKind::Video => {
-            let output = tokio::process::Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "quiet",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height:format=duration",
-                    "-of",
-                    "json",
-                ])
-                .arg(path)
-                .output()
-                .await
-                .context("无法读取视频信息：需要 ffprobe")?;
-            if !output.status.success() {
-                bail!("无法读取视频信息");
-            }
-            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            let stream = &value["streams"][0];
-            let width = stream["width"].as_u64().context("视频宽度缺失")? as u32;
-            let height = stream["height"].as_u64().context("视频高度缺失")? as u32;
-            let duration = value["format"]["duration"]
-                .as_str()
-                .context("视频时长缺失")?
-                .parse::<f64>()?
-                .ceil() as u32;
-            MessageElement::Video(
-                media
-                    .upload_video(input, None, target, width, height, duration)
-                    .await?,
-            )
+            MessageElement::Video(media.upload_video(input, None, target, 0, 0, 0).await?)
         }
     };
     Ok(messaging
@@ -837,13 +939,77 @@ mod asset_tests {
     use super::fetch_asset;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[derive(Default)]
+    struct VideoClient {
+        calls: std::sync::Mutex<Vec<(String, atri_qq::proto::media::MediaDownloadRequest)>>,
+    }
+    #[async_trait::async_trait]
+    impl atri_qq::ServiceClient for VideoClient {
+        async fn request(
+            &self,
+            command: &str,
+            body: bytes::Bytes,
+            _: atri_qq::RequestType,
+            _: atri_qq::Encryption,
+            _: std::time::Duration,
+        ) -> atri_qq::Result<bytes::Bytes> {
+            let envelope: atri_qq::proto::media::MediaOidbEnvelope =
+                atri_qq::proto::decode(body).unwrap();
+            let request = atri_qq::proto::decode(envelope.body.unwrap()).unwrap();
+            self.calls.lock().unwrap().push((command.into(), request));
+            Err(atri_qq::Error::Server {
+                code: 1234,
+                message: "download_url reached".into(),
+            })
+        }
+        async fn snapshot(&self) -> atri_qq::SessionState {
+            panic!("video download does not require message identities")
+        }
+        async fn replace_state(&self, _: atri_qq::SessionState) {
+            unreachable!()
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<atri_qq::IncomingPacket> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_messages_reject_standalone_media_before_uploading_images() {
+        use super::*;
+        use atri_qq::media::{MediaConversation, MediaKind};
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let media = Arc::new(Media::new(client.clone()));
+        let messaging = Messaging::new(client, media.clone());
+        for kind in [MediaKind::File, MediaKind::Voice] {
+            let reference = MediaReference::new(kind, MediaConversation::Group { uin: 42 });
+            let element = if kind == MediaKind::File {
+                MessageElement::File(reference)
+            } else {
+                MessageElement::Voice(reference)
+            };
+            let result = send_composed(
+                &messaging,
+                &media,
+                Conversation::Group { uin: 42 },
+                vec![
+                    ComposePart::Image(PathBuf::from("missing.png")),
+                    ComposePart::Element(Box::new(element)),
+                ],
+                1,
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("单独发送"));
+        }
+    }
+
     #[tokio::test]
     async fn downloaded_qq_voice_is_decoded_and_cached_as_wave() {
         use super::*;
         use atri_qq::media::{MediaConversation, MediaKind};
         let root = tempfile::tempdir().unwrap();
-        let pcm = vec![0; 2400 * 2];
-        let silk = atri_qq::voice::encode_silk(&pcm, 24000, 24000, true).unwrap();
+        let silk =
+            include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms.silk").to_vec();
+        let pcm = include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms_24000.pcm");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let size = silk.len() as u64;
@@ -871,6 +1037,13 @@ mod asset_tests {
         );
         reference.download_url = Some(format!("http://{address}/voice"));
         reference.size = size;
+        let original = download_cached(&media, &reference, root.path(), "voice:test", "audio")
+            .await
+            .unwrap();
+        let old_wave = original.with_extension("wav");
+        tokio::fs::write(&old_wave, b"old decoded audio")
+            .await
+            .unwrap();
         let wave = download_voice(&media, &reference, root.path(), "voice:test")
             .await
             .unwrap();
@@ -878,6 +1051,11 @@ mod asset_tests {
         let bytes = std::fs::read(&wave).unwrap();
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(bytes.len(), 44 + pcm.len());
+        assert_ne!(wave, old_wave);
+        assert_eq!(
+            tokio::fs::read(&old_wave).await.unwrap(),
+            b"old decoded audio"
+        );
         reference.download_url = Some("http://127.0.0.1:1/unavailable".into());
         assert_eq!(
             download_voice(&media, &reference, root.path(), "voice:test")
@@ -885,6 +1063,248 @@ mod asset_tests {
                 .unwrap(),
             wave
         );
+    }
+
+    #[tokio::test]
+    async fn video_upload_derives_rotated_display_metadata_in_protocol() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("clip.mp4");
+        tokio::fs::write(&path, include_bytes!("../tests/fixtures/rotated.mp4"))
+            .await
+            .unwrap();
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let media = Arc::new(Media::new(client.clone()));
+        let messaging = Messaging::new(client, media.clone());
+        let error = send_attachment(
+            &messaging,
+            &media,
+            Conversation::Group { uin: 42 },
+            path,
+            AttachmentKind::Video,
+            1,
+        )
+        .await
+        .unwrap_err();
+        // Container validation completes before the offline client's negotiation.
+        assert!(
+            matches!(
+                error.downcast_ref::<atri_qq::Error>(),
+                Some(atri_qq::Error::Disconnected)
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn parsed_video_thumbnail_failure_falls_back_to_cached_video() {
+        use super::*;
+        use atri_qq::{media::MediaConversation, proto::media as pb};
+        use prost::Message as _;
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for route in ["/cover", "/video"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).contains(route));
+                let (status, body): (&str, &[u8]) = if route == "/cover" {
+                    ("404 Not Found", b"missing")
+                } else {
+                    ("200 OK", include_bytes!("../tests/fixtures/clip.mp4"))
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let video = pb::VideoFile {
+            uuid: Some(b"clip".to_vec().into()),
+            width: Some(160),
+            height: Some(90),
+            duration: Some(1),
+            thumbnail_urls: vec![format!("http://{address}/cover").into_bytes().into()],
+            urls: vec![format!("http://{address}/video").into_bytes().into()],
+            ..Default::default()
+        };
+        let raw = pb::MediaElement {
+            video: Some(video.encode_to_vec().into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut reference =
+            MediaReference::decode_element(&raw, MediaConversation::Group { uin: 42 })
+                .unwrap()
+                .unwrap();
+        assert_eq!((reference.width, reference.height), (160, 90));
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let media = Media::new(client);
+        let preview = video_preview(&media, &reference, root.path(), "preview:video:test")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(image::image_dimensions(&preview).unwrap(), (160, 90));
+        reference.download_url = Some("http://127.0.0.1:1/unavailable".into());
+        let cached = download_video(
+            &media,
+            &reference,
+            &root.path().join("videos"),
+            "video:test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(cached).await.unwrap(),
+            include_bytes!("../tests/fixtures/clip.mp4")
+        );
+    }
+
+    #[tokio::test]
+    async fn video_download_uses_updated_nt_request_without_legacy_identity() {
+        use super::*;
+        use atri_qq::{
+            media::{MediaConversation, MediaKind},
+            proto::media as pb,
+        };
+        use prost::Message as _;
+        for (conversation, command) in [
+            (
+                MediaConversation::Friend { uid: "peer".into() },
+                "OidbSvcTrpcTcp.0x11e9_200",
+            ),
+            (
+                MediaConversation::Group { uin: 42 },
+                "OidbSvcTrpcTcp.0x11ea_200",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let client = Arc::new(VideoClient::default());
+            let media = Media::new(client.clone());
+            let indices =
+                [("nt-main", 0, 1234), ("nt-cover", 100, 64)].map(|(uuid, subtype, size)| {
+                    pb::MediaIndex {
+                        uuid: Some(uuid.as_bytes().to_vec().into()),
+                        subtype: Some(subtype),
+                        file: Some(pb::MediaFileInfo {
+                            size: Some(size),
+                            ..Default::default()
+                        }),
+                    }
+                });
+            let info = pb::MediaMessageInfo {
+                bodies: indices
+                    .iter()
+                    .map(|index| {
+                        pb::MediaMessageInfoBody {
+                            index: Some(index.encode_to_vec().into()),
+                        }
+                        .encode_to_vec()
+                        .into()
+                    })
+                    .collect(),
+            }
+            .encode_to_vec();
+            let reference =
+                MediaReference::from_message_info(info, MediaKind::Video, conversation, None)
+                    .unwrap();
+            assert!(reference.compatibility.is_none());
+            let error = download_video(&media, &reference, root.path(), "video:test")
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("download_url reached"));
+            let calls = client.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, command);
+            let request = &calls[0].1;
+            assert_eq!(
+                request
+                    .head
+                    .as_ref()
+                    .unwrap()
+                    .scene
+                    .as_ref()
+                    .unwrap()
+                    .request_type,
+                Some(2)
+            );
+            assert_eq!(
+                request.request.as_ref().unwrap().index.as_deref(),
+                Some(indices[0].encode_to_vec().as_slice())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn video_download_reuses_cache_and_checks_integrity() {
+        use super::*;
+        use atri_qq::media::{MediaConversation, MediaKind};
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..count]).starts_with("GET /video?key=a%2Bb ")
+                );
+                let body = include_bytes!("../tests/fixtures/clip.mp4");
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let media = Media::new(client);
+        let mut reference = MediaReference::new(
+            MediaKind::Video,
+            MediaConversation::Friend { uid: "peer".into() },
+        );
+        reference.download_url = Some(format!("http://{address}/video?key=a%2Bb"));
+        reference.size = include_bytes!("../tests/fixtures/clip.mp4").len() as u64;
+        let path = download_video(&media, &reference, root.path(), "video:test")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            include_bytes!("../tests/fixtures/clip.mp4")
+        );
+        assert_eq!(
+            download_video(&media, &reference, root.path(), "video:test")
+                .await
+                .unwrap(),
+            path
+        );
+        reference.size += 1;
+        assert!(
+            download_video(&media, &reference, root.path(), "video:bad")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("size mismatch")
+        );
+        assert!(!media_cache_path(root.path(), "video:bad", "mp4").exists());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -922,5 +1342,46 @@ mod asset_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{Keystore, fresh_device};
+
+    #[test]
+    fn restarting_login_keeps_server_signing_policy_and_clears_account_credentials() {
+        for selector in [None, Some(0), Some(1), Some(2)] {
+            let stored = Keystore {
+                uin: 12345,
+                uid: "old-account".into(),
+                guid: vec![7; 16],
+                device_name: "device".into(),
+                android_id: "id".into(),
+                qimei: "qimei".into(),
+                o3_xwid_switch: selector,
+                a1: vec![1],
+                a2: vec![2],
+                d2: vec![3],
+                d2_key: vec![4],
+                qr_sig: vec![5],
+                ..Default::default()
+            };
+            let fresh = fresh_device(&stored);
+            assert_eq!(fresh.o3_xwid_switch, selector);
+            assert_eq!(fresh.guid, stored.guid);
+            assert_eq!(fresh.device_name, stored.device_name);
+            assert_eq!(fresh.android_id, stored.android_id);
+            assert_eq!(fresh.qimei, stored.qimei);
+            assert_eq!(fresh.uin, 0);
+            assert!(fresh.uid.is_empty());
+            assert_eq!(fresh.d2_key, vec![0; 16]);
+            assert!(
+                fresh.a1.is_empty()
+                    && fresh.a2.is_empty()
+                    && fresh.d2.is_empty()
+                    && fresh.qr_sig.is_empty()
+            );
+        }
     }
 }

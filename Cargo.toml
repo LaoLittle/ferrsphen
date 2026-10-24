@@ -5,6 +5,9 @@ edition = "2024"
 default-run = "ferrsphen"
 license = "AGPL-3.0-or-later"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = ["desktop"]
 desktop = ["dep:gpui-kit", "dep:alhazen-core"]
@@ -19,6 +22,7 @@ surrealkv = "=1.0.0"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde-value = "0.7"
 ciborium = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
@@ -30,10 +34,24 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 toml = "1.1"
 anyhow = "1"
 open = "5"
+base64 = "0.22"
+tempfile = "3"
 qrcode = { version = "0.14", default-features = false }
+prost = "0.14"
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
+src = "0.0.6"
+
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7", default-features = false, features = ["clipboard", "file_selector", "image_picker", "url_launcher", "path_provider", "camera", "video_player"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
 
 [dev-dependencies]
+log = "0.4"
+async-trait = "0.1"
+bytes = "1"
 tempfile = "3"
 
 [[bin]]
@@ -47,3 +65,7 @@ debug = 0
 [[example]]
 name = "preview"
 required-features = ["desktop"]
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"

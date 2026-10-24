@@ -36,6 +36,7 @@ fn message() -> Message {
             }),
             MessageElement::Reply(Reply {
                 sequences: vec![14],
+                server_sequence: None,
                 message_id: 8,
                 sender_uin: 7,
                 sender_uid: "u_peer".into(),
@@ -717,4 +718,246 @@ fn conversation_preview_only_prefixes_other_group_members() {
     let direct = row.conversation.clone();
     model.receive(row, false);
     assert_eq!(model.chat_preview(&direct), "消息");
+}
+
+#[tokio::test]
+async fn cached_video_is_reparsed_and_resource_free_ptt_stays_metadata() {
+    use atri_qq::proto::{media as media_pb, messages as pb};
+    use prost::Message as _;
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    let mut item = message();
+    let video = media_pb::VideoFile {
+        uuid: Some(b"video-id".to_vec().into()),
+        name: Some(b"clip.mp4".to_vec().into()),
+        width: Some(640),
+        height: Some(360),
+        duration: Some(7),
+        urls: vec![b"https://example.com/clip.mp4".to_vec().into()],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let rich = pb::RichText {
+        elems: vec![
+            pb::Elem {
+                video: vec![video.into()],
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ],
+        voice: vec![
+            media_pb::Ptt {
+                duration: Some(7),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ],
+        ..Default::default()
+    };
+    item.raw = pb::CommonMessage {
+        message_body: pb::MessageBody {
+            rich_text: rich.encode_to_vec().into(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    item.elements = vec![
+        MessageElement::Video(MediaReference::new(
+            MediaKind::Video,
+            MediaConversation::Group { uin: 42 },
+        )),
+        MessageElement::Voice(MediaReference::new(
+            MediaKind::Voice,
+            MediaConversation::Group { uin: 42 },
+        )),
+    ];
+    item.metadata.clear();
+    db.save_message(1, &item).await.unwrap();
+    db.close().await.unwrap();
+    drop(db);
+    let db = Database::open(root.path()).unwrap();
+    let rows = db.messages(1, "group:42", 30).unwrap();
+    let restored = db.restore(1).unwrap();
+    for row in [&rows[0], &restored.messages["group:42"][0]] {
+        let [MessageElement::Video(reference)] = row.elements.as_slice() else {
+            panic!("unexpected cached content: {:?}", row.elements);
+        };
+        assert_eq!(
+            (reference.width, reference.height, reference.duration),
+            (640, 360, 7)
+        );
+        assert_eq!(
+            reference.download_url.as_deref(),
+            Some("https://example.com/clip.mp4")
+        );
+        assert_eq!(row.raw, item.raw);
+        assert!(
+            row.metadata
+                .iter()
+                .any(|record| record.scope == OpaqueScope::RichText && record.field == 4)
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cached_voice_recovers_from_wire_data_without_losing_opaque_fields() {
+    use atri_qq::proto::{media as media_pb, messages as pb};
+    use prost::Message as _;
+    for group in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open(root.path()).unwrap();
+        let mut item = message();
+        if !group {
+            item.conversation = Conversation::Friend {
+                uin: 7,
+                uid: "peer".into(),
+            };
+        }
+        let rich = pb::RichText {
+            elems: vec![
+                pb::Elem {
+                    common: vec![
+                        pb::CommonElem {
+                            service_type: Some(999),
+                            payload: b"opaque".to_vec().into(),
+                            ..Default::default()
+                        }
+                        .encode_to_vec()
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ],
+            voice: vec![
+                media_pb::Ptt {
+                    uuid: Some(b"voice-id".to_vec().into()),
+                    url: Some(b"https://example.com/voice.silk".to_vec().into()),
+                    duration: Some(3),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ],
+            ..Default::default()
+        };
+        item.raw = pb::CommonMessage {
+            message_body: pb::MessageBody {
+                rich_text: rich.encode_to_vec().into(),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        item.elements.clear();
+        item.metadata.clear();
+        db.save_message(1, &item).await.unwrap();
+        let restored = db.restore(1).unwrap();
+        let row = &restored.messages[&conversation_key(&item.conversation)][0];
+        let [
+            MessageElement::Opaque(opaque),
+            MessageElement::Voice(reference),
+        ] = row.elements.as_slice()
+        else {
+            panic!("unexpected cached content: {:?}", row.elements);
+        };
+        assert_eq!(opaque.field, 53);
+        assert_eq!(reference.duration, 3);
+        assert_eq!(reference.conversation.is_group(), group);
+        assert_eq!(
+            reference.download_url.as_deref(),
+            Some("https://example.com/voice.silk")
+        );
+        assert_eq!(row.raw, item.raw);
+        assert!(!row.is_recalled());
+        db.close().await.unwrap();
+    }
+}
+
+#[test]
+fn private_reply_prefers_server_sequence_and_retains_client_sequence_in_preview() {
+    let mut target = message();
+    target.conversation = Conversation::Friend {
+        uin: 7,
+        uid: "peer".into(),
+    };
+    target.sequence = 333;
+    target.client_sequence = 444;
+    target.message_id = 0;
+    let reply = Reply::from(&target);
+    let mut wrong = target.clone();
+    wrong.sequence = 444;
+    wrong.client_sequence = 555;
+    let rows = [wrong, target];
+    assert_eq!(
+        ferrsphen::model::reply_target(&rows, &reply)
+            .unwrap()
+            .sequence,
+        333
+    );
+    let model = Model::default();
+    let preview = model.reply_preview(&rows[1].conversation, &reply);
+    assert_eq!((preview.sequence, preview.client_sequence), (333, 444));
+    let mut old = serde_json::to_value(&reply).unwrap();
+    old.as_object_mut().unwrap().remove("server_sequence");
+    let old: Reply = serde_json::from_value(old).unwrap();
+    assert_eq!(old.server_sequence, None);
+    assert_eq!(
+        ferrsphen::model::reply_target(&rows, &old)
+            .unwrap()
+            .sequence,
+        333
+    );
+}
+
+#[tokio::test]
+async fn session_keystore_reads_legacy_rows_and_persists_server_o3_policy() {
+    use ferrsphen::storage::Session;
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(root.path()).unwrap();
+    let session = Session {
+        keystore: atri_qq::Keystore {
+            uin: 12345,
+            uid: "self".into(),
+            o3_xwid_switch: Some(1),
+            ..Default::default()
+        },
+        machine_id: "persistent-machine".into(),
+        qua: atri_qq::Profile::linux().qua,
+    };
+    let mut legacy = serde_json::to_value(&session).unwrap();
+    legacy["keystore"]
+        .as_object_mut()
+        .unwrap()
+        .remove("o3_xwid_switch");
+    db.put("session/active", &legacy).await.unwrap();
+    let mut loaded = db.session().unwrap().unwrap();
+    assert_eq!(loaded.keystore.o3_xwid_switch, None);
+    assert_eq!(loaded.keystore.uin, 12345);
+    assert_eq!(loaded.machine_id, "persistent-machine");
+    for selector in [Some(0), Some(1), Some(2)] {
+        loaded.keystore.o3_xwid_switch = selector;
+        db.put("session/active", &loaded).await.unwrap();
+        assert_eq!(
+            db.session().unwrap().unwrap().keystore.o3_xwid_switch,
+            selector
+        );
+    }
+    db.close().await.unwrap();
+    drop(db);
+    let db = Database::open(root.path()).unwrap();
+    assert_eq!(
+        db.session().unwrap().unwrap().keystore.o3_xwid_switch,
+        Some(2)
+    );
+    db.close().await.unwrap();
 }

@@ -1,17 +1,16 @@
-#[path = "../src/view.rs"]
-mod view;
 use atri_qq::{
     UserInfo,
     contacts::{Friend, Gender, Group, GroupMember, GroupMemberPermission},
     messages::{Conversation, Message, MessageElement},
 };
 use ferrsphen::backend::{Command, Update};
+use ferrsphen::view;
 use gpui_kit::{
     component::{Theme, ThemeMode},
     *,
 };
 fn main() {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let app = ferrsphen::platform::application().with_assets(gpui_kit::assets::AllAssets);
     app.run(|cx| {
         gpui_kit::init(cx);
         ferrsphen::window_chrome::init(cx);
@@ -123,10 +122,10 @@ fn main() {
         })
         .detach();
         gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1240.), px(820.)), cx)),
-                ..ferrsphen::window_chrome::options("ferrsphen · preview")
-            },
+            ferrsphen::window_chrome::app_options(
+                ferrsphen::window_chrome::AppWindowKind::Login,
+                cx,
+            ),
             cx,
             |window, cx| cx.new(|cx| view::AppView::new(commands, receiver, window, cx)),
         )

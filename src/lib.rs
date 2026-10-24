@@ -1,3 +1,5 @@
+extern crate self as ferrsphen;
+
 pub mod backend;
 pub mod model;
 pub mod storage;
@@ -19,3 +21,23 @@ pub mod window_chrome;
 
 pub mod packet_log;
 pub mod search;
+
+#[cfg(feature = "desktop")]
+pub mod rich_clipboard;
+
+#[cfg(feature = "desktop")]
+pub mod platform;
+
+#[cfg(feature = "desktop")]
+pub mod app;
+#[cfg(feature = "desktop")]
+pub mod view;
+
+pub mod expressions;
+
+#[cfg(feature = "desktop")]
+mod message_text;
+
+pub mod activity;
+
+pub mod proto;

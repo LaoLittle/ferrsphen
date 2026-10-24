@@ -46,6 +46,34 @@ mod tests {
         assert_eq!(&wav[44..], &[0, 0, 255, 127]);
         assert!(pcm_to_wave(&[0], 24000).is_err());
     }
+    #[test]
+    fn legacy_multi_frame_packets_keep_every_frame_in_wave_output() {
+        let fixtures: &[(&[u8], &[u8])] = &[
+            (
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_40ms.silk"),
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_40ms_24000.pcm"),
+            ),
+            (
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_60ms.silk"),
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_60ms_24000.pcm"),
+            ),
+            (
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms.silk"),
+                include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms_24000.pcm"),
+            ),
+        ];
+        for &(encoded, oracle) in fixtures {
+            let wave = silk_to_wave(encoded).unwrap();
+            assert_eq!(wave.len(), 44 + oracle.len());
+            assert_eq!(
+                u32::from_le_bytes(wave[40..44].try_into().unwrap()) as usize,
+                oracle.len()
+            );
+            assert!(wave[44..].iter().any(|byte| *byte != 0));
+            assert_eq!(wave, silk_to_wave(&encoded[1..]).unwrap());
+        }
+    }
+
     #[cfg(feature = "desktop")]
     #[test]
     fn silk_voice_plays_pauses_and_reaches_end_without_audio_output() {

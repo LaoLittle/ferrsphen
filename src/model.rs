@@ -40,6 +40,9 @@ pub struct History {
 }
 #[derive(Default)]
 pub struct Model {
+    pub activity: Vec<crate::activity::ActivityRecord>,
+    pub activity_ids: HashSet<String>,
+    pub reactions: HashMap<crate::activity::ReactionKey, crate::activity::ReactionState>,
     pub profile: Option<UserInfo>,
     pub chats: Vec<Chat>,
     pub selected: Option<String>,
@@ -56,6 +59,15 @@ pub struct Model {
     pub recalled: HashSet<String>,
 }
 impl Model {
+    pub fn apply_activity(&mut self, record: crate::activity::ActivityRecord) -> bool {
+        if !self.activity_ids.insert(record.id.clone()) {
+            return false;
+        }
+        crate::activity::reduce_reaction(&mut self.reactions, &record.event);
+        self.activity.push(record);
+        true
+    }
+
     pub fn chat_preview(&self, conversation: &Conversation) -> String {
         let Some(message) = self
             .messages
@@ -109,8 +121,12 @@ impl Model {
             recipient_uin: 0,
             recipient_uid: String::new(),
             sender_name: "未知用户".into(),
-            sequence: reply.sequences.first().copied().unwrap_or_default(),
-            client_sequence: 0,
+            sequence: reply.reference_sequence(conversation).unwrap_or_default(),
+            client_sequence: if matches!(conversation, Conversation::Group { .. }) {
+                0
+            } else {
+                reply.sequences.first().copied().unwrap_or_default()
+            },
             message_id: reply.message_id,
             random: 0,
             time: reply.time.into(),
@@ -239,7 +255,10 @@ impl Model {
             message.sequence
         )) || message.is_recalled()
     }
-    pub fn receive(&mut self, mut message: Message, live: bool) {
+    pub fn receive(&mut self, message: Message, live: bool) {
+        self.receive_visible(message, live, true);
+    }
+    pub fn receive_visible(&mut self, mut message: Message, live: bool, selected_visible: bool) {
         message.normalize_identity();
         let key = conversation_key(&message.conversation);
         if message.is_recalled() {
@@ -262,7 +281,7 @@ impl Model {
         }
         if live
             && !message.is_self
-            && self.selected.as_ref() != Some(&key)
+            && (!selected_visible || self.selected.as_ref() != Some(&key))
             && let Some(chat) = self
                 .chats
                 .iter_mut()
@@ -359,10 +378,20 @@ pub fn reply_target<'a>(messages: &'a [Message], reply: &Reply) -> Option<&'a Me
         } else {
             true
         };
+        let sequence_matches = match message.conversation {
+            Conversation::Group { .. } => {
+                message.sequence != 0 && reply.sequences.contains(&message.sequence)
+            }
+            _ => match reply.server_sequence.filter(|sequence| *sequence != 0) {
+                Some(sequence) => message.sequence == sequence,
+                None => {
+                    message.reply_sequence() != 0
+                        && reply.sequences.contains(&message.reply_sequence())
+                }
+            },
+        };
         sender
-            && ((message.reply_sequence() != 0
-                && reply.sequences.contains(&message.reply_sequence()))
-                || (message.sequence != 0 && reply.sequences.contains(&message.sequence))
+            && (sequence_matches
                 || (reply.message_id != 0 && reply.message_id == message.message_id))
     })
 }
@@ -446,7 +475,8 @@ pub fn summary(elements: &[MessageElement]) -> String {
             MessageElement::LightApp(_) => "[卡片]".into(),
             MessageElement::Forward(_) => "[聊天记录]".into(),
             MessageElement::GroupFile(f) => format!("[群文件] {}", f.name),
-            MessageElement::Opaque(_) => "[其他消息]".into(),
+            MessageElement::Opaque(_) => crate::expressions::Face::from_element(element)
+                .map_or_else(|| "[其他消息]".into(), |face| face.text()),
         })
         .collect::<String>()
 }

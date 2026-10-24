@@ -4,7 +4,7 @@ use atri_qq::{
 };
 use ferrsphen::ui_motion::{CardTextureCache, card_frame};
 use ferrsphen::{
-    backend::{AttachmentKind, Command, Update},
+    backend::{AttachmentKind, Command, ComposePart, Update},
     model::{Model, conversation_key, image_only, message_groups, reply_target, summary},
     ui_motion::{Bounce, ENTRANCE_SPAN, ENTRANCE_ZOOM, EXIT_SPAN, TimelineViewport, page_progress},
     viewer::{ImageItem, Viewer},
@@ -14,6 +14,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+        popover::Popover,
         spinner::Spinner,
         *,
     },
@@ -30,10 +31,21 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+const REACTION_CHOICES: [u32; 12] = [66, 76, 77, 13, 0, 32, 28, 5, 21, 49, 89, 79];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Chat,
     Settings,
+}
+
+struct PendingCopy {
+    message: Message,
+    baseline: Option<ClipboardItem>,
+}
+struct AttachmentConfirmation {
+    conversation: Conversation,
+    items: Vec<(PathBuf, AttachmentKind)>,
 }
 
 enum Phase {
@@ -65,6 +77,12 @@ struct ReplyJump {
     waiting: bool,
     layout_frames: u8,
     motion: Option<(SpringState, Instant)>,
+}
+struct SendScroll {
+    conversation: String,
+    from: Pixels,
+    target: Pixels,
+    started: Instant,
 }
 struct RecallTween {
     original: gpui_kit::Size<Pixels>,
@@ -141,12 +159,35 @@ pub struct AppView {
     forward_cache: HashMap<String, Vec<Message>>,
     phase: Phase,
     page: Page,
+    mobile_platform: bool,
+    desktop_windows: bool,
+    window_kind: crate::window_chrome::AppWindowKind,
+    window_switch_pending: bool,
+    phone: bool,
+    phone_conversation: bool,
+    phone_qr_login: bool,
     commands: mpsc::Sender<Command>,
     account: Entity<InputState>,
     password: Entity<InputState>,
     search: Entity<InputState>,
     search_index: RefCell<ferrsphen::search::SearchIndex>,
     composer: Entity<TextareaState>,
+    compose_images: HashMap<String, PathBuf>,
+    compose_faces: HashMap<String, crate::expressions::Face>,
+    emoji_open: bool,
+    emoji_favorites: bool,
+    favorites: Vec<crate::expressions::Favorite>,
+    favorites_refresh: Option<Task<()>>,
+    favorites_loading: bool,
+    favorites_error: bool,
+    poke_notices: HashMap<String, Vec<(Option<String>, String)>>,
+    pending_pokes: Vec<crate::activity::ActivityRecord>,
+    pending_reactions: HashSet<crate::activity::ReactionKey>,
+    compose_cache: tempfile::TempDir,
+    pending_copy: Option<PendingCopy>,
+    draft_contents: HashMap<String, gpui_kit::component::input::InputContent>,
+    confirmation: Option<AttachmentConfirmation>,
+    confirmation_focus: FocusHandle,
     challenge: Option<atri_qq::LoginChallenge>,
     ticket: Entity<InputState>,
     captcha_random: Entity<InputState>,
@@ -172,6 +213,8 @@ pub struct AppView {
     retries: HashMap<u64, Command>,
     forward_scroll: ScrollHandle,
     reply_jump: Option<ReplyJump>,
+    send_scroll: Option<SendScroll>,
+    send_scroll_animating: bool,
     _subscriptions: Vec<Subscription>,
     _updates: Task<()>,
 }
@@ -187,6 +230,7 @@ impl AppView {
             return;
         }
         self.reply_jump = None;
+        self.send_scroll = None;
         self.scroll_anchor = None;
         let before = self.scroll.offset();
         let previous_top = self.scroll.top_item();
@@ -250,6 +294,92 @@ impl AppView {
             }
         })
         .detach();
+    }
+
+    fn scroll_after_send(&mut self, conversation: &str, cx: &mut Context<Self>) {
+        if self.model.selected.as_deref() != Some(conversation) {
+            return;
+        }
+        self.reply_jump = None;
+        self.scroll_anchor = None;
+        self.bounce = Bounce::default();
+        self.send_scroll = Some(SendScroll {
+            conversation: conversation.into(),
+            from: self.scroll.offset().y,
+            target: -self.scroll.max_offset().y.max(px(0.)),
+            started: cx.background_executor().now(),
+        });
+        if self.send_scroll_animating {
+            return;
+        }
+        self.send_scroll_animating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let active = this.update(cx, |this, cx| {
+                    let active = this.advance_send_scroll(cx);
+                    this.send_scroll_animating = active;
+                    cx.notify();
+                    active
+                });
+                if !matches!(active, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn advance_send_scroll(&mut self, cx: &Context<Self>) -> bool {
+        let Some(mut motion) = self.send_scroll.take() else {
+            return false;
+        };
+        if self.model.selected.as_ref() != Some(&motion.conversation)
+            || !matches!(self.phase, Phase::Chat)
+            || self.page != Page::Chat
+        {
+            return false;
+        }
+        let now = cx.background_executor().now();
+        let target = -self.scroll.max_offset().y.max(px(0.));
+        // Lazy rows and the composer can change the destination after sending.
+        if (target - motion.target).abs() > px(0.5) {
+            motion.from = self.scroll.offset().y;
+            motion.target = target;
+            motion.started = now;
+        }
+        let progress = if cx.reduce_motion() {
+            1.
+        } else {
+            (now.saturating_duration_since(motion.started).as_secs_f32() / 0.28).min(1.)
+        };
+        let eased = 1. - (1. - progress).powi(3);
+        self.scroll.set_offset(point(
+            self.scroll.offset().x,
+            motion.from + (motion.target - motion.from) * eased,
+        ));
+        self.request_assets();
+        if progress < 1. || now.saturating_duration_since(motion.started).as_millis() < 380 {
+            self.send_scroll = Some(motion);
+            true
+        } else {
+            // Retain GPUI's tail anchor until the newly rendered content is laid out.
+            self.scroll.scroll_to_bottom();
+            false
+        }
+    }
+
+    fn retry_send(&mut self, id: u64, key: &str, text: &str, cx: &mut Context<Self>) {
+        if let Some(command) = self.retries.get(&id).cloned()
+            && self.command(command)
+        {
+            self.model.pending.insert(id, (key.into(), text.into()));
+            self.model.failures.remove(&id);
+            self.scroll_after_send(key, cx);
+        }
+        cx.notify();
     }
 
     fn capture_timeline_anchor(&self) -> Option<TimelineAnchor> {
@@ -394,7 +524,7 @@ impl AppView {
                     .h(relative(scale))
                     .opacity(visible)
                     .child(self.conversation(window, cx))
-                    .when(self.sidebar && self.is_group(), |panel| {
+                    .when(!self.phone && self.sidebar && self.is_group(), |panel| {
                         panel.child(self.info_sidebar(cx))
                     })
                     .when(self.transition.is_some(), |panel| {
@@ -542,6 +672,8 @@ impl AppView {
         }
         if read_only {
             self.forward_error = None;
+        } else {
+            self.send_scroll = None;
         }
         self.reply_jump = Some(ReplyJump {
             conversation,
@@ -658,47 +790,20 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mobile_platform = cfg!(any(target_os = "ios", target_os = "android"));
+        let phone = mobile_platform && phone_layout(window.viewport_size());
         let account = cx.new(|cx| InputState::new(window, cx).placeholder("QQ 账号"));
         let password = cx.new(|cx| InputState::new(window, cx).placeholder("密码").masked(true));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("输入消息")
-                .submit_on_enter(true)
+                .auto_grow(1, 6)
+                .submit_on_enter(!phone)
         });
         let ticket = cx.new(|cx| InputState::new(window, cx).placeholder("ticket"));
         let captcha_random = cx.new(|cx| InputState::new(window, cx).placeholder("randstr"));
         let voice_player = ferrsphen::audio::VoicePlayer::new(cx);
-        let subscriptions = vec![
-            cx.observe(&voice_player, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
-            cx.subscribe_in(&password, window, |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.login(window, cx);
-                }
-            }),
-            cx.subscribe_in(
-                &composer,
-                window,
-                |this, input, event, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
-                    InputEvent::Change => {
-                        if let Some(key) = this.model.selected.clone()
-                            && let Some(chat) = this
-                                .model
-                                .chats
-                                .iter_mut()
-                                .find(|chat| conversation_key(&chat.conversation) == key)
-                        {
-                            chat.draft = input.read(cx).value().to_string();
-                        }
-                        this.persist();
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            ),
-        ];
         let task = cx.spawn(async move |this, cx| {
             while let Some(update) = updates.recv().await {
                 if this
@@ -715,6 +820,7 @@ impl AppView {
                                     this.voice_player.update(cx, |player, cx| player.stop(cx));
                                 }
                                 this.apply(update);
+                                this.finish_copy(cx);
                             }
                         }
                         cx.notify();
@@ -725,7 +831,7 @@ impl AppView {
                 }
             }
         });
-        Self {
+        let mut view = Self {
             model: Model::default(),
             viewer: None,
             viewer_focus: cx.focus_handle(),
@@ -746,13 +852,36 @@ impl AppView {
             forward_error: None,
             forward_cache: HashMap::new(),
             phase: Phase::Connecting,
+            mobile_platform,
+            desktop_windows: !mobile_platform,
+            window_kind: crate::window_chrome::AppWindowKind::Login,
+            window_switch_pending: false,
             page: Page::Chat,
+            phone,
+            phone_conversation: false,
+            phone_qr_login: false,
             commands,
             account,
             password,
             search,
             search_index: RefCell::default(),
             composer,
+            compose_images: HashMap::new(),
+            compose_faces: HashMap::new(),
+            emoji_open: false,
+            emoji_favorites: false,
+            favorites: Vec::new(),
+            favorites_refresh: None,
+            favorites_loading: false,
+            favorites_error: false,
+            poke_notices: HashMap::new(),
+            pending_pokes: Vec::new(),
+            pending_reactions: HashSet::new(),
+            compose_cache: tempfile::tempdir().expect("draft cache"),
+            pending_copy: None,
+            draft_contents: HashMap::new(),
+            confirmation: None,
+            confirmation_focus: cx.focus_handle(),
             challenge: None,
             ticket,
             captcha_random,
@@ -778,9 +907,112 @@ impl AppView {
             retries: HashMap::new(),
             forward_scroll: ScrollHandle::new(),
             reply_jump: None,
-            _subscriptions: subscriptions,
+            send_scroll: None,
+            send_scroll_animating: false,
+            _subscriptions: Vec::new(),
             _updates: task,
+        };
+        view.bind_window(window, cx);
+        view
+    }
+    fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions = vec![
+            cx.observe(&self.voice_player, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&self.search, window, |_, _, _: &InputEvent, _, cx| {
+                cx.notify()
+            }),
+            cx.subscribe_in(&self.password, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.login(window, cx);
+                }
+            }),
+            cx.subscribe_in(
+                &self.composer,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } if !this.phone => {
+                        this.send(window, cx)
+                    }
+                    InputEvent::Change => {
+                        if let Some(key) = this.model.selected.clone() {
+                            this.draft_contents.insert(key, input.read(cx).content());
+                        }
+                        if let Some(key) = this.model.selected.clone()
+                            && let Some(chat) = this
+                                .model
+                                .chats
+                                .iter_mut()
+                                .find(|chat| conversation_key(&chat.conversation) == key)
+                        {
+                            chat.draft = input.read(cx).value().replace('\u{fffc}', "");
+                        }
+                        this.persist();
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        ];
+    }
+    fn desired_window(&self) -> crate::window_chrome::AppWindowKind {
+        if matches!(self.phase, Phase::Chat) {
+            crate::window_chrome::AppWindowKind::Main
+        } else {
+            crate::window_chrome::AppWindowKind::Login
         }
+    }
+    fn sync_desktop_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.desktop_windows
+            || self.window_switch_pending
+            || self.desired_window() == self.window_kind
+        {
+            return;
+        }
+        self.window_switch_pending = true;
+        let owner = cx.entity();
+        let previous = window.window_handle();
+        cx.defer(move |cx| {
+            let kind = owner.read(cx).desired_window();
+            let old_kind = owner.read(cx).window_kind;
+            if kind == old_kind {
+                owner.update(cx, |this, _| this.window_switch_pending = false);
+                return;
+            }
+            owner.update(cx, |this, _| this.window_kind = kind);
+            let view = owner.clone();
+            let result = gpui_kit::open_window(
+                crate::window_chrome::app_options(kind, cx),
+                cx,
+                move |window, cx| {
+                    view.update(cx, |this, cx| this.bind_window(window, cx));
+                    view
+                },
+            );
+            match result {
+                Ok((handle, _)) => {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        owner.update(cx, |this, cx| {
+                            if kind == crate::window_chrome::AppWindowKind::Login {
+                                this.account.update(cx, |input, cx| input.focus(window, cx));
+                            }
+                            this.window_switch_pending = false;
+                            cx.notify();
+                        });
+                    });
+                    let _ = previous.update(cx, |_, window, _| window.remove_window());
+                }
+                Err(error) => {
+                    tracing::error!(?error, "switch application window failed");
+                    owner.update(cx, |this, cx| {
+                        this.window_kind = old_kind;
+                        this.window_switch_pending = false;
+                        this.error = Some(error.to_string());
+                        cx.notify();
+                    });
+                }
+            }
+        });
     }
     fn command(&mut self, command: Command) -> bool {
         if self.commands.try_send(command).is_err() {
@@ -870,10 +1102,26 @@ impl AppView {
         .detach();
     }
     fn apply(&mut self, update: Update) {
+        let identity_changed = matches!(
+            &update,
+            Update::Online(_)
+                | Update::Contacts { .. }
+                | Update::Restored(_)
+                | Update::UserUin { .. }
+                | Update::Members { .. }
+                | Update::Message(_)
+                | Update::CachedMessages { .. }
+                | Update::History { .. }
+                | Update::ReplyHistory { .. }
+                | Update::Sent { .. }
+        );
         if matches!(
             &update,
             Update::Connecting | Update::LoginRequired | Update::Challenge(_)
         ) {
+            self.confirmation = None;
+            self.phone_conversation = false;
+            self.send_scroll = None;
             self.transition = None;
             self.recall_tweens.clear();
             self.visible_bubbles.borrow_mut().clear();
@@ -884,6 +1132,19 @@ impl AppView {
         let paginating =
             matches!(&update, Update::History { key, .. } if self.loading_more.contains(key));
         match update {
+            Update::Activity(record) => self.apply_activity(record),
+            Update::ReactionDone {
+                group,
+                sequence,
+                code,
+                result,
+            } => {
+                self.pending_reactions.remove(&(group, sequence, code));
+                match result {
+                    Ok(record) => self.apply_activity(record),
+                    Err(error) => self.error = Some(error),
+                }
+            }
             Update::Connecting => self.phase = Phase::Connecting,
             Update::Challenge(challenge) => {
                 self.challenge = Some(challenge);
@@ -916,7 +1177,20 @@ impl AppView {
                     .is_some_and(|old| old.uin != profile.uin)
                 {
                     self.model = Model::default();
+                    self.confirmation = None;
+                    self.compose_images.clear();
+                    self.compose_faces.clear();
+                    self.favorites.clear();
+                    self.favorites_refresh = None;
+                    self.favorites_loading = false;
+                    self.emoji_open = false;
+                    self.poke_notices.clear();
+                    self.pending_pokes.clear();
+                    self.pending_reactions.clear();
+                    self.pending_copy = None;
+                    self.draft_contents.clear();
                     self.transition = None;
+                    self.send_scroll = None;
                     self.scroll_anchor = None;
                     self.bounce = Bounce::default();
                     self.loading_more.clear();
@@ -950,6 +1224,7 @@ impl AppView {
             }
             Update::Restored(model) => {
                 self.transition = None;
+                self.send_scroll = None;
                 self.recall_tweens.clear();
                 self.visible_bubbles.borrow_mut().clear();
                 self.scroll_anchor = None;
@@ -959,6 +1234,7 @@ impl AppView {
                 let profile = self.model.profile.take();
                 self.model = *model;
                 self.model.profile = profile;
+                self.rebuild_pokes();
                 if let Some(chat) = self.model.selected_chat() {
                     self.command(Command::Select(chat.conversation.clone()));
                     self.load_history(false);
@@ -980,7 +1256,8 @@ impl AppView {
                 self.model.announcements.insert(group, result);
             }
             Update::Message(message) => {
-                self.model.receive(message, true);
+                let visible = self.page == Page::Chat && (!self.phone || self.phone_conversation);
+                self.model.receive_visible(message, true, visible);
                 self.persist();
             }
             Update::CachedMessages { key: _, messages } => {
@@ -1056,6 +1333,19 @@ impl AppView {
                     self.assets.insert(key, path);
                 }
                 Err(error) => {
+                    if self.pending_copy.as_ref().is_some_and(|copy| {
+                        copy.message
+                            .elements
+                            .iter()
+                            .enumerate()
+                            .any(|(index, element)| {
+                                matches!(element, MessageElement::Image(_))
+                                    && image_key(&copy.message, index) == key
+                            })
+                    }) {
+                        self.pending_copy = None;
+                        self.error = Some(error.clone());
+                    }
                     if let Some(viewer) = &mut self.viewer
                         && viewer.current().key == key
                     {
@@ -1094,7 +1384,24 @@ impl AppView {
             } => {
                 self.mark_recalled(&conversation, sequence);
             }
+            Update::Favorites { cached, result } => {
+                if !cached {
+                    self.favorites_loading = false;
+                }
+                match result {
+                    Ok(items) => {
+                        self.favorites = items;
+                        self.favorites_error = false;
+                    }
+                    Err(_) => self.favorites_error = true,
+                }
+            }
             Update::Notification(event) => {
+                if matches!(event, PushEvent::Poke { .. } | PushEvent::Reaction { .. }) {
+                    self.apply_activity(crate::activity::ActivityRecord::notification(
+                        event.clone(),
+                    ));
+                }
                 if let PushEvent::Recall {
                     conversation,
                     sequence,
@@ -1106,8 +1413,12 @@ impl AppView {
             }
             Update::Error(error) => self.error = Some(error),
         }
+        if identity_changed {
+            self.rebuild_pokes();
+        }
         self.request_assets();
         if near_bottom
+            && self.send_scroll.is_none()
             && !paginating
             && self.scroll_anchor.is_none()
             && !self.reply_jump.as_ref().is_some_and(|jump| !jump.read_only)
@@ -1154,6 +1465,28 @@ impl AppView {
             .collect()
     }
     fn request_assets(&mut self) {
+        let faces = self
+            .visible_groups(false)
+            .into_iter()
+            .chain(self.visible_groups(true))
+            .flat_map(|rows| rows.iter())
+            .flat_map(|message| message.elements.iter())
+            .filter_map(crate::expressions::Face::from_element)
+            .collect::<Vec<_>>();
+        for face in faces {
+            self.request_face(&face);
+        }
+        let reaction_faces = self
+            .visible_groups(false)
+            .into_iter()
+            .flatten()
+            .flat_map(|message| self.reaction_keys(message))
+            .filter_map(|(key, _)| key.2.parse::<u32>().ok())
+            .filter(|id| *id < 4096)
+            .collect::<Vec<_>>();
+        for id in reaction_faces {
+            self.request_face(&crate::expressions::Face::new(id));
+        }
         let mut avatars = Vec::new();
         if let Some(profile) = &self.model.profile {
             avatars.push(profile.uin);
@@ -1327,7 +1660,7 @@ impl AppView {
                     .elements
                     .iter()
                     .enumerate()
-                    .filter_map(move |(index, element)| {
+                    .filter_map(|(index, element)| {
                         if let MessageElement::Video(reference) = element {
                             Some((
                                 format!(
@@ -1522,11 +1855,45 @@ impl AppView {
         cx.notify();
     }
     fn select(&mut self, conversation: Conversation, window: &mut Window, cx: &mut Context<Self>) {
+        self.emoji_open = false;
+        if self.phone {
+            let already_selected =
+                self.model.selected.as_ref() == Some(&conversation_key(&conversation));
+            self.phone_conversation = true;
+            self.page = Page::Chat;
+            self.transition = None;
+            if already_selected {
+                if let Some(chat) = self
+                    .model
+                    .chats
+                    .iter_mut()
+                    .find(|chat| chat.conversation == conversation)
+                {
+                    chat.unread = 0;
+                }
+                self.persist();
+                self.request_assets();
+            } else {
+                self.commit_select(conversation.clone(), window, cx);
+            }
+            if !cx.reduce_motion() {
+                self.transition = Some(ConversationSwitch {
+                    destination: conversation,
+                    started: cx.background_executor().now(),
+                    entering: true,
+                });
+            }
+            window.blur(cx);
+            window.dismiss_virtual_keyboard();
+            cx.notify();
+            return;
+        }
         if self.model.selected.as_ref() == Some(&conversation_key(&conversation)) {
             self.transition = None;
             cx.notify();
             return;
         }
+        self.send_scroll = None;
         self.recall_tweens.clear();
         self.visible_bubbles.borrow_mut().clear();
         if self.model.selected.is_none() || cx.reduce_motion() {
@@ -1556,10 +1923,16 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        gpui_kit::base::TextSelection::clear(window, cx);
         self.bounce = Bounce::default();
+        self.send_scroll = None;
         self.scroll_anchor = None;
         self.recall_tweens.clear();
         self.visible_bubbles.borrow_mut().clear();
+        if let Some(key) = self.model.selected.clone() {
+            self.draft_contents
+                .insert(key, self.composer.read(cx).content());
+        }
         self.model.selected = Some(conversation_key(&conversation));
         if let Some(chat) = self.model.chats.iter_mut().find(|chat| {
             Some(&conversation_key(&chat.conversation)) == self.model.selected.as_ref()
@@ -1571,9 +1944,16 @@ impl AppView {
             .selected_chat()
             .map(|chat| chat.draft.clone())
             .unwrap_or_default();
+        let content = self
+            .draft_contents
+            .get(&conversation_key(&conversation))
+            .cloned()
+            .unwrap_or_else(|| draft.into());
         self.composer.update(cx, |input, cx| {
-            input.set_value(draft, window, cx);
-            input.focus(window, cx);
+            input.set_value(content, window, cx);
+            if !self.phone {
+                input.focus(window, cx);
+            }
         });
         self.reply_jump = None;
         self.mentions.clear();
@@ -1650,30 +2030,69 @@ impl AppView {
         }
     }
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.status == "离线"
-            || self
-                .transition
-                .as_ref()
-                .is_some_and(|transition| !transition.entering)
-        {
+        if self.confirmation.is_some() || self.status == "离线" {
             return;
         }
         let Some(chat) = self.model.selected_chat() else {
             return;
         };
         let conversation = chat.conversation.clone();
-        let mut text = self.composer.read(cx).value().to_string();
+        let input = self.composer.read(cx);
+        let text = input.value().to_string();
         if text.trim().is_empty() {
             return;
         }
-        let mut elements = Vec::new();
-        for mention in self.mentions.drain(..) {
-            text = text.replacen(&format!("@{} ", mention.display), "", 1);
-            elements.push(MessageElement::Mention(mention));
+        let tokens = input.tokens().to_vec();
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        for span in tokens {
+            let range = span.range();
+            if range.start > cursor {
+                parts.push(ComposePart::Element(Box::new(MessageElement::Text(
+                    text[cursor..range.start].to_owned(),
+                ))));
+            }
+            if let Some(face) = self.compose_faces.get(span.token().id().as_ref()) {
+                parts.push(ComposePart::Element(Box::new(face.element())));
+                cursor = range.end;
+                continue;
+            }
+            let Some(path) = self.compose_images.get(span.token().id().as_ref()) else {
+                self.error = Some("图片不可用".into());
+                cx.notify();
+                return;
+            };
+            parts.push(ComposePart::Image(path.clone()));
+            cursor = range.end;
+        }
+        if cursor < text.len() {
+            parts.push(ComposePart::Element(Box::new(MessageElement::Text(
+                text[cursor..].to_owned(),
+            ))));
+        }
+        let mut prefix = Vec::new();
+        for mention in &self.mentions {
+            let mut removed = false;
+            for part in &mut parts {
+                if let ComposePart::Element(element) = part
+                    && let MessageElement::Text(text) = element.as_mut()
+                {
+                    let pattern = format!("@{} ", mention.display);
+                    if !removed && text.contains(&pattern) {
+                        *text = text.replacen(&pattern, "", 1);
+                        removed = true;
+                    }
+                }
+            }
+            prefix.push(ComposePart::Element(Box::new(MessageElement::Mention(
+                mention.clone(),
+            ))));
         }
         if let Some(reply) = self.reply.as_ref() {
             match Reply::with_preview(reply) {
-                Ok(reply) => elements.push(MessageElement::Reply(reply)),
+                Ok(reply) => {
+                    prefix.push(ComposePart::Element(Box::new(MessageElement::Reply(reply))))
+                }
                 Err(error) => {
                     self.error = Some(error.to_string());
                     cx.notify();
@@ -1681,109 +2100,1046 @@ impl AppView {
                 }
             }
         }
-        self.reply = None;
-        self.reply_jump = None;
-        self.scroll_anchor = None;
-        elements.push(MessageElement::Text(text.clone()));
+        prefix.extend(parts);
+        let parts = prefix;
+        let mut elements = Vec::new();
+        let mut images = Vec::new();
+        for part in &parts {
+            match part {
+                ComposePart::Element(element) => elements.push(element.as_ref().clone()),
+                ComposePart::Image(path) => {
+                    let Ok(target) = conversation.media_conversation() else {
+                        return;
+                    };
+                    let mut reference = atri_qq::media::MediaReference::new(
+                        atri_qq::media::MediaKind::Image,
+                        target,
+                    );
+                    reference.name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    if let Ok((width, height)) = image::image_dimensions(path) {
+                        reference.width = width;
+                        reference.height = height;
+                    }
+                    images.push((elements.len(), path.clone()));
+                    elements.push(MessageElement::Image(reference));
+                }
+            }
+        }
         self.sequence += 1;
         let id = self.sequence;
         let nonce = (rand::random::<u32>() & 0x7fff_ffff).max(1);
-        let optimistic_elements = elements.clone();
-        let command = Command::Send {
-            id,
-            nonce,
-            conversation: conversation.clone(),
-            elements,
+        let command = if images.is_empty() {
+            Command::Send {
+                id,
+                nonce,
+                conversation: conversation.clone(),
+                elements: elements.clone(),
+            }
+        } else {
+            Command::Compose {
+                id,
+                nonce,
+                conversation: conversation.clone(),
+                parts,
+            }
         };
         if self.command(command.clone()) {
-            self.model.stage(
+            let staged = self.model.stage(
                 id,
                 conversation.clone(),
-                optimistic_elements,
+                elements,
                 nonce,
                 chrono::Utc::now().timestamp(),
             );
-            self.scroll.scroll_to_bottom();
+            for (index, path) in images {
+                self.assets.insert(image_key(&staged, index), path);
+            }
+            self.reply = None;
+            self.reply_jump = None;
+            self.scroll_anchor = None;
+            self.mentions.clear();
+            self.scroll_after_send(&conversation_key(&conversation), cx);
             self.retries.insert(id, command);
-            self.model
-                .pending
-                .insert(id, (conversation_key(&conversation), text));
+            self.model.pending.insert(
+                id,
+                (conversation_key(&conversation), summary(&staged.elements)),
+            );
+            self.draft_contents.remove(&conversation_key(&conversation));
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.persist();
         }
         cx.notify();
     }
-    fn attach(&mut self, kind: AttachmentKind, cx: &mut Context<Self>) {
+    fn attach(&mut self, kind: AttachmentKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(chat) = self.model.selected_chat() else {
             return;
         };
+        if self.confirmation.is_some() {
+            return;
+        }
         let conversation = chat.conversation.clone();
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
+            multiple: matches!(kind, AttachmentKind::Image),
             prompt: Some("选择文件".into()),
         });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let _ = this.update(cx, |this, cx| {
-                    this.sequence += 1;
-                    let id = this.sequence;
-                    let text = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let nonce = (rand::random::<u32>() & 0x7fff_ffff).max(1);
-                    let local_path = path.clone();
-                    let command = Command::Attachment {
-                        id,
-                        nonce,
-                        conversation: conversation.clone(),
-                        path,
-                        kind,
-                    };
-                    if this.command(command.clone()) {
-                        let media_kind = match kind {
-                            AttachmentKind::Image => atri_qq::media::MediaKind::Image,
-                            AttachmentKind::Voice => atri_qq::media::MediaKind::Voice,
-                            AttachmentKind::Video => atri_qq::media::MediaKind::Video,
-                            AttachmentKind::File => atri_qq::media::MediaKind::File,
-                        };
-                        let mut reference = atri_qq::media::MediaReference::new(
-                            media_kind,
-                            conversation.media_conversation().expect("chat media"),
-                        );
-                        reference.name = text.clone();
-                        let element = match kind {
-                            AttachmentKind::Image => MessageElement::Image(reference),
-                            AttachmentKind::Voice => MessageElement::Voice(reference),
-                            AttachmentKind::Video => MessageElement::Video(reference),
-                            AttachmentKind::File => MessageElement::File(reference),
-                        };
-                        let staged = this.model.stage(
-                            id,
-                            conversation.clone(),
-                            vec![element],
-                            nonce,
-                            chrono::Utc::now().timestamp(),
-                        );
-                        if matches!(kind, AttachmentKind::Image) {
-                            this.assets.insert(image_key(&staged, 0), local_path);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if this.model.selected.as_ref() != Some(&conversation_key(&conversation)) {
+                        return;
+                    }
+                    if matches!(kind, AttachmentKind::Image) {
+                        for path in paths {
+                            this.insert_image(path, window, cx);
                         }
-                        this.scroll.scroll_to_bottom();
-                        this.retries.insert(id, command);
-                        this.model
-                            .pending
-                            .insert(id, (conversation_key(&conversation), text));
+                    } else if matches!(kind, AttachmentKind::File | AttachmentKind::Voice) {
+                        this.confirmation = Some(AttachmentConfirmation {
+                            conversation,
+                            items: paths.into_iter().map(|path| (path, kind)).collect(),
+                        });
+                        this.confirmation_focus.focus(window, cx);
+                    } else {
+                        for path in paths {
+                            this.submit_attachment(conversation.clone(), path, kind, cx);
+                        }
                     }
                     cx.notify();
                 });
             }
         })
         .detach();
+    }
+    fn paste_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.confirmation.is_some() {
+            return false;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        if let Some(paths) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) => Some(paths.clone()),
+            _ => None,
+        }) {
+            self.receive_paths(paths.paths(), window, cx);
+            return true;
+        }
+        let parts = match ferrsphen::rich_clipboard::rich_parts(&item) {
+            Ok(Some(parts)) => parts,
+            Ok(None) => return false,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return true;
+            }
+        };
+        let files = parts
+            .iter()
+            .map(|part| ferrsphen::rich_clipboard::materialize(part, self.compose_cache.path()))
+            .collect::<anyhow::Result<Vec<_>>>();
+        match files {
+            Ok(files) => {
+                for (part, file) in parts.into_iter().zip(files) {
+                    match part {
+                        ferrsphen::rich_clipboard::Part::Text { text } => {
+                            self.composer
+                                .update(cx, |input, cx| input.replace(text, window, cx));
+                        }
+                        ferrsphen::rich_clipboard::Part::Face { face } => {
+                            self.insert_face(face, window, cx)
+                        }
+                        ferrsphen::rich_clipboard::Part::Image { .. } => {
+                            if let Some(path) = file {
+                                self.insert_image(path, window, cx);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        cx.notify();
+        true
+    }
+    fn copy_draft(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let input = self.composer.read(cx);
+        let range = input.selected_range();
+        let tokens = input
+            .tokens()
+            .iter()
+            .filter(|span| span.range().start >= range.start && span.range().end <= range.end)
+            .cloned()
+            .collect::<Vec<_>>();
+        if tokens.is_empty() {
+            return false;
+        }
+        let value = input.value();
+        let result = (|| -> anyhow::Result<ClipboardItem> {
+            let mut parts = Vec::new();
+            let mut cursor = range.start;
+            for span in tokens {
+                if cursor < span.range().start {
+                    parts.push(ferrsphen::rich_clipboard::text(
+                        &value[cursor..span.range().start],
+                    ));
+                }
+                if let Some(face) = self.compose_faces.get(span.token().id().as_ref()) {
+                    parts.push(ferrsphen::rich_clipboard::Part::Face { face: face.clone() });
+                    cursor = span.range().end;
+                    continue;
+                }
+                let path = self
+                    .compose_images
+                    .get(span.token().id().as_ref())
+                    .ok_or_else(|| anyhow::anyhow!("图片不可用"))?;
+                parts.push(ferrsphen::rich_clipboard::image_file(path)?);
+                cursor = span.range().end;
+            }
+            if cursor < range.end {
+                parts.push(ferrsphen::rich_clipboard::text(&value[cursor..range.end]));
+            }
+            ferrsphen::rich_clipboard::clipboard(parts)
+        })();
+        match result {
+            Ok(item) => {
+                self.pending_copy = None;
+                cx.write_to_clipboard(item);
+                if cut {
+                    self.composer
+                        .update(cx, |input, cx| input.replace("", window, cx));
+                }
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        cx.notify();
+        true
+    }
+    fn copy_message(&mut self, message: Message, cx: &mut Context<Self>) {
+        self.pending_copy = None;
+        if self.model.is_recalled(&message) {
+            cx.write_to_clipboard(ClipboardItem::new_string("[已撤回]".into()));
+            return;
+        }
+        for (index, element) in message.elements.iter().enumerate() {
+            if let MessageElement::Image(reference) = element {
+                let key = image_key(&message, index);
+                if !self.assets.contains_key(&key) {
+                    self.command(Command::ViewImage {
+                        key,
+                        reference: reference.clone(),
+                    });
+                }
+            }
+        }
+        self.pending_copy = Some(PendingCopy {
+            message,
+            baseline: cx.read_from_clipboard(),
+        });
+        self.finish_copy(cx);
+    }
+    fn finish_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(copy) = &self.pending_copy else {
+            return;
+        };
+        if copy
+            .message
+            .elements
+            .iter()
+            .enumerate()
+            .any(|(index, element)| {
+                matches!(element, MessageElement::Image(_))
+                    && !self.assets.contains_key(&image_key(&copy.message, index))
+            })
+        {
+            return;
+        }
+        let copy = self.pending_copy.take().unwrap();
+        if cx.read_from_clipboard() != copy.baseline {
+            return;
+        }
+        let result = (|| -> anyhow::Result<ClipboardItem> {
+            let parts = copy
+                .message
+                .elements
+                .iter()
+                .enumerate()
+                .map(|(index, element)| {
+                    if matches!(element, MessageElement::Image(_)) {
+                        ferrsphen::rich_clipboard::image_file(
+                            &self.assets[&image_key(&copy.message, index)],
+                        )
+                    } else if let Some(face) = crate::expressions::Face::from_element(element) {
+                        Ok(ferrsphen::rich_clipboard::Part::Face { face })
+                    } else {
+                        Ok(ferrsphen::rich_clipboard::text(summary(
+                            std::slice::from_ref(element),
+                        )))
+                    }
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ferrsphen::rich_clipboard::clipboard(parts)
+        })();
+        match result {
+            Ok(item) => cx.write_to_clipboard(item),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+    fn request_face(&mut self, face: &crate::expressions::Face) {
+        if let Some(url) = face.image_url() {
+            self.asset(format!("face:{}", face.id), url);
+        }
+    }
+    fn face_image(&self, face: &crate::expressions::Face) -> AnyElement {
+        face_image(face, &self.assets)
+    }
+    fn insert_face(
+        &mut self,
+        face: crate::expressions::Face,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_face(&face);
+        let id = format!("compose-face:{:016x}", rand::random::<u64>());
+        let token = gpui_kit::component::input::InlineToken::new(id.clone(), "\u{fffc}")
+            .with_label(face.text());
+        self.compose_faces.insert(id, face);
+        self.emoji_open = false;
+        let result = self.composer.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.replace_with_token(token, window, cx)
+        });
+        if let Err(error) = result {
+            self.error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+    fn load_favorites(&mut self) {
+        if self.favorites_loading {
+            return;
+        }
+        self.requested.retain(|key| !key.starts_with("favorite:"));
+        self.favorites_loading = self.command(Command::Favorites);
+        self.favorites_error = !self.favorites_loading;
+    }
+    fn favorites_visible(&self) -> bool {
+        self.emoji_open
+            && self.emoji_favorites
+            && matches!(self.phase, Phase::Chat)
+            && self.page == Page::Chat
+            && (!self.phone || self.phone_conversation)
+            && self.model.selected_chat().is_some()
+    }
+    fn sync_favorites_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.favorites_visible() {
+            self.favorites_refresh = None;
+            return;
+        }
+        if self.favorites_refresh.is_some() {
+            return;
+        }
+        self.favorites_refresh = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if !this.favorites_visible() {
+                            return false;
+                        }
+                        this.load_favorites();
+                        cx.notify();
+                        true
+                    })
+                    .ok()
+                    != Some(true)
+                {
+                    break;
+                }
+            }
+        }));
+    }
+    fn expression_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let owner = cx.entity();
+        let change_owner = owner.clone();
+        Popover::new("expression-picker")
+            .anchor(Anchor::BottomLeft)
+            .open(self.emoji_open)
+            .on_open_change(move |open, _, cx| {
+                change_owner.update(cx, |this, cx| {
+                    this.emoji_open = *open;
+                    if *open {
+                        for &(id, _) in crate::expressions::FACES {
+                            this.request_face(&crate::expressions::Face::new(id));
+                        }
+                        this.load_favorites();
+                    }
+                    this.sync_favorites_refresh(cx);
+                    cx.notify();
+                });
+            })
+            .trigger(
+                Button::new("emoji-button")
+                    .ghost()
+                    .small()
+                    .icon(gpui_kit::assets::IconName::FaceSlightlySmiling)
+                    .size(px(if self.phone { 44. } else { 32. }))
+                    .tooltip("表情")
+                    .accessibility_label("表情")
+                    .debug_selector(|| "emoji-button".into()),
+            )
+            .content(move |_, _, cx| owner.update(cx, |this, cx| this.expression_content(cx)))
+            .into_any_element()
+    }
+    fn expression_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tabs = div()
+            .flex()
+            .gap_1()
+            .child(
+                Button::new("faces-tab")
+                    .debug_selector(|| "faces-tab".into())
+                    .ghost()
+                    .small()
+                    .label("表情")
+                    .selected(!self.emoji_favorites)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.emoji_favorites = false;
+                        this.sync_favorites_refresh(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("favorites-tab")
+                    .debug_selector(|| "favorites-tab".into())
+                    .ghost()
+                    .small()
+                    .label("收藏")
+                    .selected(self.emoji_favorites)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.emoji_favorites = true;
+                        this.load_favorites();
+                        this.sync_favorites_refresh(cx);
+                        cx.notify();
+                    })),
+            );
+        let content = if self.emoji_favorites {
+            if self.favorites.is_empty() {
+                div()
+                    .h(px(230.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if self.favorites_loading {
+                        Spinner::new().into_any_element()
+                    } else {
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if self.favorites_error {
+                                "加载失败"
+                            } else {
+                                "暂无收藏表情"
+                            })
+                            .into_any_element()
+                    })
+                    .into_any_element()
+            } else {
+                let owner = cx.entity().downgrade();
+                uniform_list(
+                    "favorite-expressions",
+                    self.favorites.len().div_ceil(5),
+                    move |range, _, cx| {
+                        owner
+                            .update(cx, |this, cx| {
+                                range
+                                    .map(|row| {
+                                        let items = this
+                                            .favorites
+                                            .iter()
+                                            .skip(row * 5)
+                                            .take(5)
+                                            .cloned()
+                                            .collect::<Vec<_>>();
+                                        let mut cells = Vec::new();
+                                        for item in items {
+                                            let key = format!(
+                                                "favorite:{}:{}",
+                                                this.model
+                                                    .profile
+                                                    .as_ref()
+                                                    .map_or(0, |user| user.uin),
+                                                item.id
+                                            );
+                                            this.asset(key.clone(), item.url);
+                                            let path = this.assets.get(&key).cloned();
+                                            let mut button =
+                                                Button::new(SharedString::from(key.clone()))
+                                                    .debug_selector(move || key.clone())
+                                                    .ghost()
+                                                    .size(px(52.))
+                                                    .disabled(path.is_none())
+                                                    .accessibility_label("收藏表情");
+                                            if let Some(path) = path {
+                                                button = button
+                                                    .child(
+                                                        img(path.clone())
+                                                            .size(px(46.))
+                                                            .object_fit(ObjectFit::Contain),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.emoji_open = false;
+                                                            this.insert_favorite(&path, window, cx);
+                                                        },
+                                                    ));
+                                            } else {
+                                                button = button.child(Spinner::new());
+                                            }
+                                            cells.push(button);
+                                        }
+                                        div()
+                                            .flex()
+                                            .h(px(56.))
+                                            .gap_1()
+                                            .children(cells)
+                                            .into_any_element()
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    },
+                )
+                .h(px(230.))
+                .w_full()
+                .into_any_element()
+            }
+        } else {
+            let rows = crate::expressions::FACES.chunks(6).map(|row| {
+                div().flex().gap_1().children(row.iter().map(|&(id, _)| {
+                    let face = crate::expressions::Face::new(id);
+                    Button::new(SharedString::from(format!("face-choice:{id}")))
+                        .debug_selector(move || format!("face-choice:{id}"))
+                        .ghost()
+                        .size(px(43.))
+                        .accessibility_label(face.name.clone())
+                        .child(self.face_image(&face))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.insert_face(face.clone(), window, cx)
+                        }))
+                }))
+            });
+            div()
+                .id("face-list")
+                .h(px(230.))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element()
+        };
+        div()
+            .debug_selector(|| "emoji-panel".into())
+            .w(px(288.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(tabs)
+            .child(content)
+            .into_any_element()
+    }
+    fn participant_avatar(
+        &self,
+        uin: u64,
+        uid: &str,
+        name: &str,
+        conversation: &Conversation,
+        read_only: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let owner = cx.entity().downgrade();
+        let uid = uid.to_owned();
+        let name = name.to_owned();
+        let conversation = conversation.clone();
+        let disabled = read_only || self.status == "离线" || (uin == 0 && uid.is_empty());
+        div()
+            .id(SharedString::from(format!("participant:{uin}:{uid}")))
+            .debug_selector(move || format!("participant-avatar:{uin}"))
+            .child(self.avatar(uin, &name, cx))
+            .context_menu(move |menu, _, _| {
+                let mention_owner = owner.clone();
+                let poke_owner = owner.clone();
+                let mention_uid = uid.clone();
+                let mention_name = name.clone();
+                let poke_uid = uid.clone();
+                let conversation = conversation.clone();
+                menu.when(matches!(conversation, Conversation::Group { .. }), |menu| {
+                    menu.item(PopupMenuItem::new("@").disabled(disabled).on_click(
+                        move |_, window, cx| {
+                            let _ = mention_owner.update(cx, |this, cx| {
+                                this.mentions.push(Mention {
+                                    uin,
+                                    uid: Some(mention_uid.clone()),
+                                    display: mention_name.clone(),
+                                    is_everyone: false,
+                                });
+                                this.composer.update(cx, |input, cx| {
+                                    input.focus(window, cx);
+                                    input.replace(format!("@{mention_name} "), window, cx);
+                                });
+                                cx.notify();
+                            });
+                        },
+                    ))
+                })
+                .item(
+                    PopupMenuItem::new("戳一戳")
+                        .disabled(
+                            disabled || matches!(conversation, Conversation::Temporary { .. }),
+                        )
+                        .on_click(move |_, _, cx| {
+                            let _ = poke_owner.update(cx, |this, _| {
+                                this.command(Command::Poke {
+                                    conversation: conversation.clone(),
+                                    target: uin,
+                                    uid: poke_uid.clone(),
+                                });
+                            });
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+    fn receive_poke(
+        &mut self,
+        group: Option<u64>,
+        actor: Option<u64>,
+        target: Option<u64>,
+        parameters: &std::collections::BTreeMap<String, String>,
+        time: i64,
+    ) -> bool {
+        let own = self.model.profile.as_ref().map_or(0, |profile| profile.uin);
+        let key = if let Some(group) = group {
+            conversation_key(&Conversation::Group { uin: group })
+        } else {
+            let peer = [actor, target]
+                .into_iter()
+                .flatten()
+                .find(|uin| *uin != own && *uin != 0);
+            let Some(peer) = peer else {
+                return false;
+            };
+            let Some(chat) = self.model.chats.iter().find(|chat| {
+                let Conversation::Friend { uin, uid } = &chat.conversation else {
+                    return false;
+                };
+                *uin == peer
+                    || (!uid.is_empty()
+                        && (self.model.resolved_uins.get(uid) == Some(&peer)
+                            || self
+                                .model
+                                .friends
+                                .iter()
+                                .any(|friend| friend.uin == peer && friend.uid == *uid)
+                            || self
+                                .model
+                                .messages
+                                .get(&conversation_key(&chat.conversation))
+                                .is_some_and(|messages| {
+                                    messages.iter().any(|message| {
+                                        (message.sender_uin == peer && message.sender_uid == *uid)
+                                            || (message.recipient_uin == peer
+                                                && message.recipient_uid == *uid)
+                                    })
+                                })))
+            }) else {
+                return false;
+            };
+            conversation_key(&chat.conversation)
+        };
+        let display = |uin: Option<u64>| {
+            let Some(uin) = uin.filter(|uin| *uin != 0) else {
+                return "对方".to_owned();
+            };
+            if uin == own {
+                return "你".into();
+            }
+            let friend = self.model.friends.iter().find(|friend| friend.uin == uin);
+            let member = group
+                .and_then(|group| self.model.members.get(&group))
+                .and_then(|members| members.iter().find(|member| member.uin == uin));
+            let fallback = self
+                .model
+                .chats
+                .iter()
+                .find(|chat| conversation_key(&chat.conversation) == key)
+                .filter(|chat| group.is_none() && !chat.title.starts_with("dm:"))
+                .map_or("", |chat| chat.title.as_str());
+            ferrsphen::model::display_name(friend, member, fallback, uin)
+        };
+        let action = parameters
+            .get("action_str")
+            .filter(|action| !action.trim().is_empty())
+            .map_or("戳了戳", String::as_str);
+        let suffix = parameters.get("suffix_str").map_or("", String::as_str);
+        let text = format!("{} {action} {}{suffix}", display(actor), display(target));
+        let after = self
+            .model
+            .messages
+            .get(&key)
+            .and_then(|rows| {
+                rows.iter()
+                    .rev()
+                    .find(|message| message.time.saturating_mul(1000) <= time)
+            })
+            .map(message_key);
+        let notices = self.poke_notices.entry(key).or_default();
+        notices.push((after, text));
+        if notices.len() > 100 {
+            notices.remove(0);
+        }
+        true
+    }
+    fn apply_activity(&mut self, record: crate::activity::ActivityRecord) {
+        if !self.model.apply_activity(record.clone()) {
+            return;
+        }
+        self.display_poke(record);
+    }
+    fn display_poke(&mut self, record: crate::activity::ActivityRecord) {
+        if let crate::activity::ActivityEvent::Notification(PushEvent::Poke {
+            group_uin,
+            actor_uin,
+            target_uin,
+            parameters,
+            ..
+        }) = &record.event
+            && !self.receive_poke(*group_uin, *actor_uin, *target_uin, parameters, record.time)
+        {
+            self.pending_pokes.push(record);
+        }
+    }
+    fn rebuild_pokes(&mut self) {
+        self.poke_notices.clear();
+        self.pending_pokes.clear();
+        let pokes = self
+            .model
+            .activity
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::activity::ActivityEvent::Notification(PushEvent::Poke { .. })
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in pokes {
+            self.display_poke(record);
+        }
+    }
+    fn poke_rows(
+        &self,
+        messages: &[Message],
+        read_only: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        if read_only {
+            return vec![];
+        }
+        let Some(first) = messages.first() else {
+            return vec![];
+        };
+        self.poke_notices
+            .get(&conversation_key(&first.conversation))
+            .into_iter()
+            .flatten()
+            .filter(|(after, _)| match after {
+                Some(key) => messages.iter().any(|message| message_key(message) == *key),
+                None => self
+                    .model
+                    .messages
+                    .get(&conversation_key(&first.conversation))
+                    .and_then(|rows| rows.first())
+                    .is_some_and(|message| message_key(message) == message_key(first)),
+            })
+            .map(|(_, text)| {
+                div()
+                    .debug_selector(|| "poke-notice".into())
+                    .w_full()
+                    .py_2()
+                    .text_center()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text.clone())
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn insert_favorite(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let result = ferrsphen::rich_clipboard::image_file(path).and_then(|part| {
+            ferrsphen::rich_clipboard::materialize(&part, self.compose_cache.path())
+        });
+        match result {
+            Ok(Some(path)) => self.insert_image(path, window, cx),
+            Ok(None) => {}
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+    fn insert_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !path.is_file() || image::image_dimensions(&path).is_err() {
+            self.error = Some("无法读取图片".into());
+            cx.notify();
+            return;
+        }
+        let id = format!("compose-image:{:016x}", rand::random::<u64>());
+        self.compose_images.insert(id.clone(), path);
+        let token = gpui_kit::component::input::InlineToken::new(id, "\u{fffc}").with_label("图片");
+        let result = self.composer.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.replace_with_token(token, window, cx)
+        });
+        if let Err(error) = result {
+            self.error = Some(error.to_string());
+        }
+        cx.notify();
+    }
+    fn receive_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.model.selected_chat() else {
+            return;
+        };
+        if self.confirmation.is_some() {
+            return;
+        }
+        let conversation = chat.conversation.clone();
+        let mut standalone = Vec::new();
+        for path in paths {
+            if !path.is_file() {
+                self.error = Some("请选择文件".into());
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match extension.as_str() {
+                "png" | "jpg" | "jpeg" | "gif" | "webp" => {
+                    self.insert_image(path.clone(), window, cx)
+                }
+                "silk" | "amr" | "wav" | "mp3" | "ogg" | "opus" | "m4a" | "flac" | "aac" => {
+                    standalone.push((path.clone(), AttachmentKind::Voice))
+                }
+                _ => standalone.push((path.clone(), AttachmentKind::File)),
+            }
+        }
+        if !standalone.is_empty() {
+            self.confirmation = Some(AttachmentConfirmation {
+                conversation,
+                items: standalone,
+            });
+            self.confirmation_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+    fn submit_attachment(
+        &mut self,
+        conversation: Conversation,
+        path: PathBuf,
+        kind: AttachmentKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.sequence += 1;
+        let id = self.sequence;
+        let text = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let nonce = (rand::random::<u32>() & 0x7fff_ffff).max(1);
+        let command = Command::Attachment {
+            id,
+            nonce,
+            conversation: conversation.clone(),
+            path: path.clone(),
+            kind,
+        };
+        if self.command(command.clone()) {
+            let media_kind = match kind {
+                AttachmentKind::Image => atri_qq::media::MediaKind::Image,
+                AttachmentKind::Voice => atri_qq::media::MediaKind::Voice,
+                AttachmentKind::Video => atri_qq::media::MediaKind::Video,
+                AttachmentKind::File => atri_qq::media::MediaKind::File,
+            };
+            let Ok(target) = conversation.media_conversation() else {
+                return;
+            };
+            let mut reference = atri_qq::media::MediaReference::new(media_kind, target);
+            reference.name = text.clone();
+            let element = match kind {
+                AttachmentKind::Image => MessageElement::Image(reference),
+                AttachmentKind::Voice => MessageElement::Voice(reference),
+                AttachmentKind::Video => MessageElement::Video(reference),
+                AttachmentKind::File => MessageElement::File(reference),
+            };
+            let staged = self.model.stage(
+                id,
+                conversation.clone(),
+                vec![element],
+                nonce,
+                chrono::Utc::now().timestamp(),
+            );
+            if matches!(kind, AttachmentKind::Image) {
+                self.assets.insert(image_key(&staged, 0), path);
+            }
+            self.scroll_after_send(&conversation_key(&conversation), cx);
+            self.retries.insert(id, command);
+            self.model
+                .pending
+                .insert(id, (conversation_key(&conversation), text));
+        }
+        cx.notify();
+    }
+    fn confirm_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.status == "离线" {
+            return;
+        }
+        if let Some(confirmation) = self.confirmation.take() {
+            for (path, kind) in confirmation.items {
+                self.submit_attachment(confirmation.conversation.clone(), path, kind, cx);
+            }
+        }
+        self.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+    fn confirmation_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(confirmation) = &self.confirmation else {
+            return div().into_any_element();
+        };
+        let title = if confirmation
+            .items
+            .iter()
+            .all(|(_, kind)| *kind == AttachmentKind::Voice)
+        {
+            "发送语音"
+        } else {
+            "发送文件"
+        };
+        div()
+            .id("attachment-confirmation")
+            .debug_selector(|| "attachment-confirmation".into())
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui_kit::rgba(0x00000066))
+            .track_focus(&self.confirmation_focus)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.confirmation = None;
+                    this.composer
+                        .update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .w_96()
+                    .max_w(relative(0.94))
+                    .max_h(px(480.))
+                    .p_5()
+                    .gap_4()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .when_some(
+                        self.model
+                            .chats
+                            .iter()
+                            .find(|chat| chat.conversation == confirmation.conversation),
+                        |view, chat| {
+                            view.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(chat.title.clone()),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .id("confirmation-files")
+                            .overflow_y_scroll()
+                            .max_h(px(280.))
+                            .children(confirmation.items.iter().map(|(path, _)| {
+                                div().py_1().text_sm().truncate().child(
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("attachment-cancel")
+                                    .ghost()
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirmation = None;
+                                        this.composer
+                                            .update(cx, |input, cx| input.focus(window, cx));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "attachment-confirm-button".into())
+                                    .child(
+                                        Button::new("attachment-confirm")
+                                            .primary()
+                                            .label("发送")
+                                            .disabled(self.status == "离线")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.confirm_attachments(window, cx)
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
     fn avatar(&self, uin: u64, name: &str, cx: &App) -> AnyElement {
         self.avatar_for(&format!("avatar:{uin}"), name, cx)
@@ -1833,70 +3189,101 @@ impl AppView {
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_8()
-            .p_8()
+            .gap_4()
+            .when(self.phone, |view| view.p_4())
+            .when(!self.phone, |view| view.p_8())
             .child(
                 div()
                     .flex()
-                    .gap_10()
                     .items_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(rems(15.))
-                                    .p_3()
-                                    .bg(cx.theme().primary_foreground)
-                                    .rounded_lg()
-                                    .map(|element| match &self.qr {
-                                        Some(image) => {
-                                            element.child(img(image.clone()).size_full())
-                                        }
-                                        None => element.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("二维码加载中"),
-                                        ),
-                                    }),
-                            )
-                            .child(
-                                Button::new("refresh-qr")
-                                    .ghost()
-                                    .label("刷新二维码")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.qr = None;
-                                        this.command(Command::Qr);
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w_64()
-                            .gap_4()
-                            .child(div().text_lg().child("登录 QQ"))
-                            .child(Input::new(&self.account).aria_label("QQ 账号"))
-                            .child(Input::new(&self.password).aria_label("密码"))
-                            .child(
-                                Button::new("login")
-                                    .primary()
-                                    .w_full()
-                                    .label("登录")
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.login(window, cx)),
-                                    ),
-                            ),
-                    ),
+                    .when(self.phone, |view| view.flex_col().gap_4())
+                    .when(!self.phone, |view| view.gap_10())
+                    .when(!self.phone || self.phone_qr_login, |view| {
+                        view.child(self.qr_login(cx))
+                    })
+                    .when(!self.phone || !self.phone_qr_login, |view| {
+                        view.child(self.password_login(cx))
+                    }),
+            )
+            .when(self.phone, |view| {
+                view.child(
+                    Button::new("switch-login")
+                        .debug_selector(|| "switch-login".into())
+                        .ghost()
+                        .label(if self.phone_qr_login {
+                            "密码登录"
+                        } else {
+                            "二维码登录"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.phone_qr_login = !this.phone_qr_login;
+                            window.blur(cx);
+                            window.dismiss_virtual_keyboard();
+                            if this.phone_qr_login {
+                                this.qr = None;
+                                this.qr_url = None;
+                                this.command(Command::Qr);
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+    fn qr_login(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "qr-login".into())
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(rems(15.))
+                    .p_3()
+                    .bg(cx.theme().primary_foreground)
+                    .rounded_lg()
+                    .map(|element| match &self.qr {
+                        Some(image) => element.child(img(image.clone()).size_full()),
+                        None => element.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("二维码加载中"),
+                        ),
+                    }),
+            )
+            .child(
+                Button::new("refresh-qr")
+                    .ghost()
+                    .label("刷新二维码")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.qr = None;
+                        this.command(Command::Qr);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+    fn password_login(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .debug_selector(|| "password-login".into())
+            .flex()
+            .flex_col()
+            .w_64()
+            .gap_4()
+            .child(div().text_lg().child("登录 QQ"))
+            .child(Input::new(&self.account).aria_label("QQ 账号"))
+            .child(Input::new(&self.password).aria_label("密码"))
+            .child(
+                Button::new("login")
+                    .primary()
+                    .w_full()
+                    .label("登录")
+                    .on_click(cx.listener(|this, _, window, cx| this.login(window, cx))),
             )
             .into_any_element()
     }
@@ -2004,19 +3391,74 @@ impl AppView {
             .child(div().w_3())
             .into_any_element()
     }
+    fn main_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let body = div().flex().flex_1().min_h_0().min_w_0();
+        let page = if self.page == Page::Settings {
+            div()
+                .debug_selector(|| "settings-page".into())
+                .flex_1()
+                .h_full()
+                .into_any_element()
+        } else if self.phone {
+            if self.phone_conversation {
+                self.conversation_panel(window, cx)
+            } else {
+                self.chat_list(cx)
+            }
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(self.chat_list(cx))
+                .child(self.conversation_panel(window, cx))
+                .into_any_element()
+        };
+        if self.phone {
+            body.flex_col()
+                .child(div().flex().flex_1().min_h_0().min_w_0().child(page))
+                .when(
+                    self.page == Page::Settings || !self.phone_conversation,
+                    |body| body.child(self.navigation(cx)),
+                )
+                .into_any_element()
+        } else {
+            body.child(self.navigation(cx))
+                .child(page)
+                .into_any_element()
+        }
+    }
+
+    fn show_chat_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        gpui_kit::base::TextSelection::clear(window, cx);
+        self.phone_conversation = false;
+        self.transition = None;
+        self.send_scroll = None;
+        self.reply_jump = None;
+        self.scroll_anchor = None;
+        self.bounce = Bounce::default();
+        self.recall_tweens.clear();
+        self.visible_bubbles.borrow_mut().clear();
+        window.blur(cx);
+        window.dismiss_virtual_keyboard();
+        cx.notify();
+    }
+
     fn navigation(&self, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::assets::IconName;
         div()
             .debug_selector(|| "navigation".into())
             .flex()
-            .flex_col()
             .items_center()
-            .w(px(52.))
-            .h_full()
             .flex_shrink_0()
-            .py_3()
             .gap_2()
-            .border_r_1()
+            .when(self.phone, |nav| {
+                nav.w_full().h(px(56.)).justify_around().border_t_1()
+            })
+            .when(!self.phone, |nav| {
+                nav.flex_col().w(px(52.)).h_full().py_3().border_r_1()
+            })
             .border_color(cx.theme().border)
             .children(
                 [
@@ -2029,15 +3471,20 @@ impl AppView {
                         Button::new(id)
                             .ghost()
                             .icon(icon)
+                            .when(self.phone, |button| button.size(px(44.)))
                             .tooltip(label)
                             .accessibility_label(label)
                             .when(self.page == page, |button| button.bg(cx.theme().accent))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if this.page != page {
+                                    this.send_scroll = None;
                                     this.recall_tweens.clear();
                                     this.visible_bubbles.borrow_mut().clear();
                                 }
                                 this.page = page;
+                                if this.phone {
+                                    this.show_chat_list(window, cx);
+                                }
                                 window.blur(cx);
                                 cx.notify();
                             })),
@@ -2068,13 +3515,25 @@ impl AppView {
         .min_h_0()
         .px_1();
         div()
+            .debug_selector(|| "chat-list".into())
             .flex()
             .flex_col()
-            .w_72()
+            .when(self.phone, |list| list.w_full().min_w_0().flex_1())
+            .when(!self.phone, |list| list.w_72())
             .h_full()
             .flex_shrink_0()
-            .border_r_1()
+            .when(!self.phone, |list| list.border_r_1())
             .border_color(cx.theme().border)
+            .when(self.phone, |list| {
+                list.child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("聊天"),
+                )
+            })
             .child(
                 div()
                     .p_3()
@@ -2099,6 +3558,10 @@ impl AppView {
             _ => 0,
         };
         Button::new(SharedString::from(format!("chat:{key}")))
+            .debug_selector({
+                let key = key.clone();
+                move || format!("chat:{key}")
+            })
             .ghost()
             .selected(selected)
             .when(selected, |button| button.bg(cx.theme().accent))
@@ -2164,11 +3627,23 @@ impl AppView {
             message.sequence
         );
         match element {
-            MessageElement::Text(text) => div().text_sm().child(text.clone()).into_any_element(),
+            MessageElement::Text(text) => div()
+                .debug_selector(move || format!("message-text:{key}"))
+                .text_sm()
+                .cursor_text()
+                .child(crate::message_text::MessageText::new(
+                    "message-text",
+                    text.clone(),
+                ))
+                .into_any_element(),
             MessageElement::Mention(mention) => div()
                 .text_sm()
                 .text_color(cx.theme().primary)
-                .child(format!("@{}", mention.display))
+                .cursor_text()
+                .child(crate::message_text::MessageText::new(
+                    "message-mention",
+                    format!("@{}", mention.display),
+                ))
                 .into_any_element(),
             MessageElement::Reply(reply) => {
                 let preview = self.quoted_message(message, reply, read_only);
@@ -2510,6 +3985,9 @@ impl AppView {
                     .into_any_element()
             }
             MessageElement::Opaque(value) => {
+                if let Some(face) = crate::expressions::Face::from_element(element) {
+                    return self.face_image(&face);
+                }
                 let text = format!("字段 {}\n{}", value.field, hex::encode(&value.payload));
                 Button::new(SharedString::from(format!("opaque:{key}")))
                     .ghost()
@@ -2529,6 +4007,7 @@ impl AppView {
         read_only: bool,
         image_index: Option<usize>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + use<> {
+        let can_react = self.can_react(message, read_only);
         let message = message.clone();
         let owner = cx.entity().downgrade();
         let recalled = self.model.is_recalled(&message);
@@ -2574,28 +4053,90 @@ impl AppView {
             }
             let reply = message.clone();
             let recall = message.clone();
-            let text = if recalled {
-                "[已撤回]".into()
-            } else {
-                summary(&message.elements)
-            };
+            let copied = message.clone();
+            let copy_owner = owner.clone();
             let reply_owner = owner.clone();
             let recall_owner = owner.clone();
-            menu.item(
-                PopupMenuItem::new("回复")
-                    .disabled(recalled || read_only)
-                    .on_click(move |_, window, cx| {
-                        let _ = reply_owner.update(cx, |this, cx| {
-                            this.reply = Some(reply.clone());
-                            this.request_assets();
-                            this.composer
-                                .update(cx, |input, cx| input.focus(window, cx));
-                            cx.notify();
+            let menu = if can_react {
+                if let Some(entity) = owner.upgrade() {
+                    cx.observe(&entity, |_, _, cx| cx.notify()).detach();
+                }
+                let source = owner.clone();
+                let requested = owner.clone();
+                cx.defer(move |cx| {
+                    let _ = requested.update(cx, |this, cx| {
+                        for id in REACTION_CHOICES {
+                            this.request_face(&crate::expressions::Face::new(id));
+                        }
+                        cx.notify();
+                    });
+                });
+                let target = message.clone();
+                menu.min_w(px(284.)).max_w(px(284.)).item(
+                    PopupMenuItem::element(move |_, cx| {
+                        let Some(entity) = source.upgrade() else {
+                            return div().into_any_element();
+                        };
+                        let this = entity.read(cx);
+                        let own = this.model.profile.as_ref().map_or("", |p| p.uid.as_str());
+                        let choices = REACTION_CHOICES.into_iter().map(|id| {
+                                let face = crate::expressions::Face::new(id);
+                                let code = id.to_string();
+                                let selected = this.reaction_keys(&target).iter().any(|(key, state)| key.2 == code && state.actors.contains(own));
+                                let pending = matches!(target.conversation, Conversation::Group { uin } if this.pending_reactions.contains(&(uin, target.sequence, code.clone())));
+                                let source = source.clone();
+                                let target = target.clone();
+                                Button::new(SharedString::from(format!("reaction-choice:{id}")))
+                                    .debug_selector(move || format!("reaction-choice:{id}"))
+                                    .ghost()
+                                    .size(px(40.))
+                                    .rounded_xl()
+                                    .when(selected, |button| button.bg(cx.theme().accent))
+                                    .disabled(this.status == "离线" || pending)
+                                    .tooltip(format!("{}{}", if selected { "取消" } else { "" }, face.name))
+                                    .accessibility_label(face.name.clone())
+                                    .child(this.face_image(&face))
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = source.update(cx, |this, cx| this.toggle_reaction(&target, id.to_string(), cx));
+                                        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+                                    })
                         });
-                    }),
+                        div()
+                            .debug_selector(|| "reaction-panel".into())
+                            .w(px(260.))
+                            .py_2()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .bg(cx.theme().popover)
+                            .rounded_xl()
+                            .children(choices)
+                            .into_any_element()
+                    }).disabled(true),
+                ).separator()
+            } else {
+                menu
+            };
+            menu.item(
+                PopupMenuItem::element(|_, _| {
+                    div()
+                        .debug_selector(|| "message-menu-reply".into())
+                        .child("回复")
+                })
+                .disabled(recalled || read_only)
+                .on_click(move |_, window, cx| {
+                    let _ = reply_owner.update(cx, |this, cx| {
+                        this.reply = Some(reply.clone());
+                        this.request_assets();
+                        this.composer
+                            .update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    });
+                }),
             )
             .item(PopupMenuItem::new("复制").on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                let _ = copy_owner.update(cx, |this, cx| this.copy_message(copied.clone(), cx));
             }))
             .item(
                 PopupMenuItem::element(move |_, cx| {
@@ -2694,14 +4235,37 @@ impl AppView {
             .collect::<Vec<_>>();
         let collapsed = card_preview::collapsed(&sizes);
         let visible_cards = if images.len() <= 5 { images.len() } else { 3 };
+        let reaction_cells = images
+            .iter()
+            .map(|(message, _, _)| {
+                if separate_messages && self.can_react(message, read_only) {
+                    self.reaction_keys(message).len()
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        let minimum_width = if reaction_cells.iter().any(|count| *count != 0) {
+            180.
+        } else if separate_messages {
+            112.
+        } else {
+            0.
+        };
         let expanded_width = sizes
             .iter()
             .map(|size| size.width)
-            .fold(if separate_messages { 112. } else { 0. }, f32::max);
+            .fold(minimum_width, f32::max);
         let action_height = if separate_messages { ACTION_HEIGHT } else { 0. };
+        let columns = ((expanded_width + 4.) / 64.).floor().max(1.) as usize;
+        let reaction_heights = reaction_cells
+            .iter()
+            .map(|count| count.div_ceil(columns) as f32 * 32.)
+            .collect::<Vec<_>>();
         let expanded_height = sizes
             .iter()
-            .map(|size| size.height + action_height + 8.)
+            .zip(&reaction_heights)
+            .map(|(size, reactions)| size.height + action_height + reactions + 8.)
             .sum::<f32>();
         let collapsed_width = collapsed.width;
         let collapsed_height = collapsed.height;
@@ -2711,6 +4275,7 @@ impl AppView {
             .enumerate()
             .map(|(order, (message, index, reference))| {
                 let size = sizes[order];
+                let action_height = action_height + reaction_heights[order];
                 let (collapsed_x, collapsed_y) = collapsed.centers[order.min(visible_cards - 1)];
                 let collapsed_size = collapsed.sizes[order.min(visible_cards - 1)];
                 let collapsed_scale = if order < visible_cards {
@@ -2761,8 +4326,22 @@ impl AppView {
                             }),
                         )
                     });
-                let actions = (separate_messages && expanded)
-                    .then(|| self.message_actions(message, cx, read_only, true));
+                let actions = (separate_messages && expanded).then(|| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(expanded_width))
+                        .when(message.is_self, |bar| bar.items_end())
+                        .child(self.message_actions(message, cx, read_only, true))
+                        .when(reaction_heights[order] > 0., |bar| {
+                            bar.child(
+                                div()
+                                    .w(px(expanded_width))
+                                    .child(self.reaction_row(message, read_only, cx)),
+                            )
+                        })
+                        .into_any_element()
+                });
                 let hover_key = message_key(message);
                 let interactive = separate_messages && expanded;
                 let move_key = hover_key.clone();
@@ -2842,7 +4421,7 @@ impl AppView {
                             .top(px(top))
                             .w(px(rotated.width + if interactive { 16. } else { 0. }))
                             .h(px(
-                                rotated.height + if interactive { ACTION_HEIGHT + 16. } else { 0. }
+                                rotated.height + if interactive { action_height + 16. } else { 0. }
                             ))
                             .when(interactive, |card| card.p_2().m(px(-8.)))
                             .when(order >= visible_cards && progress <= 0.001, |card| {
@@ -2851,7 +4430,7 @@ impl AppView {
                             .when(order >= visible_cards, |card| card.opacity(progress))
                             .child(trigger)
                             .when_some(actions, |card, actions| {
-                                card.child(div().h(px(ACTION_HEIGHT)).child(actions))
+                                card.child(div().h(px(action_height)).child(actions))
                             })
                     },
                 )
@@ -2900,6 +4479,133 @@ impl AppView {
             })
             .into_any_element()
     }
+    fn can_react(&self, message: &Message, read_only: bool) -> bool {
+        !read_only
+            && !self.model.is_recalled(message)
+            && message.sequence != 0
+            && matches!(message.conversation, Conversation::Group { uin } if uin != 0)
+    }
+    fn reaction_keys(
+        &self,
+        message: &Message,
+    ) -> Vec<(crate::activity::ReactionKey, crate::activity::ReactionState)> {
+        let Conversation::Group { uin } = message.conversation else {
+            return vec![];
+        };
+        let mut rows = self
+            .model
+            .reactions
+            .iter()
+            .filter(|((group, sequence, _), state)| {
+                *group == uin && *sequence == message.sequence && state.count > 0
+            })
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.0.2.cmp(&b.0.2));
+        rows
+    }
+    fn toggle_reaction(&mut self, message: &Message, code: String, cx: &mut Context<Self>) {
+        if !self.can_react(message, false) || self.status == "离线" {
+            return;
+        }
+        let Conversation::Group { uin } = message.conversation else {
+            return;
+        };
+        let key = (uin, message.sequence, code.clone());
+        if self.pending_reactions.contains(&key) {
+            return;
+        }
+        let own = self
+            .model
+            .profile
+            .as_ref()
+            .map_or("", |profile| profile.uid.as_str());
+        let added = !self
+            .model
+            .reactions
+            .get(&key)
+            .is_some_and(|state| state.actors.contains(own));
+        if self.command(Command::Reaction {
+            group: uin,
+            sequence: message.sequence,
+            code,
+            added,
+        }) {
+            self.pending_reactions.insert(key);
+        }
+        cx.notify();
+    }
+    fn reaction_symbol(&self, code: &str) -> AnyElement {
+        if let Ok(id) = code.parse::<u32>() {
+            if id < 4096 {
+                return self.face_image(&crate::expressions::Face::new(id));
+            }
+            if let Some(character) = char::from_u32(id) {
+                return div()
+                    .text_sm()
+                    .child(character.to_string())
+                    .into_any_element();
+            }
+        }
+        div().text_sm().child(code.to_owned()).into_any_element()
+    }
+    fn reaction_row(
+        &self,
+        message: &Message,
+        read_only: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.can_react(message, read_only) {
+            return div().into_any_element();
+        }
+        let own = self
+            .model
+            .profile
+            .as_ref()
+            .map_or("", |profile| profile.uid.as_str());
+        let rows = self.reaction_keys(message).into_iter().map(|(key, state)| {
+            let code = key.2.clone();
+            let message = message.clone();
+            let mine = state.actors.contains(own);
+            let selector = format!("reaction:{}:{}:{}", key.0, key.1, code);
+            Button::new(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .ghost()
+                .xsmall()
+                .w(px(60.))
+                .h(px(28.))
+                .px_1()
+                .when(mine, |button| button.bg(cx.theme().accent))
+                .disabled(self.status == "离线" || self.pending_reactions.contains(&key))
+                .tooltip(format!(
+                    "{} · {}",
+                    if mine { "取消回应" } else { "回应" },
+                    state.count
+                ))
+                .accessibility_label(format!("回应 {}，{}次", code, state.count))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.reaction_symbol(&code))
+                        .child(div().text_xs().child(if state.count > 99 {
+                            "99+".into()
+                        } else {
+                            state.count.to_string()
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_reaction(&message, code.clone(), cx)
+                }))
+        });
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(rows)
+            .into_any_element()
+    }
     fn message_actions(
         &self,
         message: &Message,
@@ -2914,7 +4620,7 @@ impl AppView {
             .map(|fade| (fade.from, fade.to, fade.generation))
             .unwrap_or((0., 0., 0));
         let reply = message.clone();
-        let text = summary(&message.elements);
+        let copied = message.clone();
         let actions = div()
             .flex()
             .gap_1()
@@ -2941,13 +4647,9 @@ impl AppView {
                     .icon(gpui_kit::assets::IconName::Copy)
                     .tooltip("复制")
                     .accessibility_label("复制")
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(if recalled {
-                            "[已撤回]".into()
-                        } else {
-                            text.clone()
-                        }))
-                    }),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.copy_message(copied.clone(), cx)),
+                    ),
             )
             .with_animation(
                 SharedString::from(format!("actions:{key}:{generation}")),
@@ -3042,6 +4744,8 @@ impl AppView {
                     .text_size(window.rem_size() * 0.875)
                     .line_height(px(20.))
                     .font_family(cx.theme().font_family.clone())
+                    .min_w_0()
+                    .truncate()
                     .child("[已撤回]")
                     .into_any_element(),
             );
@@ -3064,7 +4768,7 @@ impl AppView {
             .flex_col()
             .gap_2()
             .rounded_lg()
-            .overflow_hidden()
+            .when(image_only || recalled, |body| body.overflow_hidden())
             .when(!image_only || recalled, |body| {
                 body.px_3().py_2().bg(if message.is_self {
                     cx.theme().accent
@@ -3132,9 +4836,12 @@ impl AppView {
             .gap_3()
             .items_start()
             .when(message.is_self, |row| row.flex_row_reverse())
-            .child(self.avatar(
+            .child(self.participant_avatar(
                 self.model.sender_uin(message),
+                &message.sender_uid,
                 &self.model.sender_name(message),
+                &message.conversation,
+                read_only,
                 cx,
             ))
             .child(
@@ -3144,6 +4851,7 @@ impl AppView {
                     .items_start()
                     .gap_1()
                     .max_w(rems(36.))
+                    .when(self.phone, |col| col.flex_1().min_w_0())
                     .when(message.is_self, |col| col.items_end())
                     .child(
                         div()
@@ -3179,7 +4887,10 @@ impl AppView {
                                 }
                             }))
                             .child(body)
-                            .when(!separate_messages, |col| col.child(actions)),
+                            .when(!separate_messages, |col| {
+                                col.child(self.reaction_row(message, read_only, cx))
+                                    .child(actions)
+                            }),
                     ),
             )
             .into_any_element()
@@ -3204,7 +4915,11 @@ impl AppView {
             size(viewport.size.width, viewport.size.height + overscan * 2.),
         );
         let initialized = viewport.size.height > px(0.);
-        let anchor = if !read_only && self.scroll_anchor.is_none() && initialized {
+        let anchor = if !read_only
+            && self.scroll_anchor.is_none()
+            && self.send_scroll.is_none()
+            && initialized
+        {
             self.capture_timeline_anchor().map(|mut anchor| {
                 anchor.follow_tail = (scroll.offset().y + scroll.max_offset().y).abs() < px(80.);
                 anchor
@@ -3248,7 +4963,14 @@ impl AppView {
                     div()
                         .w_full()
                         .flex_shrink_0()
-                        .child(self.message_row(messages, window, cx, read_only))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .child(self.message_row(messages, window, cx, read_only))
+                                .children(self.poke_rows(messages, read_only, cx)),
+                        )
                         .on_children_prepainted(move |bounds, _, cx| {
                             if let Some(bounds) = bounds.first() {
                                 let old = cache
@@ -3262,6 +4984,7 @@ impl AppView {
                                     cx.defer(move |cx| {
                                         let _ = owner.update(cx, |this, cx| {
                                             if this.scroll_anchor.is_none()
+                                                && this.send_scroll.is_none()
                                                 && this.reply_jump.is_none()
                                                 && this.model.selected.as_ref()
                                                     == Some(&anchor.conversation)
@@ -3325,7 +5048,7 @@ impl AppView {
         let history = self.model.history.get(&key);
         let loading = history.is_some_and(|history| history.loading);
         let error = history.and_then(|history| history.error.clone());
-        let rows = self.lazy_message_rows(
+        let mut rows = self.lazy_message_rows(
             self.model
                 .messages
                 .get(&key)
@@ -3335,6 +5058,26 @@ impl AppView {
             cx,
             false,
         );
+        if rows.is_empty()
+            && let Some(notices) = self.poke_notices.get(&key)
+        {
+            let leading = notices
+                .iter()
+                .filter(|(after, _)| after.is_none())
+                .map(|(_, text)| {
+                    div()
+                        .debug_selector(|| "poke-notice".into())
+                        .w_full()
+                        .py_2()
+                        .text_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(text.clone())
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            rows.splice(0..0, leading);
+        }
         let pending = self
             .model
             .pending
@@ -3373,20 +5116,28 @@ impl AppView {
                             .small()
                             .label("重试")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(command) = this.retries.get(&id).cloned()
-                                    && this.command(command)
-                                {
-                                    this.model
-                                        .pending
-                                        .insert(id, (retry_key.clone(), text.clone()));
-                                    this.model.failures.remove(&id);
-                                }
-                                cx.notify();
+                                this.retry_send(id, &retry_key, &text, cx);
                             })),
                     )
             })
             .collect::<Vec<_>>();
         div()
+            .id("chat-drop-target")
+            .debug_selector(|| "chat-drop-target".into())
+            .on_drag_move::<ExternalPaths>(|event, window, cx| {
+                // GPUI suppresses drop hit testing after keyboard input until mouse modality resumes.
+                if window.last_input_was_keyboard() {
+                    let event = event.event.clone();
+                    window.defer(cx, move |window, cx| {
+                        if cx.has_active_drag() {
+                            window.dispatch_event(gpui_kit::PlatformInput::MouseMove(event), cx);
+                        }
+                    });
+                }
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.receive_paths(paths.paths(), window, cx)
+            }))
             .flex()
             .flex_col()
             .flex_1()
@@ -3396,13 +5147,31 @@ impl AppView {
                 div()
                     .flex()
                     .items_center()
-                    .h_12()
-                    .px_5()
+                    .h(px(if self.phone { 52. } else { 48. }))
+                    .flex_shrink_0()
+                    .gap_2()
+                    .when(self.phone, |header| header.px_2())
+                    .when(!self.phone, |header| header.px_5())
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .when(self.phone, |header| {
+                        header.child(
+                            Button::new("back-to-chats")
+                                .debug_selector(|| "back-to-chats".into())
+                                .ghost()
+                                .size(px(44.))
+                                .icon(gpui_kit::assets::IconName::ChevronLeft)
+                                .accessibility_label("返回会话列表")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_chat_list(window, cx)
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(chat.title.clone()),
@@ -3434,7 +5203,8 @@ impl AppView {
                             .min_h_0()
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
-                            .px_5()
+                            .when(self.phone, |timeline| timeline.px_3())
+                            .when(!self.phone, |timeline| timeline.px_5())
                             .py_4()
                             .gap_5()
                             .children(rows)
@@ -3479,50 +5249,96 @@ impl AppView {
             )
             .child(
                 div()
+                    .debug_selector(|| "composer".into())
                     .flex()
                     .flex_col()
+                    .flex_shrink_0()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .p_3()
-                    .gap_2()
+                    .when(self.phone, |composer| composer.p_2().gap_1())
+                    .when(!self.phone, |composer| composer.p_3().gap_2())
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_kit::component::input::Paste, window, cx| {
+                            if this.composer.read(cx).focus_handle(cx).is_focused(window)
+                                && this.paste_draft(window, cx)
+                            {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_kit::component::input::Copy, window, cx| {
+                            if this.composer.read(cx).focus_handle(cx).is_focused(window)
+                                && this.copy_draft(false, window, cx)
+                            {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_kit::component::input::Cut, window, cx| {
+                            if this.composer.read(cx).focus_handle(cx).is_focused(window)
+                                && this.copy_draft(true, window, cx)
+                            {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
                     .child(
                         div()
                             .flex()
                             .gap_1()
+                            .child(self.expression_picker(cx))
                             .child(
                                 Button::new("image-upload")
+                                    .debug_selector(|| "image-upload".into())
                                     .ghost()
                                     .small()
-                                    .label("图片")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.attach(AttachmentKind::Image, cx)
+                                    .icon(gpui_kit::assets::IconName::Image)
+                                    .size(px(if self.phone { 44. } else { 32. }))
+                                    .tooltip("图片")
+                                    .accessibility_label("图片")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach(AttachmentKind::Image, window, cx)
                                     })),
                             )
                             .child(
                                 Button::new("file-upload")
+                                    .debug_selector(|| "file-upload".into())
                                     .ghost()
                                     .small()
-                                    .label("文件")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.attach(AttachmentKind::File, cx)
+                                    .icon(gpui_kit::assets::IconName::Paperclip)
+                                    .size(px(if self.phone { 44. } else { 32. }))
+                                    .tooltip("文件")
+                                    .accessibility_label("文件")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach(AttachmentKind::File, window, cx)
                                     })),
                             )
                             .child(
                                 Button::new("voice-upload")
+                                    .debug_selector(|| "voice-upload".into())
                                     .ghost()
                                     .small()
-                                    .label("语音")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.attach(AttachmentKind::Voice, cx)
+                                    .icon(gpui_kit::assets::IconName::Mic)
+                                    .size(px(if self.phone { 44. } else { 32. }))
+                                    .tooltip("语音")
+                                    .accessibility_label("语音")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach(AttachmentKind::Voice, window, cx)
                                     })),
                             )
                             .child(
                                 Button::new("video-upload")
+                                    .debug_selector(|| "video-upload".into())
                                     .ghost()
                                     .small()
-                                    .label("视频")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.attach(AttachmentKind::Video, cx)
+                                    .icon(gpui_kit::assets::IconName::Clapperboard)
+                                    .size(px(if self.phone { 44. } else { 32. }))
+                                    .tooltip("视频")
+                                    .accessibility_label("视频")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach(AttachmentKind::Video, window, cx)
                                     })),
                             ),
                     )
@@ -3539,7 +5355,9 @@ impl AppView {
                                     Button::new("cancel-reply")
                                         .ghost()
                                         .xsmall()
-                                        .label("取消")
+                                        .icon(gpui_kit::assets::IconName::X)
+                                        .tooltip("取消回复")
+                                        .accessibility_label("取消回复")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.reply = None;
                                             cx.notify();
@@ -3548,23 +5366,97 @@ impl AppView {
                         )
                     })
                     .child(
-                        Textarea::new(&self.composer)
-                            .appearance(false)
-                            .h_24()
-                            .bordered(false)
-                            .aria_label("消息内容"),
-                    )
-                    .child(
-                        div().flex().justify_end().child(
-                            Button::new("send")
-                                .primary()
-                                .label("发送")
-                                .disabled(
-                                    self.composer.read(cx).value().trim().is_empty()
-                                        || self.status == "离线",
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                        ),
+                        div()
+                            .flex()
+                            .w_full()
+                            .gap_2()
+                            .when(self.phone, |row| row.items_end())
+                            .when(!self.phone, |row| row.flex_col())
+                            .child(
+                                div()
+                                    .debug_selector(|| "composer-editor".into())
+                                    .min_w_0()
+                                    .when(self.phone, |editor| editor.flex_1())
+                                    .child(
+                                        Textarea::new(&self.composer)
+                                            .token({
+                                                let images = self.compose_images.clone();
+                                                let faces = self.compose_faces.clone();
+                                                let assets = self.assets.clone();
+                                                move |context, _, _| {
+                                                    if let Some(face) =
+                                                        faces.get(context.token().id().as_ref())
+                                                    {
+                                                        return face_image(face, &assets);
+                                                    }
+                                                    div()
+                                                        .debug_selector(|| "composer-image".into())
+                                                        .w(px(112.))
+                                                        .h(px(72.))
+                                                        .rounded_md()
+                                                        .overflow_hidden()
+                                                        .when_some(
+                                                            images
+                                                                .get(context.token().id().as_ref())
+                                                                .cloned(),
+                                                            |view, path| {
+                                                                view.child(
+                                                                    img(path)
+                                                                        .size_full()
+                                                                        .object_fit(
+                                                                            ObjectFit::Contain,
+                                                                        ),
+                                                                )
+                                                            },
+                                                        )
+                                                        .into_any_element()
+                                                }
+                                            })
+                                            .appearance(false)
+                                            .when(!self.phone, |input| input.h_24())
+                                            .when(
+                                                self.composer.read(cx).tokens().iter().any(
+                                                    |span| {
+                                                        self.compose_images.contains_key(
+                                                            span.token().id().as_ref(),
+                                                        )
+                                                    },
+                                                ),
+                                                |input| {
+                                                    input
+                                                        .line_height(px(80.))
+                                                        .when(!self.phone, |input| {
+                                                            input.h(px(160.))
+                                                        })
+                                                },
+                                            )
+                                            .bordered(false)
+                                            .aria_label("消息内容"),
+                                    ),
+                            )
+                            .child(
+                                div().flex().justify_end().child(
+                                    Button::new("send")
+                                        .debug_selector(|| "send-message".into())
+                                        .primary()
+                                        .accessibility_label("发送")
+                                        .when(self.phone, |button| {
+                                            button
+                                                .icon(gpui_kit::assets::IconName::ArrowUp)
+                                                .size(px(44.))
+                                        })
+                                        .when(!self.phone, |button| button.label("发送"))
+                                        .disabled(
+                                            self.composer.read(cx).value().trim().is_empty()
+                                                || self.status == "离线",
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.send(window, cx)
+                                            }),
+                                        ),
+                                ),
+                            ),
                     ),
             )
             .into_any_element()
@@ -3717,38 +5609,30 @@ impl AppView {
             &member.nickname,
             member.uin,
         );
-        let uid = member.uid.clone();
-        let uin = member.uin;
-        let display = name.clone();
+        let conversation = self
+            .model
+            .selected_chat()
+            .map(|chat| chat.conversation.clone());
         div()
             .flex()
             .items_center()
             .gap_2()
             .py_2()
-            .child(self.avatar(member.uin, &name, cx))
+            .child(match conversation {
+                Some(conversation) => self.participant_avatar(
+                    member.uin,
+                    &member.uid,
+                    &name,
+                    &conversation,
+                    false,
+                    cx,
+                ),
+                None => self.avatar(member.uin, &name, cx),
+            })
             .child(div().flex_1().min_w_0().text_sm().truncate().child(name))
-            .child(
-                Button::new(SharedString::from(format!("mention:{uin}:{uid}")))
-                    .ghost()
-                    .xsmall()
-                    .label("@")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.mentions.push(Mention {
-                            uin,
-                            uid: Some(uid.clone()),
-                            display: display.clone(),
-                            is_everyone: false,
-                        });
-                        this.composer.update(cx, |input, cx| {
-                            let text = format!("{}@{} ", input.value(), display);
-                            input.set_value(text, window, cx);
-                            input.focus(window, cx);
-                        });
-                        cx.notify();
-                    })),
-            )
             .into_any_element()
     }
+
     fn open_video(
         &mut self,
         key: String,
@@ -4169,25 +6053,7 @@ impl AppView {
                 ferrsphen::window_chrome::title_bar(cx)
                     .pl(ferrsphen::window_chrome::leading_inset(window))
                     .gap_3()
-                    .child(div().flex_1().min_w_0().text_sm().truncate().child(name))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .when(cfg!(target_os = "macos"), |bar| {
-                                bar.child(
-                                    Button::new("viewer-close")
-                                        .ghost()
-                                        .icon(gpui_kit::assets::IconName::X)
-                                        .tooltip("关闭")
-                                        .accessibility_label("关闭图片")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.close_image(window, cx)
-                                        })),
-                                )
-                            }),
-                    ),
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(name)),
             )
             .child(
                 div()
@@ -4377,6 +6243,17 @@ impl AppView {
 }
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_desktop_window(window, cx);
+        let phone = self.mobile_platform && phone_layout(window.viewport_size());
+        if self.phone != phone {
+            self.phone = phone;
+            self.transition = None;
+            self.scroll_anchor = None;
+            self.bounce = Bounce::default();
+            self.composer
+                .update(cx, |input, cx| input.set_submit_on_enter(!phone, cx));
+        }
+        self.sync_favorites_refresh(cx);
         self.advance_transition(window, cx);
         self.animate_recalls(cx);
         self.visible_bubbles.borrow_mut().clear();
@@ -4392,12 +6269,18 @@ impl Render for AppView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(if matches!(self.phase, Phase::Chat) {
-                self.topbar(window, cx)
-            } else {
-                ferrsphen::window_chrome::title_bar(cx)
-                    .child(div().flex_1())
-                    .into_any_element()
+            .when(!self.phone, |view| {
+                view.child(if matches!(self.phase, Phase::Chat) {
+                    div()
+                        .debug_selector(|| "desktop-title-bar".into())
+                        .flex_shrink_0()
+                        .child(self.topbar(window, cx))
+                        .into_any_element()
+                } else {
+                    ferrsphen::window_chrome::title_bar(cx)
+                        .child(div().flex_1())
+                        .into_any_element()
+                })
             })
             .when_some(self.error.clone(), |view, error| {
                 view.child(
@@ -4430,26 +6313,7 @@ impl Render for AppView {
             })
             .map(|view| {
                 if matches!(self.phase, Phase::Chat) {
-                    view.child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.navigation(cx))
-                            .map(|body| {
-                                if self.page == Page::Chat {
-                                    body.child(self.chat_list(cx))
-                                        .child(self.conversation_panel(window, cx))
-                                } else {
-                                    body.child(
-                                        div()
-                                            .debug_selector(|| "settings-page".into())
-                                            .flex_1()
-                                            .h_full(),
-                                    )
-                                }
-                            }),
-                    )
+                    view.child(self.main_page(window, cx))
                 } else {
                     view.child(self.login_view(cx))
                         .when(self.challenge.is_some(), |view| {
@@ -4457,7 +6321,10 @@ impl Render for AppView {
                         })
                 }
             })
-            .when(self.details.is_some(), |view| view.child(self.overlay(cx)));
+            .when(self.details.is_some(), |view| view.child(self.overlay(cx)))
+            .when(self.confirmation.is_some(), |view| {
+                view.child(self.confirmation_view(cx))
+            });
         ferrsphen::window_chrome::surface(content, window, cx)
     }
 }
@@ -4542,7 +6409,7 @@ mod ui_tests {
         media::{MediaConversation, MediaKind, MediaReference},
         messages::{Conversation, Message, MessageElement, Reply},
     };
-    use ferrsphen::backend::{Command, Update};
+    use ferrsphen::backend::{AttachmentKind, Command, ComposePart, Update};
     use ferrsphen::model::Cursor;
     use gpui::{
         AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, VisualTestContext,
@@ -4573,7 +6440,14 @@ mod ui_tests {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| AppView::new(commands, receiver, window, cx)),
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut view = AppView::new(commands, receiver, window, cx);
+                        view.mobile_platform = true;
+                        view.desktop_windows = false;
+                        view
+                    })
+                },
             )
             .unwrap()
         });
@@ -4645,6 +6519,1827 @@ mod ui_tests {
         })
         .unwrap();
     }
+    fn draft_image_file(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = root.join(name);
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([90, 130, 180, 255]))
+            .save(&path)
+            .unwrap();
+        path
+    }
+    fn drop_files(cx: &mut TestAppContext, main: AnyWindowHandle, paths: Vec<std::path::PathBuf>) {
+        draw(cx, main);
+        let position = VisualTestContext::from_window(main, cx)
+            .debug_bounds("chat-drop-target")
+            .unwrap()
+            .center();
+        cx.update_window(main, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::FileDrop(gpui::FileDropEvent::Entered {
+                    position,
+                    paths: gpui::ExternalPaths(paths.into_iter().collect()),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        draw(cx, main);
+        cx.update_window(main, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::FileDrop(gpui::FileDropEvent::Submit { position }),
+                cx,
+            );
+            window.dispatch_event(PlatformInput::FileDrop(gpui::FileDropEvent::Ended), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    fn poke_friend(uin: u64, uid: &str, nickname: &str) -> atri_qq::contacts::Friend {
+        atri_qq::contacts::Friend {
+            uin,
+            uid: uid.into(),
+            nickname: nickname.into(),
+            remark: String::new(),
+            personal_sign: String::new(),
+            qid: String::new(),
+            age: 0,
+            gender: atri_qq::contacts::Gender::Unknown(0),
+            category_id: 0,
+            category: None,
+        }
+    }
+    fn private_poke(actor: u64, target: u64) -> Update {
+        Update::Notification(atri_qq::messages::PushEvent::Poke {
+            group_uin: None,
+            actor_uin: Some(actor),
+            target_uin: Some(target),
+            parameters: [
+                ("action_str".into(), "拍了拍".into()),
+                ("suffix_str".into(), "的肩膀".into()),
+            ]
+            .into_iter()
+            .collect(),
+            raw: vec![],
+        })
+    }
+    fn reaction_push(
+        group: u64,
+        sequence: u64,
+        code: &str,
+        added: bool,
+        count: u32,
+        operator: &str,
+    ) -> crate::activity::ActivityRecord {
+        crate::activity::ActivityRecord::notification(atri_qq::messages::PushEvent::Reaction {
+            group_uin: group,
+            sequence,
+            code: code.into(),
+            added,
+            count,
+            operator_uid: operator.into(),
+        })
+    }
+    fn reaction_ack(code: &str, added: bool) -> crate::activity::ActivityRecord {
+        crate::activity::ActivityRecord::new(crate::activity::ActivityEvent::ReactionConfirmed {
+            group: 42,
+            sequence: 1,
+            code: code.into(),
+            added,
+            operator_uid: "self".into(),
+        })
+    }
+    #[gpui::test]
+    fn expanded_picture_messages_keep_individual_reaction_rows_between_images(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(picture_message(1, 32, 24), false);
+                view.model.receive(picture_message(2, 160, 100), false);
+                for code in ["76", "66", "14"] {
+                    view.apply(Update::Activity(reaction_push(
+                        42, 1, code, true, 1, "peer",
+                    )));
+                }
+                view.apply(Update::Activity(reaction_push(
+                    42, 2, "76", true, 2, "peer",
+                )));
+                view.change_stack("group:42:1:1", true, cx);
+            })
+        });
+        frames(cx, main, 70);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let first = visual.debug_bounds("stack-card:group:42:1:1:0").unwrap();
+        let second = visual.debug_bounds("stack-card:group:42:1:1:1").unwrap();
+        let first_chip = visual.debug_bounds("reaction:42:1:76").unwrap();
+        let second_chip = visual.debug_bounds("reaction:42:2:76").unwrap();
+        assert!(first_chip.top() >= first.bottom());
+        assert!(
+            first_chip.bottom() <= second.top(),
+            "{first_chip:?}, {second:?}"
+        );
+        assert!(second_chip.top() >= second.bottom());
+    }
+    #[gpui::test]
+    fn group_reaction_chips_toggle_and_do_not_double_count_receipts_and_pushes(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                view.model.receive(text_message(1), false);
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "76", true, 3, "peer",
+                )));
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let chip = visual.debug_bounds("reaction:42:1:76").unwrap();
+        visual.simulate_click(chip.center(), Default::default());
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_reaction(&text_message(1), "76".into(), cx)
+            })
+        });
+        let sends = std::iter::from_fn(|| commands.try_recv().ok()).filter(|command| matches!(command, Command::Reaction { group:42, sequence:1, code, added:true } if code == "76")).count();
+        assert_eq!(sends, 1);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "76", true, 4, "self",
+                )));
+                view.apply(Update::ReactionDone {
+                    group: 42,
+                    sequence: 1,
+                    code: "76".into(),
+                    result: Ok(reaction_ack("76", true)),
+                });
+                let state = &view.model.reactions[&(42, 1, "76".into())];
+                assert_eq!(state.count, 4);
+                assert!(state.actors.contains("self"));
+                assert!(view.pending_reactions.is_empty());
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let chip = visual.debug_bounds("reaction:42:1:76").unwrap();
+        visual.simulate_click(chip.center(), Default::default());
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(
+            |command| matches!(command, Command::Reaction { added:false, code, .. } if code == "76")
+        ));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::ReactionDone {
+                    group: 42,
+                    sequence: 1,
+                    code: "76".into(),
+                    result: Ok(reaction_ack("76", false)),
+                });
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "76", false, 3, "self",
+                )));
+                let state = &view.model.reactions[&(42, 1, "76".into())];
+                assert_eq!(state.count, 3);
+                assert!(!state.actors.contains("self"));
+                view.toggle_reaction(&text_message(1), "66".into(), cx);
+                view.apply(Update::ReactionDone {
+                    group: 42,
+                    sequence: 1,
+                    code: "66".into(),
+                    result: Err("server detail".into()),
+                });
+                assert!(!view.model.reactions.contains_key(&(42, 1, "66".into())));
+                assert!(view.pending_reactions.is_empty());
+                assert_eq!(view.error.as_deref(), Some("server detail"));
+                let mut private = text_message(2);
+                private.conversation = Conversation::Friend {
+                    uin: 200,
+                    uid: "peer".into(),
+                };
+                view.toggle_reaction(&private, "76".into(), cx);
+                assert!(!view.can_react(&private, false));
+            })
+        });
+    }
+    #[gpui::test]
+    fn phone_context_menu_reactions_use_group_api_without_a_message_button(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(390.), px(844.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.phone_conversation = true;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("react:group:42:1:1").is_none());
+        let bubble = visual.debug_bounds("message-bubble:group:42:1:1").unwrap();
+        visual.simulate_mouse_down(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("reaction-panel").is_some());
+        let choice = visual.debug_bounds("reaction-choice:66").unwrap();
+        visual.simulate_click(choice.center(), Default::default());
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::Reaction { group:42, sequence:1, code, added:true } if code == "66")));
+        assert_eq!(cx.windows().len(), 1);
+    }
+    #[gpui::test]
+    fn desktop_context_reactions_are_two_rows_and_toggle_own_selection(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                view.model.receive(text_message(1), false);
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "66", true, 1, "self",
+                )));
+                cx.notify();
+            });
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let bubble = visual.debug_bounds("message-bubble:group:42:1:1").unwrap();
+        visual.simulate_mouse_move(bubble.center(), None, Default::default());
+        frames(cx, main, 8);
+        assert!(visual.debug_bounds("react:group:42:1:1").is_none());
+        visual.simulate_mouse_down(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        frames(cx, main, 3);
+        let heart = visual.debug_bounds("reaction-choice:66").unwrap();
+        let question = visual.debug_bounds("reaction-choice:32").unwrap();
+        let laugh = visual.debug_bounds("reaction-choice:28").unwrap();
+        let victory = visual.debug_bounds("reaction-choice:79").unwrap();
+        assert_eq!(heart.origin.y, question.origin.y);
+        assert_eq!(laugh.origin.y, victory.origin.y);
+        assert!(laugh.origin.y > heart.origin.y);
+        assert_eq!(heart.origin.x, laugh.origin.x);
+        assert!(visual.debug_bounds("message-menu-reply").unwrap().origin.y > victory.origin.y);
+        visual.simulate_click(heart.center(), Default::default());
+        frames(cx, main, 3);
+        assert!(visual.debug_bounds("reaction-panel").is_none());
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::Reaction { group:42, sequence:1, code, added:false } if code == "66")));
+        assert_eq!(cx.windows().len(), 1);
+    }
+    #[gpui::test]
+    fn restored_pokes_keep_their_time_position_and_reactions_restore_without_duplicate_events(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let mut restored = ferrsphen::model::Model::default();
+        let first = text_message(1);
+        let second = text_message(2);
+        restored.receive(first.clone(), false);
+        restored.receive(second, false);
+        let mut poke =
+            crate::activity::ActivityRecord::notification(atri_qq::messages::PushEvent::Poke {
+                group_uin: Some(42),
+                actor_uin: Some(7),
+                target_uin: Some(100),
+                parameters: Default::default(),
+                raw: vec![],
+            });
+        poke.time = first.time * 1000 + 500;
+        restored.apply_activity(poke.clone());
+        let reaction = reaction_push(42, 1, "76", true, 4, "self");
+        restored.apply_activity(reaction.clone());
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                view.apply(Update::Restored(Box::new(restored)));
+                view.apply(Update::Activity(poke));
+                view.apply(Update::Activity(reaction));
+                let notices = &view.poke_notices["group:42"];
+                assert_eq!(notices.len(), 1);
+                assert_eq!(notices[0].0.as_ref(), Some(&super::message_key(&first)));
+                assert_eq!(view.model.reactions[&(42, 1, "76".into())].count, 4);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("poke-notice").is_some());
+        assert!(visual.debug_bounds("reaction:42:1:76").is_some());
+    }
+    #[gpui::test]
+    fn private_poke_pushes_display_both_directions_in_uid_only_chats(cx: &mut TestAppContext) {
+        let (main, view, updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                let mut message = text_message(1);
+                message.conversation = Conversation::Friend {
+                    uin: 0,
+                    uid: "peer".into(),
+                };
+                message.sender_uin = 0;
+                view.model.receive(message, false);
+                view.model
+                    .contacts(vec![poke_friend(200, "peer", "好友昵称")], vec![]);
+                assert!(matches!(
+                    view.model.selected_chat().unwrap().conversation,
+                    Conversation::Friend { uin: 0, .. }
+                ));
+                cx.notify();
+            })
+        });
+        updates.try_send(private_poke(100, 200)).unwrap();
+        updates.try_send(private_poke(200, 100)).unwrap();
+        cx.run_until_parked();
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let notices = &view.poke_notices["dm:uid:peer"];
+            assert_eq!(notices.len(), 2);
+            assert_eq!(notices[0].1, "你 拍了拍 好友昵称的肩膀");
+            assert_eq!(notices[1].1, "好友昵称 拍了拍 你的肩膀");
+            assert!(notices.iter().all(|(after, _)| after.is_some()));
+            assert!(view.pending_pokes.is_empty());
+        });
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("poke-notice")
+                .is_some()
+        );
+    }
+    #[gpui::test]
+    fn private_poke_waits_for_identity_and_displays_without_message_history(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                view.model.ensure(
+                    Conversation::Friend {
+                        uin: 0,
+                        uid: "peer".into(),
+                    },
+                    "好友昵称".into(),
+                );
+                cx.notify();
+            })
+        });
+        updates.try_send(private_poke(200, 100)).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).pending_pokes.len(), 1));
+        updates
+            .try_send(Update::UserUin {
+                uid: "peer".into(),
+                result: Ok(200),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.pending_pokes.is_empty());
+            let notices = &view.poke_notices["dm:uid:peer"];
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].0, None);
+            assert_eq!(notices[0].1, "好友昵称 拍了拍 你的肩膀");
+        });
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("poke-notice")
+                .is_some()
+        );
+        updates
+            .try_send(Update::Contacts {
+                friends: vec![poke_friend(200, "peer", "好友昵称")],
+                groups: vec![],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).poke_notices["dm:uid:peer"].len(), 1));
+    }
+    #[gpui::test]
+    fn message_text_can_be_drag_selected_and_copied_without_changing_the_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let text = "第一段文字 alpha beta 第二段";
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Text(text.into())];
+                view.model.receive(message, false);
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("保留草稿", window, cx);
+                    input.focus(window, cx);
+                });
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let bounds = visual.debug_bounds("message-text:group:42:1:0").unwrap();
+        let start = point(bounds.left() + px(1.), bounds.center().y);
+        let end = point(bounds.left() + bounds.size.width / 3., bounds.center().y);
+        visual.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+        frames(cx, main, 3);
+        let selected = cx
+            .update_window(main, |_, window, cx| {
+                gpui_kit::base::TextSelection::selected_text(window, cx)
+            })
+            .unwrap();
+        assert!(!selected.is_empty() && selected != text, "{selected:?}");
+        assert!(text.contains(&selected));
+        clipboard_key(cx, main, "c");
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(selected.as_str())
+            );
+            assert_eq!(view.read(cx).composer.read(cx).value().as_ref(), "保留草稿");
+        });
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_select(Conversation::Group { uin: 99 }, window, cx);
+            })
+        })
+        .unwrap();
+        cx.update_window(main, |_, window, cx| {
+            assert!(gpui_kit::base::TextSelection::selected_text(window, cx).is_empty())
+        })
+        .unwrap();
+    }
+    #[gpui::test]
+    fn phone_message_long_press_selects_text_and_handles_adjust_and_copy_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(390.), px(844.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.phone_conversation = true;
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Text("alpha beta gamma".into())];
+                view.model.receive(message, false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let bounds = visual.debug_bounds("message-text:group:42:1:0").unwrap();
+        let start = point(bounds.left() + px(10.), bounds.center().y);
+        for phase in [TouchPhase::Started, TouchPhase::Ended] {
+            visual.simulate_event(gpui::LongPressEvent {
+                phase,
+                start_position: start,
+                position: start,
+            });
+        }
+        frames(cx, main, 3);
+        let snapshot = cx
+            .update_window(main, |_, window, cx| {
+                assert_eq!(
+                    gpui_kit::base::TextSelection::selected_text(window, cx),
+                    "alpha"
+                );
+                let snapshot = gpui_kit::base::TextSelection::touch_selection(window, cx).unwrap();
+                assert!(snapshot.is_menu_open());
+                snapshot
+            })
+            .unwrap();
+        let caret = snapshot.end();
+        let handle = point(caret.left(), caret.bottom() + px(3.));
+        let destination = point(bounds.right() + px(1.), handle.y);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        visual.simulate_event(gpui::TouchDragEvent {
+            phase: TouchPhase::Started,
+            start_position: handle,
+            position: handle,
+        });
+        for phase in [TouchPhase::Moved, TouchPhase::Ended] {
+            visual.simulate_event(gpui::TouchDragEvent {
+                phase,
+                start_position: handle,
+                position: destination,
+            });
+        }
+        frames(cx, main, 3);
+        cx.update_window(main, |_, window, cx| {
+            assert_eq!(
+                gpui_kit::base::TextSelection::selected_text(window, cx),
+                "alpha beta gamma"
+            );
+            assert!(
+                gpui_kit::base::TextSelection::touch_selection(window, cx)
+                    .unwrap()
+                    .is_menu_open()
+            );
+        })
+        .unwrap();
+        clipboard_key(cx, main, "c");
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("alpha beta gamma")
+            )
+        });
+    }
+    #[gpui::test]
+    fn forwarded_message_text_keeps_literal_content_and_supports_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let text = "**literal** <tag> & text";
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Text(text.into())];
+                view.forward = Some(vec![message]);
+                view.open_detail_window(DetailKind::Forward, cx);
+            })
+        });
+        cx.run_until_parked();
+        let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
+        frames(cx, forward, 3);
+        let mut visual = VisualTestContext::from_window(forward, cx);
+        let bounds = visual.debug_bounds("message-text:group:42:1:0").unwrap();
+        let start = point(bounds.left(), bounds.center().y);
+        let end = point(bounds.right(), bounds.center().y);
+        visual.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+        frames(cx, forward, 3);
+        clipboard_key(cx, forward, "c");
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(text)
+            )
+        });
+        assert_eq!(cx.windows().len(), 2);
+        draw(cx, main);
+    }
+    #[gpui::test]
+    fn favorites_refresh_on_reopen_and_every_thirty_seconds_only_while_visible(
+        cx: &mut TestAppContext,
+    ) {
+        fn requests(commands: &mut mpsc::Receiver<Command>) -> usize {
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .filter(|command| matches!(command, Command::Favorites))
+                .count()
+        }
+        fn click(cx: &mut TestAppContext, main: AnyWindowHandle, selector: &'static str) {
+            let mut visual = VisualTestContext::from_window(main, cx);
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Default::default());
+            frames(cx, main, 3);
+        }
+        fn complete(cx: &mut TestAppContext, updates: &mpsc::Sender<Update>) {
+            updates
+                .try_send(Update::Favorites {
+                    cached: false,
+                    result: Ok(vec![]),
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        fn advance(cx: &mut TestAppContext, seconds: u64) {
+            cx.background_executor
+                .advance_clock(Duration::from_secs(seconds));
+            cx.run_until_parked();
+        }
+        let (main, view, updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        requests(&mut commands);
+        click(cx, main, "emoji-button");
+        assert_eq!(requests(&mut commands), 1);
+        complete(cx, &updates);
+        advance(cx, 31);
+        assert_eq!(requests(&mut commands), 0);
+        click(cx, main, "favorites-tab");
+        assert_eq!(requests(&mut commands), 1);
+        complete(cx, &updates);
+        advance(cx, 29);
+        assert_eq!(requests(&mut commands), 0);
+        advance(cx, 1);
+        assert_eq!(requests(&mut commands), 1);
+        advance(cx, 30);
+        assert_eq!(
+            requests(&mut commands),
+            0,
+            "an in-flight refresh must not be duplicated"
+        );
+        updates
+            .try_send(Update::Favorites {
+                cached: false,
+                result: Err("retry".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        advance(cx, 30);
+        assert_eq!(requests(&mut commands), 1);
+        complete(cx, &updates);
+        click(cx, main, "faces-tab");
+        advance(cx, 60);
+        assert_eq!(requests(&mut commands), 0);
+        click(cx, main, "emoji-button");
+        cx.update(|cx| assert!(!view.read(cx).emoji_open));
+        advance(cx, 60);
+        assert_eq!(requests(&mut commands), 0);
+        click(cx, main, "emoji-button");
+        assert_eq!(requests(&mut commands), 1, "reopening must fetch again");
+        complete(cx, &updates);
+        click(cx, main, "favorites-tab");
+        assert_eq!(requests(&mut commands), 1);
+        complete(cx, &updates);
+        click(cx, main, "emoji-button");
+        advance(cx, 60);
+        assert_eq!(requests(&mut commands), 0);
+        cx.update(|cx| assert!(view.read(cx).favorites_refresh.is_none()));
+    }
+    #[gpui::test]
+    fn desktop_login_and_connecting_share_small_window_then_open_main_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (login, view, updates, mut commands) = fixture(cx);
+        cx.simulate_window_resize(login, crate::window_chrome::AppWindowKind::Login.size());
+        cx.update_window(login, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.mobile_platform = false;
+                view.desktop_windows = true;
+                view.account
+                    .update(cx, |input, cx| input.set_value("12345", window, cx));
+                cx.notify();
+            })
+        })
+        .unwrap();
+        draw(cx, cx.windows()[0]);
+        assert_eq!(cx.windows().len(), 1);
+        updates.try_send(Update::LoginRequired).unwrap();
+        cx.run_until_parked();
+        draw(cx, cx.windows()[0]);
+        let mut visual = VisualTestContext::from_window(login, cx);
+        assert!(visual.debug_bounds("password-login").is_some());
+        assert!(visual.debug_bounds("qr-login").is_some());
+        assert!(visual.debug_bounds("switch-login").is_none());
+        updates.try_send(Update::Connecting).unwrap();
+        cx.run_until_parked();
+        draw(cx, cx.windows()[0]);
+        assert_eq!(cx.windows()[0].window_id(), login.window_id());
+        updates
+            .try_send(Update::Online(atri_qq::UserInfo {
+                uin: 12345,
+                uid: "self".into(),
+                nickname: "我".into(),
+                age: 0,
+                gender: 0,
+            }))
+            .unwrap();
+        updates.try_send(Update::Message(text_message(1))).unwrap();
+        cx.run_until_parked();
+        draw(cx, cx.windows()[0]);
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        let main = cx.windows()[0];
+        assert_ne!(main.window_id(), login.window_id());
+        draw(cx, cx.windows()[0]);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    window.viewport_size(),
+                    crate::window_chrome::AppWindowKind::Main.size()
+                );
+                assert!(!view.phone);
+                view.composer.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace("切换后发送", window, cx);
+                });
+            })
+        })
+        .unwrap();
+        cx.simulate_keystrokes(main, "enter");
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::Send { .. }))
+        );
+        updates.try_send(Update::LoginRequired).unwrap();
+        cx.run_until_parked();
+        draw(cx, cx.windows()[0]);
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        let next_login = cx.windows()[0];
+        assert_ne!(next_login.window_id(), main.window_id());
+        draw(cx, next_login);
+        cx.update_window(next_login, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    window.viewport_size(),
+                    crate::window_chrome::AppWindowKind::Login.size()
+                );
+                assert_eq!(view.account.read(cx).value().as_ref(), "12345");
+                view.password.update(cx, |input, cx| {
+                    input.set_value("password", window, cx);
+                    input.focus(window, cx);
+                });
+            })
+        })
+        .unwrap();
+        cx.simulate_keystrokes(next_login, "enter");
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::Login { uin: 12345, .. }))
+        );
+        draw(cx, next_login);
+        assert_eq!(cx.windows()[0].window_id(), next_login.window_id());
+    }
+    #[gpui::test]
+    fn desktop_never_enters_phone_layout_when_resized_below_phone_breakpoint(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.mobile_platform = false;
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        cx.simulate_window_resize(main, size(px(500.), px(450.)));
+        draw(cx, main);
+        cx.update(|cx| assert!(!view.read(cx).phone));
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("desktop-title-bar").is_some());
+        assert!(visual.debug_bounds("chat-list").is_some());
+        assert!(visual.debug_bounds("conversation-panel").is_some());
+        assert_eq!(
+            visual.debug_bounds("navigation").unwrap().size.width,
+            px(52.)
+        );
+    }
+    #[gpui::test]
+    fn expression_popup_inserts_faces_and_favorites_into_one_ordered_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        let root = tempfile::tempdir().unwrap();
+        let image = draft_image_file(root.path(), "favorite.png");
+        let extensionless = root.path().join("cached-favorite");
+        std::fs::copy(&image, &extensionless).unwrap();
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.composer
+                    .update(cx, |input, cx| input.replace("前", window, cx));
+                view.apply(Update::Favorites {
+                    cached: true,
+                    result: Ok(vec![crate::expressions::Favorite {
+                        id: "ABC".into(),
+                        url: "https://example.test/favorite".into(),
+                    }]),
+                });
+                view.assets
+                    .insert("favorite:0:ABC".into(), extensionless.clone());
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 3);
+        let initial_windows = cx.update(|cx| cx.windows().len());
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let button = visual.debug_bounds("emoji-button").unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let panel = visual
+            .debug_bounds("emoji-panel")
+            .expect("popup is in the main window");
+        assert!(panel.bottom() <= button.top() + px(1.));
+        assert_eq!(cx.update(|cx| cx.windows().len()), initial_windows);
+        let face = visual.debug_bounds("face-choice:14").unwrap();
+        visual.simulate_click(face.center(), Default::default());
+        frames(cx, main, 3);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.composer.read(cx).tokens().len(), 1);
+                assert!(!view.emoji_open);
+                assert!(view.compose_images.is_empty());
+                view.composer
+                    .update(cx, |input, cx| input.replace("中", window, cx));
+            })
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let button = visual.debug_bounds("emoji-button").unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let tab = visual.debug_bounds("favorites-tab").unwrap();
+        visual.simulate_click(tab.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let favorite = visual.debug_bounds("favorite:0:ABC").unwrap();
+        visual.simulate_click(favorite.center(), Default::default());
+        frames(cx, main, 3);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.emoji_open);
+                assert_eq!(view.composer.read(cx).tokens().len(), 2);
+                let path = view.compose_images.values().next().unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), std::fs::read(&image).unwrap());
+                view.composer
+                    .update(cx, |input, cx| input.replace("后", window, cx));
+                view.send(window, cx);
+            })
+        })
+        .unwrap();
+        let mut sent = Vec::new();
+        let mut favorites = 0;
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                Command::Compose { parts, .. } => sent.push(parts),
+                Command::Favorites => favorites += 1,
+                Command::Send { .. } => panic!("draft was split"),
+                _ => {}
+            }
+        }
+        assert_eq!(favorites, 1);
+        assert_eq!(sent.len(), 1);
+        let parts = &sent[0];
+        assert_eq!(parts.len(), 5);
+        assert!(
+            matches!(&parts[0], ComposePart::Element(element) if matches!(element.as_ref(), MessageElement::Text(text) if text == "前"))
+        );
+        assert!(
+            matches!(&parts[1], ComposePart::Element(element) if crate::expressions::Face::from_element(element).is_some_and(|face| face.id == 14))
+        );
+        assert!(
+            matches!(&parts[2], ComposePart::Element(element) if matches!(element.as_ref(), MessageElement::Text(text) if text == "中"))
+        );
+        assert!(matches!(&parts[3], ComposePart::Image(_)));
+        assert!(
+            matches!(&parts[4], ComposePart::Element(element) if matches!(element.as_ref(), MessageElement::Text(text) if text == "后"))
+        );
+    }
+    #[gpui::test]
+    fn phone_expression_popup_fits_without_creating_a_window(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(320.), px(568.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.phone_conversation = true;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let button = visual.debug_bounds("emoji-button").unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let panel = visual.debug_bounds("emoji-panel").unwrap();
+        assert!(
+            panel.left() >= px(0.) && panel.right() <= px(320.),
+            "{panel:?}"
+        );
+        assert!(
+            panel.top() >= px(0.) && panel.bottom() <= px(568.),
+            "{panel:?}"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    }
+    #[gpui::test]
+    fn avatar_menu_mentions_without_losing_images_and_sends_poke_to_clicked_user(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        let root = tempfile::tempdir().unwrap();
+        let image = draft_image_file(root.path(), "draft.png");
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.insert_image(image.clone(), window, cx);
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let avatar = visual.debug_bounds("participant-avatar:7").unwrap();
+        let press = avatar.center();
+        visual.simulate_mouse_down(press, gpui::MouseButton::Right, Default::default());
+        visual.simulate_mouse_up(press, gpui::MouseButton::Right, Default::default());
+        draw(cx, main);
+        let at = press + point(px(30.), px(17.));
+        visual.simulate_mouse_move(at, None, Default::default());
+        visual.simulate_click(at, Default::default());
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.composer.read(cx).tokens().len(), 1);
+            assert_eq!(view.mentions[0].uin, 7);
+            assert_eq!(view.mentions[0].display, "昵称");
+            assert!(view.composer.read(cx).value().contains("@昵称 "));
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let press = visual
+            .debug_bounds("participant-avatar:7")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(press, gpui::MouseButton::Right, Default::default());
+        visual.simulate_mouse_up(press, gpui::MouseButton::Right, Default::default());
+        draw(cx, main);
+        let poke = press + point(px(30.), px(45.));
+        visual.simulate_mouse_move(poke, None, Default::default());
+        visual.simulate_click(poke, Default::default());
+        let mut targets = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let Command::Poke {
+                conversation,
+                target,
+                uid,
+            } = command
+            {
+                targets.push((conversation, target, uid));
+            }
+        }
+        assert_eq!(
+            targets,
+            vec![(Conversation::Group { uin: 42 }, 7, "peer".into())]
+        );
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Notification(atri_qq::messages::PushEvent::Poke {
+                    group_uin: Some(42),
+                    actor_uin: Some(7),
+                    target_uin: Some(8),
+                    parameters: Default::default(),
+                    raw: vec![],
+                }));
+                assert_eq!(view.poke_notices["group:42"].len(), 1);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+    }
+    #[gpui::test]
+    fn phone_login_defaults_to_password_and_switches_to_qr(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(320.), px(568.)));
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Login;
+                view.account
+                    .update(cx, |input, cx| input.set_value("12345678", window, cx));
+                view.password.update(cx, |input, cx| {
+                    input.set_value("saved-password", window, cx)
+                });
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let password = visual.debug_bounds("password-login").unwrap();
+        let switch = visual.debug_bounds("switch-login").unwrap();
+        assert!(switch.top() >= password.bottom());
+        assert!(visual.debug_bounds("qr-login").is_none());
+        let root = tempfile::tempdir().unwrap();
+        let qr = draft_image_file(root.path(), "qr.png");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Qr {
+                    bytes: std::fs::read(qr).unwrap(),
+                    url: "qr-login".into(),
+                });
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("password-login").is_some());
+        assert!(visual.debug_bounds("qr-login").is_none());
+        visual.simulate_click(switch.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("password-login").is_none());
+        assert!(visual.debug_bounds("qr-login").is_some());
+        assert_eq!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .filter(|command| matches!(command, Command::Qr))
+                .count(),
+            1
+        );
+        let switch = visual.debug_bounds("switch-login").unwrap();
+        visual.simulate_click(switch.center(), Default::default());
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("password-login").is_some());
+        assert!(visual.debug_bounds("qr-login").is_none());
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.account.read(cx).value().as_ref(), "12345678");
+            assert_eq!(view.password.read(cx).value().as_ref(), "saved-password");
+        });
+        cx.simulate_window_resize(main, size(px(820.), px(1180.)));
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let qr = visual.debug_bounds("qr-login").unwrap();
+        let password = visual.debug_bounds("password-login").unwrap();
+        assert!(qr.right() <= password.left());
+        assert!(visual.debug_bounds("switch-login").is_none());
+    }
+
+    #[gpui::test]
+    fn phone_starts_at_list_and_navigates_back_without_losing_draft(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(390.), px(844.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let list = visual.debug_bounds("chat-list").unwrap();
+        let nav = visual.debug_bounds("navigation").unwrap();
+        assert_eq!(list.size.width, px(390.));
+        assert_eq!(nav.size.width, px(390.));
+        assert_eq!(nav.bottom(), px(844.));
+        assert!(nav.top() >= list.bottom() - px(1.));
+        assert!(visual.debug_bounds("conversation-panel").is_none());
+        assert!(visual.debug_bounds("desktop-title-bar").is_none());
+        assert!(visual.debug_bounds("group-sidebar").is_none());
+        let chat = visual.debug_bounds("chat:group:42").unwrap();
+        visual.simulate_click(chat.center(), Default::default());
+        frames(cx, main, 25);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("chat-list").is_none());
+        assert!(visual.debug_bounds("group-sidebar").is_none());
+        assert!(visual.debug_bounds("conversation-panel").is_some());
+        assert!(visual.debug_bounds("navigation").is_none());
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.composer
+                    .update(cx, |input, cx| input.set_value("保留草稿", window, cx));
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let back = visual.debug_bounds("back-to-chats").unwrap();
+        visual.simulate_click(back.center(), Default::default());
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Message(text_message(2)));
+                view.apply(Update::Message(text_message(2)));
+                assert_eq!(view.model.selected_chat().unwrap().unread, 1);
+                cx.notify();
+            })
+        });
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let settings = visual.debug_bounds("nav-settings").unwrap();
+        visual.simulate_click(settings.center(), Default::default());
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("settings-page").is_some());
+        assert!(visual.debug_bounds("navigation").is_some());
+        let chat_nav = visual.debug_bounds("nav-chat").unwrap();
+        visual.simulate_click(chat_nav.center(), Default::default());
+        draw(cx, main);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let chat = visual.debug_bounds("chat:group:42").unwrap();
+        visual.simulate_click(chat.center(), Default::default());
+        frames(cx, main, 25);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.composer.read(cx).value().as_ref(), "保留草稿");
+            assert_eq!(view.model.selected_chat().unwrap().unread, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn phone_composer_grows_with_wrapped_lines_and_avoids_keyboard(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(390.), px(844.)));
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.phone_conversation = true;
+                view.composer
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 4);
+        let initial = VisualTestContext::from_window(main, cx)
+            .debug_bounds("composer-editor")
+            .unwrap();
+        assert!(
+            initial.size.height <= px(48.),
+            "single-line composer: {:?}",
+            initial.size
+        );
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("中文自动换行".repeat(15), window, cx)
+                });
+                cx.notify();
+            })
+        })
+        .unwrap();
+        frames(cx, main, 4);
+        let grown = VisualTestContext::from_window(main, cx)
+            .debug_bounds("composer-editor")
+            .unwrap();
+        assert!(grown.size.height > initial.size.height);
+        assert!(grown.size.height <= px(180.));
+        cx.simulate_keystrokes(main, "enter");
+        cx.update(|cx| assert!(view.read(cx).composer.read(cx).value().contains('\n')));
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::Send { .. }))
+        );
+        cx.simulate_window_visual_viewport_change(
+            main,
+            Bounds::new(point(px(0.), px(44.)), size(px(390.), px(500.))),
+        );
+        frames(cx, main, 4);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let safe = visual.debug_bounds("safe-content").unwrap();
+        let editor = visual.debug_bounds("composer-editor").unwrap();
+        assert_eq!(safe.top(), px(44.));
+        assert!(safe.bottom() <= px(544.));
+        assert!(editor.bottom() <= safe.bottom());
+        assert!(
+            visual
+                .debug_bounds("conversation-panel")
+                .unwrap()
+                .size
+                .height
+                > px(200.)
+        );
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| view.send(window, cx))
+        })
+        .unwrap();
+        frames(cx, main, 4);
+        let empty = VisualTestContext::from_window(main, cx)
+            .debug_bounds("composer-editor")
+            .unwrap();
+        assert_eq!(empty.size.height, initial.size.height);
+    }
+
+    #[gpui::test]
+    fn tablet_keeps_desktop_columns_and_phone_landscape_keeps_phone_routes(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.simulate_window_resize(main, size(px(820.), px(1180.)));
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 4);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let nav = visual.debug_bounds("navigation").unwrap();
+        assert_eq!(nav.size.width, px(52.));
+        assert!(visual.debug_bounds("desktop-title-bar").is_some());
+        assert!(visual.debug_bounds("chat-list").is_some());
+        assert!(visual.debug_bounds("conversation-panel").is_some());
+        assert!(visual.debug_bounds("group-sidebar").is_some());
+        cx.simulate_window_resize(main, size(px(844.), px(390.)));
+        frames(cx, main, 4);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("desktop-title-bar").is_none());
+        assert!(visual.debug_bounds("group-sidebar").is_none());
+        assert!(visual.debug_bounds("conversation-panel").is_none());
+        assert_eq!(
+            visual.debug_bounds("navigation").unwrap().size.width,
+            px(844.)
+        );
+        assert!(visual.debug_bounds("chat-list").is_some());
+    }
+
+    #[gpui::test]
+    fn send_scroll_tweens_from_old_history_and_tracks_lazy_layout(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                for sequence in 1..=1000 {
+                    view.model.receive(text_message(sequence), false);
+                }
+                cx.notify();
+            })
+        });
+        frames(cx, main, 8);
+        cx.update(|cx| view.read(cx).scroll.scroll_to_top_of_item(0));
+        frames(cx, main, 8);
+        let before = cx.update(|cx| view.read(cx).scroll.offset().y);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.jump_to_reply(
+                    Conversation::Group { uin: 42 },
+                    Reply::with_preview(&text_message(10)).unwrap(),
+                    false,
+                    cx,
+                );
+                view.scroll_anchor = view.capture_timeline_anchor();
+                view.composer
+                    .update(cx, |input, cx| input.set_value("新的消息", window, cx));
+                view.send(window, cx);
+                assert!(view.reply_jump.is_none());
+                assert!(view.scroll_anchor.is_none());
+                assert!(view.send_scroll.is_some());
+                assert_eq!(
+                    view.scroll.offset().y,
+                    before,
+                    "send must not jump instantly"
+                );
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.scroll.offset().y < before);
+            assert!(view.scroll.offset().y > -view.scroll.max_offset().y + px(1.));
+        });
+        let (id, nonce) = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, nonce, .. } => Some((id, nonce)),
+                _ => None,
+            })
+            .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                let mut receipt = text_message(1001);
+                receipt.is_self = true;
+                receipt.random = nonce;
+                receipt.elements = vec![MessageElement::Text("服务器回执".repeat(60))];
+                view.apply(Update::Sent {
+                    id,
+                    result: Ok(receipt),
+                });
+                cx.notify();
+            });
+        });
+        frames(cx, main, 160);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.send_scroll.is_none());
+            assert!(!view.send_scroll_animating);
+            assert!((view.scroll.offset().y + view.scroll.max_offset().y).abs() < px(1.));
+        });
+    }
+
+    #[gpui::test]
+    fn attachments_and_retries_scroll_without_mouse_or_frame_callbacks(cx: &mut TestAppContext) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                for sequence in 1..=80 {
+                    view.model.receive(text_message(sequence), false);
+                }
+                cx.notify();
+            })
+        });
+        frames(cx, main, 8);
+        for kind in [
+            AttachmentKind::File,
+            AttachmentKind::Voice,
+            AttachmentKind::Video,
+        ] {
+            cx.update(|cx| view.read(cx).scroll.scroll_to_top_of_item(0));
+            frames(cx, main, 8);
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.jump_to_reply(
+                        Conversation::Group { uin: 42 },
+                        Reply::with_preview(&text_message(1)).unwrap(),
+                        false,
+                        cx,
+                    );
+                    view.submit_attachment(
+                        Conversation::Group { uin: 42 },
+                        "/tmp/attachment".into(),
+                        kind,
+                        cx,
+                    );
+                    assert!(view.reply_jump.is_none());
+                    assert!(view.send_scroll.is_some());
+                });
+            });
+            cx.run_until_parked();
+            for tick in 0..35 {
+                cx.background_executor
+                    .advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                if tick == 3 {
+                    cx.update(|cx| assert!(view.read(cx).scroll.offset().y < px(-1.)));
+                }
+            }
+            frames(cx, main, 50);
+            cx.update(|cx| {
+                let view = view.read(cx);
+                assert!((view.scroll.offset().y + view.scroll.max_offset().y).abs() < px(1.));
+            });
+        }
+        let id = std::iter::from_fn(|| commands.try_recv().ok())
+            .find_map(|command| {
+                if let Command::Attachment { id, .. } = command {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        cx.update(|cx| view.read(cx).scroll.scroll_to_top_of_item(0));
+        frames(cx, main, 8);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Sent {
+                    id,
+                    result: Err("发送失败".into()),
+                });
+                view.retry_send(id, "group:42", "attachment", cx);
+                assert!(view.send_scroll.is_some());
+                assert!(!view.model.failures.contains_key(&id));
+            });
+        });
+        frames(cx, main, 100);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!((view.scroll.offset().y + view.scroll.max_offset().y).abs() < px(1.));
+        });
+    }
+
+    #[gpui::test]
+    fn external_picture_drop_inserts_inline_and_sends_one_ordered_message(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let path = draft_image_file(root.path(), "image.png");
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("前后", window, cx);
+                    input.set_selected_range(3..3, cx);
+                });
+                cx.notify();
+            })
+        })
+        .unwrap();
+        drop_files(cx, main, vec![path.clone()]);
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let input = view.composer.read(cx);
+            assert_eq!(input.value().as_ref(), "前\u{fffc}后");
+            assert_eq!(input.tokens().len(), 1);
+            assert!(input.line_height().unwrap() >= px(72.));
+        });
+        let bounds = VisualTestContext::from_window(main, cx)
+            .debug_bounds("composer-image")
+            .unwrap();
+        assert_eq!(bounds.size.height, px(72.));
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::Compose { .. } | Command::Attachment { .. } | Command::Send { .. }
+            ))
+        );
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| view.send(window, cx))
+        })
+        .unwrap();
+        let outgoing = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(|command| {
+                matches!(
+                    command,
+                    Command::Compose { .. } | Command::Attachment { .. } | Command::Send { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outgoing.len(), 1);
+        let Command::Compose { parts, .. } = &outgoing[0] else {
+            panic!("mixed message was not composed");
+        };
+        assert!(
+            matches!(parts.as_slice(),[ComposePart::Element(before),ComposePart::Image(image),ComposePart::Element(after)] if matches!(before.as_ref(),MessageElement::Text(text) if text=="前") && image == &path && matches!(after.as_ref(),MessageElement::Text(text) if text=="后"))
+        );
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let message = view.model.messages["group:42"].last().unwrap();
+            assert!(matches!(
+                message.elements.as_slice(),
+                [
+                    MessageElement::Text(_),
+                    MessageElement::Image(_),
+                    MessageElement::Text(_)
+                ]
+            ));
+            assert_eq!(view.assets.get(&super::image_key(message, 1)), Some(&path));
+            assert!(view.composer.read(cx).tokens().is_empty());
+        });
+    }
+    #[gpui::test]
+    fn image_picker_keeps_multiple_inline_images_editable_and_restores_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = vec![
+            draft_image_file(root.path(), "one.png"),
+            draft_image_file(root.path(), "two.png"),
+        ];
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.attach(AttachmentKind::Image, window, cx);
+            })
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.multiple);
+            Some(paths.clone())
+        });
+        cx.run_until_parked();
+        frames(cx, main, 2);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.composer.read(cx).tokens().len(), 2);
+                view.composer
+                    .update(cx, |input, cx| input.replace("末尾", window, cx));
+                view.commit_select(Conversation::Group { uin: 99 }, window, cx);
+                assert!(view.composer.read(cx).tokens().is_empty());
+                view.commit_select(Conversation::Group { uin: 42 }, window, cx);
+                assert_eq!(view.composer.read(cx).tokens().len(), 2);
+                assert!(view.composer.read(cx).value().ends_with("末尾"));
+            })
+        })
+        .unwrap();
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::Compose { .. } | Command::Attachment { .. } | Command::Send { .. }
+            ))
+        );
+        cx.simulate_keystrokes(main, "home delete");
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(view.read(cx).composer.read(cx).tokens().len(), 1));
+    }
+    #[gpui::test]
+    fn dropped_file_and_voice_require_confirmation_and_leave_image_draft_intact(
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let picture = draft_image_file(root.path(), "image.png");
+        let file = root.path().join("document.txt");
+        std::fs::write(&file, b"file").unwrap();
+        let voice = root.path().join("voice.silk");
+        std::fs::write(&voice, b"voice").unwrap();
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        drop_files(cx, main, vec![picture, file.clone(), voice.clone()]);
+        draw(cx, main);
+        assert!(
+            VisualTestContext::from_window(main, cx)
+                .debug_bounds("attachment-confirmation")
+                .is_some()
+        );
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::Attachment { .. } | Command::Compose { .. }
+            ))
+        );
+        cx.simulate_keystrokes(main, "escape");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.confirmation.is_none());
+            assert_eq!(view.composer.read(cx).tokens().len(), 1);
+        });
+        drop_files(cx, main, vec![file.clone(), voice.clone()]);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(
+                    view.confirmation.is_some(),
+                    "missing confirmation after second drop; status: {}",
+                    view.status
+                );
+                view.confirm_attachments(window, cx)
+            })
+        })
+        .unwrap();
+        let outgoing = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(|command| {
+                matches!(
+                    command,
+                    Command::Attachment { .. } | Command::Compose { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outgoing.len(), 2);
+        assert!(
+            matches!(&outgoing[0],Command::Attachment {path,kind:AttachmentKind::File,..} if path==&file)
+        );
+        assert!(
+            matches!(&outgoing[1],Command::Attachment {path,kind:AttachmentKind::Voice,..} if path==&voice)
+        );
+        cx.update(|cx| assert_eq!(view.read(cx).composer.read(cx).tokens().len(), 1));
+    }
+
+    fn clipboard_key(cx: &mut TestAppContext, window: AnyWindowHandle, letter: &str) {
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window, &format!("{modifier}-{letter}"));
+        cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn native_clipboard_image_pastes_inline_without_sending(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let source = draft_image_file(root.path(), "clipboard.png");
+        let bytes = std::fs::read(source).unwrap();
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.composer
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    bytes.clone(),
+                )));
+                cx.notify();
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        clipboard_key(cx, main, "v");
+        frames(cx, main, 2);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let input = view.composer.read(cx);
+            assert_eq!(input.tokens().len(), 1);
+            let path = &view.compose_images[input.tokens()[0].token().id().as_ref()];
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        });
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::Compose { .. } | Command::Send { .. } | Command::Attachment { .. }
+            ))
+        );
+    }
+    #[gpui::test]
+    fn mixed_draft_copy_cut_and_paste_preserve_text_and_picture_order(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let source = draft_image_file(root.path(), "clipboard.png");
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("前后", window, cx);
+                    input.set_selected_range(3..3, cx);
+                });
+                view.insert_image(source, window, cx);
+            })
+        })
+        .unwrap();
+        draw(cx, main);
+        clipboard_key(cx, main, "a");
+        clipboard_key(cx, main, "c");
+        cx.update(|cx| {
+            let item = cx.read_from_clipboard().unwrap();
+            assert_eq!(item.text().as_deref(), Some("前[图片]后"));
+            assert!(
+                ferrsphen::rich_clipboard::rich_parts(&item)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+        clipboard_key(cx, main, "x");
+        cx.update(|cx| assert!(view.read(cx).composer.read(cx).value().is_empty()));
+        clipboard_key(cx, main, "v");
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let input = view.composer.read(cx);
+            assert_eq!(input.value().as_ref(), "前\u{fffc}后");
+            assert_eq!(input.tokens().len(), 1);
+            assert_eq!(input.tokens()[0].range(), 3..6);
+        });
+    }
+    #[gpui::test]
+    fn message_copy_fetches_missing_images_without_opening_a_viewer(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let source = draft_image_file(root.path(), "clipboard.png");
+        let (main, view, updates, mut commands) = fixture(cx);
+        let mut message = picture_message(1, 32, 24);
+        message
+            .elements
+            .insert(0, MessageElement::Text("前".into()));
+        message.elements.push(MessageElement::Text("后".into()));
+        let key = super::image_key(&message, 1);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(message.clone(), false);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("old".into()));
+                view.copy_message(message.clone(), cx);
+            })
+        });
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(
+            |command| matches!(command,Command::ViewImage {key:ref candidate,..} if candidate==&key)
+        ));
+        updates
+            .try_send(Update::Image {
+                key: key.clone(),
+                result: Ok(source.clone()),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).viewer_window.is_none());
+            let item = cx.read_from_clipboard().unwrap();
+            assert_eq!(item.text().as_deref(), Some("前[图片]后"));
+            let parts = ferrsphen::rich_clipboard::rich_parts(&item)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                parts.as_slice(),
+                [
+                    ferrsphen::rich_clipboard::Part::Text { .. },
+                    ferrsphen::rich_clipboard::Part::Image { .. },
+                    ferrsphen::rich_clipboard::Part::Text { .. }
+                ]
+            ));
+        });
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.assets.remove(&key);
+                view.copy_message(message, cx);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("new selection".into()));
+            })
+        });
+        updates
+            .try_send(Update::Image {
+                key,
+                result: Ok(source),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("new selection")
+            )
+        });
+        let _ = main;
+    }
+    #[gpui::test]
+    fn file_and_voice_pickers_wait_for_the_confirmation_button(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        for (kind, name) in [
+            (AttachmentKind::File, "file.txt"),
+            (AttachmentKind::Voice, "voice.silk"),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, b"data").unwrap();
+            cx.update_window(main, |_, window, cx| {
+                view.update(cx, |view, cx| view.attach(kind, window, cx))
+            })
+            .unwrap();
+            cx.simulate_path_prompt_response(|_| Some(vec![path.clone()]));
+            cx.run_until_parked();
+            draw(cx, main);
+            assert!(
+                !std::iter::from_fn(|| commands.try_recv().ok())
+                    .any(|command| matches!(command, Command::Attachment { .. }))
+            );
+            let mut visual = VisualTestContext::from_window(main, cx);
+            let button = visual.debug_bounds("attachment-confirm-button").unwrap();
+            visual.simulate_click(button.center(), Default::default());
+            cx.run_until_parked();
+            let outgoing = std::iter::from_fn(|| commands.try_recv().ok())
+                .filter(|command| matches!(command, Command::Attachment { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(outgoing.len(), 1);
+            assert!(
+                matches!(&outgoing[0],Command::Attachment {path:sent,kind:sent_kind,..} if sent==&path && sent_kind==&kind)
+            );
+            cx.update(|cx| assert!(view.read(cx).confirmation.is_none()));
+        }
+    }
+
     #[gpui::test]
     fn fullscreen_shortcut_reaches_main_and_detail_windows(cx: &mut TestAppContext) {
         let (main, view, _updates, _commands) = fixture(cx);
@@ -5216,7 +8911,7 @@ mod ui_tests {
         visual.simulate_mouse_down(press, gpui::MouseButton::Right, Default::default());
         visual.simulate_mouse_up(press, gpui::MouseButton::Right, Default::default());
         draw(cx, main);
-        let item = press + point(px(30.), px(17.));
+        let item = visual.debug_bounds("message-menu-reply").unwrap().center();
         visual.simulate_mouse_move(item, None, Default::default());
         visual.simulate_click(item, Default::default());
         cx.update(|cx| assert_eq!(view.read(cx).reply.as_ref().unwrap().sequence, 1));
@@ -5271,12 +8966,17 @@ mod ui_tests {
         cx: &mut TestAppContext,
     ) {
         let (main, view, _updates, _commands) = fixture(cx);
+        let root = tempfile::tempdir().unwrap();
+        let image = draft_image_file(root.path(), "copy.png");
+        let expected = std::fs::read(&image).unwrap();
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 view.phase = Phase::Chat;
                 for sequence in 1..=2 {
                     let mut message = picture_message(sequence, 32, 24);
                     message.is_self = true;
+                    view.assets
+                        .insert(super::image_key(&message, 0), image.clone());
                     view.model.receive(message, false);
                 }
                 view.change_stack("group:42:self:1", true, cx);
@@ -5308,12 +9008,11 @@ mod ui_tests {
         );
         visual.simulate_click(actions.origin + point(px(34.), px(10.)), Default::default());
         cx.update(|cx| {
-            assert_eq!(
-                cx.read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .as_deref(),
-                Some("[图片]")
-            )
+            let item = cx.read_from_clipboard().unwrap();
+            let [gpui::ClipboardEntry::Image(image)] = item.entries() else {
+                panic!("expected native image clipboard");
+            };
+            assert_eq!(image.bytes, expected);
         });
     }
     #[gpui::test]
@@ -5480,6 +9179,7 @@ mod ui_tests {
                 video.width = 320;
                 video.height = 180;
                 video.duration = 90;
+                message.recipient_uin = 100;
                 message.elements = vec![MessageElement::Video(video)];
                 view.model.receive(message, false);
                 view.request_assets();
@@ -5489,7 +9189,8 @@ mod ui_tests {
         });
         let previews = std::iter::from_fn(|| commands.try_recv().ok())
             .filter_map(|command| {
-                if let Command::VideoPreview { key, .. } = command {
+                if let Command::VideoPreview { key, reference } = command {
+                    assert_eq!(reference.duration, 90);
                     Some(key)
                 } else {
                     None
@@ -5503,7 +9204,7 @@ mod ui_tests {
         visual.simulate_click(preview.origin + point(px(12.), px(12.)), Default::default());
         cx.run_until_parked();
         assert!(
-            matches!(commands.try_recv().unwrap(), Command::ViewVideo { key, .. } if key == "video:group:42:1:0")
+            matches!(commands.try_recv().unwrap(), Command::ViewVideo { key, reference } if key == "video:group:42:1:0" && reference.duration == 90)
         );
         cx.update(|cx| assert_eq!(cx.windows().len(), 2));
     }
@@ -5613,7 +9314,24 @@ mod ui_tests {
         cx.run_until_parked();
         assert_eq!(cx.windows().len(), 2);
         draw(cx, image);
-        cx.update_window(image, |_, window, cx| {
+        cx.update_window(image, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        cx.update_window(main, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let reference =
+                    MediaReference::new(MediaKind::Image, MediaConversation::Group { uin: 42 });
+                view.open_image("image".into(), reference, window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let reopened = cx.update(|cx| view.read(cx).viewer_window.unwrap());
+        assert_ne!(image.window_id(), reopened.window_id());
+        assert_eq!(cx.windows().len(), 2);
+        draw(cx, reopened);
+        cx.update_window(reopened, |_, window, cx| {
             view.update(cx, |view, cx| view.close_image(window, cx));
         })
         .unwrap();
@@ -5903,4 +9621,27 @@ mod ui_tests {
         assert!((actual.size.width - target.width).abs() < px(1.));
         assert!((actual.size.height - target.height).abs() < px(1.));
     }
+}
+
+fn phone_layout(viewport: gpui_kit::Size<Pixels>) -> bool {
+    viewport.width.min(viewport.height) < px(600.)
+}
+
+fn face_image(face: &crate::expressions::Face, assets: &HashMap<String, PathBuf>) -> AnyElement {
+    let path = assets.get(&format!("face:{}", face.id));
+    div()
+        .min_w(px(24.))
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(if let Some(path) = path {
+            img(path.clone())
+                .size(px(24.))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element()
+        } else {
+            div().text_sm().child(face.text()).into_any_element()
+        })
+        .into_any_element()
 }

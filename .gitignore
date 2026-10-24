@@ -2,3 +2,4 @@
 /run
 .DS_Store
 /data
+Cargo.lock
