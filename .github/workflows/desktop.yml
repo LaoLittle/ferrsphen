@@ -1,0 +1,168 @@
+name: Desktop packages
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
+  ATRI_QQ_REVISION: 879971778d1c95bd27c1a4b0ccca9aa9a604dc36
+
+jobs:
+  desktop:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    defaults:
+      run:
+        shell: bash
+        working-directory: ferrsphen
+    steps:
+      - name: Check out ferrsphen
+        uses: actions/checkout@v7
+        with:
+          path: ferrsphen
+          persist-credentials: false
+      - name: Check out protocol library
+        uses: actions/checkout@v7
+        with:
+          repository: LaoLittle/atri_qq
+          ref: ${{ env.ATRI_QQ_REVISION }}
+          path: atri_qq
+          token: ${{ secrets.DEPENDENCY_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Update Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add '${{ matrix.target }}'
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ferrsphen/target
+          key: desktop-${{ matrix.target }}-${{ hashFiles('ferrsphen/Cargo.lock', 'ferrsphen/Cargo.toml', 'ferrsphen/.github/workflows/desktop.yml') }}-${{ env.ATRI_QQ_REVISION }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: bash ci/install-linux-deps.sh
+      - name: Install macOS assembler
+        if: runner.os == 'macOS'
+        run: command -v nasm >/dev/null || brew install nasm
+      - name: Install Windows assembler
+        if: runner.os == 'Windows' && startsWith(matrix.target, 'x86_64')
+        run: |
+          choco install nasm --yes --no-progress
+          echo 'C:/Program Files/NASM' >> "$GITHUB_PATH"
+      - name: Use static MSVC runtime
+        if: runner.os == 'Windows'
+        run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
+      - name: Check packaging and locale catalogs
+        run: python -m unittest discover -s ci -p 'test_*.py'
+      - name: Build
+        run: cargo build --locked --profile app-release --bin ferrsphen --target '${{ matrix.target }}'
+      - name: Package and verify architecture
+        run: python ci/package-desktop.py --target '${{ matrix.target }}' --dependency-revision "$ATRI_QQ_REVISION"
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrsphen-${{ matrix.target }}
+          path: ferrsphen/dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  riscv64:
+    name: riscv64gc-unknown-linux-gnu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Check out ferrsphen
+        uses: actions/checkout@v7
+        with:
+          path: ferrsphen
+          persist-credentials: false
+      - name: Check out protocol library
+        uses: actions/checkout@v7
+        with:
+          repository: LaoLittle/atri_qq
+          ref: ${{ env.ATRI_QQ_REVISION }}
+          path: atri_qq
+          token: ${{ secrets.DEPENDENCY_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            .cargo-riscv64/registry
+            .cargo-riscv64/git
+            ferrsphen/target
+          key: desktop-riscv64-${{ hashFiles('ferrsphen/Cargo.lock', 'ferrsphen/ci/riscv64.Dockerfile', 'ferrsphen/ci/rustc-riscv64.sh') }}-${{ env.ATRI_QQ_REVISION }}
+      - name: Build cross compiler
+        run: docker build -t ferrsphen-riscv64 -f ferrsphen/ci/riscv64.Dockerfile ferrsphen/ci
+      - name: Build app-release
+        run: docker run --rm -v "$PWD:/workspace" -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
+      - name: Package and verify architecture
+        run: python3 ferrsphen/ci/package-desktop.py --target riscv64gc-unknown-linux-gnu --dependency-revision "$ATRI_QQ_REVISION"
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrsphen-riscv64gc-unknown-linux-gnu
+          path: ferrsphen/dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish tagged packages
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [desktop, riscv64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ferrsphen-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --verify-tag --generate-notes
+          gh release upload "$RELEASE_TAG" dist/* --clobber

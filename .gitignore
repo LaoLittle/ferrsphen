@@ -1,5 +1,10 @@
-/target
-/run
+target/
+run/
 .DS_Store
-/data
+data/
 Cargo.lock
+mobile/
+tests/
+scripts/
+dist/
+__pycache__/

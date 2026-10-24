@@ -437,7 +437,7 @@ fn forward_card_preview_does_not_depend_on_count() {
     );
     assert_eq!(
         ferrsphen::model::summary(&[MessageElement::Forward(reference)]),
-        "[聊天记录]"
+        "[Chat History]"
     );
 }
 

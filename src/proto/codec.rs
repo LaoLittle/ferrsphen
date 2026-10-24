@@ -1,4 +1,6 @@
-use super::{Empty, Entry, IntegerByteSequence, Map, Record, Sequence, Value, value::Kind};
+use super::storage::{
+    Empty, Entry, IntegerByteSequence, Map, Record, Sequence, Value, value::Kind,
+};
 use anyhow::{Context, Result, bail, ensure};
 use prost::Message as _;
 use serde::{Serialize, de::DeserializeOwned};
@@ -19,7 +21,18 @@ fn encode_data(value: Data) -> Result<Vec<u8>> {
     let record = Record {
         schema_version: VERSION,
         value: Some(to_proto(value, 0)?),
+        session: None,
     };
+    encode_record(record)
+}
+pub(crate) fn encode_session(session: &crate::storage::Session) -> Result<Vec<u8>> {
+    encode_record(Record {
+        schema_version: VERSION,
+        value: None,
+        session: Some(session.into()),
+    })
+}
+fn encode_record(record: Record) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(MAGIC.len() + record.encoded_len());
     output.extend_from_slice(MAGIC);
     record.encode(&mut output)?;
@@ -33,7 +46,13 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
             "不支持的数据库版本：{}",
             record.schema_version
         );
-        let data = from_proto(record.value.context("数据库记录缺少值")?, 0)?;
+        let data = match (record.value, record.session) {
+            (Some(value), None) => from_proto(value, 0)?,
+            (None, Some(session)) => {
+                serde_value::to_value(crate::storage::Session::try_from(session)?)?
+            }
+            _ => bail!("Invalid database record payload"),
+        };
         T::deserialize(serde_value::ValueDeserializer::<
             serde_value::DeserializerError,
         >::new(data))
@@ -197,7 +216,7 @@ fn from_proto(value: Value, depth: usize) -> Result<Data> {
 #[cfg(test)]
 mod tests {
     use super::{MAGIC, MAX_DEPTH, decode, encode, is_protobuf};
-    use crate::proto::{Record, Value, value::Kind};
+    use crate::proto::storage::{Record, Value, value::Kind};
     use prost::Message as _;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
@@ -261,23 +280,47 @@ mod tests {
         assert_eq!(decode::<serde_value::Value>(&bytes).unwrap(), wide);
     }
     #[test]
+    fn keystore_has_a_typed_protobuf_payload_and_rejects_invalid_integer_widths() {
+        let session = crate::storage::Session {
+            keystore: atri_qq::Keystore {
+                uin: 123,
+                o3_xwid_switch: Some(0),
+                ..Default::default()
+            },
+            machine_id: "machine".into(),
+            qua: "profile".into(),
+        };
+        let encoded = super::encode_session(&session).unwrap();
+        let mut record = Record::decode(&encoded[MAGIC.len()..]).unwrap();
+        assert!(record.value.is_none());
+        let wire = record.session.as_mut().unwrap();
+        assert_eq!(wire.keystore.as_ref().unwrap().o3_xwid_switch, Some(0));
+        wire.keystore.as_mut().unwrap().age = 256;
+        let invalid = super::encode_record(record).unwrap();
+        assert!(super::decode::<crate::storage::Session>(&invalid).is_err());
+    }
+    #[test]
     fn corrupt_or_future_protobuf_is_not_reinterpreted_as_legacy_cbor() {
         for record in [
             Record {
+                session: None,
                 schema_version: 2,
                 value: Some(Value {
                     kind: Some(Kind::U64(1)),
                 }),
             },
             Record {
+                session: None,
                 schema_version: 1,
                 value: None,
             },
             Record {
+                session: None,
                 schema_version: 1,
                 value: Some(Value { kind: None }),
             },
             Record {
+                session: None,
                 schema_version: 1,
                 value: Some(Value {
                     kind: Some(Kind::U8(256)),

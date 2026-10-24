@@ -37,10 +37,30 @@ impl Database {
             .map(|bytes| crate::proto::decode(bytes.as_slice()))
             .transpose()
     }
+    pub async fn save_session(&self, session: &Session) -> Result<()> {
+        let bytes = crate::proto::encode_session(session)?;
+        let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        use std::io::Write as _;
+        file.write_all(&crate::proto::encode_keystore_file(session))?;
+        file.as_file().sync_all()?;
+        file.persist(self.root.join("keystore.bin"))?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)?.sync_all()?;
+        self.put_bytes("session/active", &bytes).await
+    }
     pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let bytes = crate::proto::encode(value)?;
+        self.put_bytes(key, &bytes).await
+    }
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let mut tx = self.tree.begin()?;
-        tx.set(key.as_bytes(), &bytes)?;
+        tx.set(key.as_bytes(), bytes)?;
         tx.set_durability(Durability::Immediate);
         tx.commit().await?;
         Ok(())
@@ -278,6 +298,18 @@ impl Database {
         Ok(model)
     }
     pub fn session(&self) -> Result<Option<Session>> {
+        let keyfile = self.root.join("keystore.bin");
+        match std::fs::read(&keyfile) {
+            Ok(bytes) => {
+                return crate::proto::decode_keystore_file(&bytes)
+                    .with_context(|| format!("读取 {} 失败", keyfile.display()))
+                    .map(Some);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("读取 {} 失败", keyfile.display()));
+            }
+        }
         if let Some(session) = self.get("session/active")? {
             return Ok(Some(session));
         }
@@ -350,6 +382,119 @@ mod migration_tests {
         let mut tx = db.tree.begin().unwrap();
         tx.set(key.as_bytes(), &bytes).unwrap();
         tx.commit().await.unwrap();
+    }
+    #[tokio::test]
+    async fn typed_session_preserves_tickets_device_identity_and_optional_o3_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open(root.path()).unwrap();
+        let session = Session {
+            keystore: Keystore {
+                uin: u64::MAX,
+                uid: "account-uid".into(),
+                a1: (0..=255).collect(),
+                a2: vec![255, 0, 128],
+                d2_key: vec![3; 16],
+                ps_keys: std::collections::BTreeMap::from([("qq.com".into(), "ticket".into())]),
+                o3_xwid_switch: Some(0),
+                qr_sig: vec![5; 16],
+                key_exchange_key: vec![7; 16],
+                login_cookie: "transient".into(),
+                ..Default::default()
+            },
+            machine_id: "machine".into(),
+            qua: atri_qq::Profile::linux().qua,
+        };
+        for policy in [Some(0), Some(u32::MAX), None] {
+            let mut expected = session.clone();
+            expected.keystore.o3_xwid_switch = policy;
+            db.save_session(&expected).await.unwrap();
+            let loaded = db.session().unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert!(loaded.keystore.qr_sig.is_empty());
+            assert!(loaded.keystore.key_exchange_key.is_empty());
+            assert!(loaded.keystore.login_cookie.is_empty());
+        }
+        let keyfile = root.path().join("keystore.bin");
+        use prost::Message as _;
+        let file = crate::proto::session::KeystoreFile::decode(
+            std::fs::read(&keyfile).unwrap().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(file.schema_version, 1);
+        assert_eq!(file.session.unwrap().keystore.unwrap().uin, u64::MAX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(db.migrate_legacy().await.unwrap(), 0);
+        let mut tx = db.tree.begin().unwrap();
+        tx.delete(b"session/active").unwrap();
+        tx.commit().await.unwrap();
+        db.close().await.unwrap();
+        drop(db);
+        let db = Database::open(root.path()).unwrap();
+        let loaded = db.session().unwrap().unwrap();
+        assert_eq!(loaded.keystore.a1, session.keystore.a1);
+        assert_eq!(loaded.keystore.guid, session.keystore.guid);
+        assert_eq!(loaded.keystore.device_name, session.keystore.device_name);
+        assert_eq!(loaded.machine_id, session.machine_id);
+        assert_eq!(loaded.qua, session.qua);
+        db.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn corrupt_keystore_file_does_not_silently_fall_back_to_stale_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open(root.path()).unwrap();
+        let session = Session {
+            keystore: Keystore::default(),
+            machine_id: "machine".into(),
+            qua: "profile".into(),
+        };
+        db.save_session(&session).await.unwrap();
+        std::fs::write(root.path().join("keystore.bin"), [255, 0]).unwrap();
+        assert!(db.session().is_err());
+        db.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_keystore_file_can_be_imported_once_and_reopened_from_protobuf() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("storage/io.atri.qq");
+        std::fs::create_dir_all(directory.join("data")).unwrap();
+        std::fs::create_dir_all(directory.join("config")).unwrap();
+        let keyfile = directory.join("data/keystore.cbor");
+        let keystore = Keystore {
+            uin: 12345,
+            a2: vec![255, 0, 42],
+            o3_xwid_switch: Some(0),
+            ..Default::default()
+        };
+        ciborium::into_writer(&keystore, std::fs::File::create(&keyfile).unwrap()).unwrap();
+        std::fs::write(
+            directory.join("config/config.toml"),
+            "machine_id = \"machine\"\nqua = \"test-qua\"\n",
+        )
+        .unwrap();
+        let db = Database::open(root.path()).unwrap();
+        let imported = db.session().unwrap().unwrap();
+        db.save_session(&imported).await.unwrap();
+        db.close().await.unwrap();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+        let db = Database::open(root.path()).unwrap();
+        let loaded = db.session().unwrap().unwrap();
+        assert_eq!(loaded.keystore.uin, keystore.uin);
+        assert_eq!(loaded.keystore.a2, keystore.a2);
+        assert_eq!(loaded.keystore.guid, keystore.guid);
+        assert_eq!(loaded.keystore.o3_xwid_switch, Some(0));
+        assert_eq!(loaded.machine_id, "machine");
+        db.close().await.unwrap();
     }
     #[tokio::test]
     async fn legacy_sessions_messages_pokes_and_reactions_migrate_without_changing_account_keys() {

@@ -1,3 +1,7 @@
+rust_i18n::i18n!("locales", fallback = "en");
+
+pub mod i18n;
+
 extern crate self as ferrsphen;
 
 pub mod backend;

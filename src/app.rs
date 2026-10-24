@@ -10,11 +10,14 @@ pub fn default_data_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("HOME").expect("application container"))
             .join("Library/Application Support/ferrsphen")
     } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
+        dirs::data_local_dir()
+            .expect("application data directory")
+            .join("ferrsphen")
     }
 }
 
 pub fn run(root: PathBuf) {
+    crate::i18n::init();
     let packet_log = ferrsphen::packet_log::init(&root).expect("初始化 packet 日志失败");
     tracing::info!(path = %packet_log.display(), "Packet log");
     let mut backend = Backend::start(root);
@@ -31,6 +34,8 @@ pub fn run(root: PathBuf) {
                 async {}
             })
             .detach();
+            use gpui_kit::component as gpui_component;
+            rust_i18n::extend!(gpui_component);
             gpui_kit::init(cx);
             ferrsphen::window_chrome::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);

@@ -298,7 +298,7 @@ async fn run(
         machine_id: hex::encode(rand::random::<[u8; 16]>()),
         qua: atri_qq::Profile::linux().qua,
     });
-    db.put("session/active", &session).await?;
+    db.save_session(&session).await?;
     emit(&sender, Update::Account(session.keystore.uin)).await?;
     let mut password = None;
     let mut active_client = None;
@@ -351,9 +351,9 @@ async fn run(
                                 emit(&sender,Update::Qr{bytes:image,url}).await?;
                             }
                             Ok(LoginEvent::QrState(state))=>emit(&sender,Update::Status(format!("{state:?}"))).await?,
-                            Ok(LoginEvent::KeystoreChanged(keystore))=>{session.keystore=keystore;db.put("session/active",&session).await?;}
+                            Ok(LoginEvent::KeystoreChanged(keystore))=>{session.keystore=keystore;db.save_session(&session).await?;}
                             Ok(LoginEvent::Online{..})=>{
-                                online=true;let state=client.snapshot().await;session.keystore=state.keystore;db.put("session/active",&session).await?;
+                                online=true;let state=client.snapshot().await;session.keystore=state.keystore;db.save_session(&session).await?;
                                 emit(&sender,Update::Online(UserInfo::from(&session.keystore))).await?;
                                 emit(&sender,Update::Restored(Box::new(db.restore(session.keystore.uin)?))).await?;
                                 let cached_friends=db.get::<Vec<Friend>>(&format!("friends/{}",session.keystore.uin))?.unwrap_or_default();

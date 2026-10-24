@@ -1,9 +1,12 @@
 syntax = "proto3";
 package ferrsphen.storage;
 
+import "keystore.proto";
+
 message Record {
   uint32 schema_version = 1;
   Value value = 2;
+  ferrsphen.session.Session session = 3;
 }
 
 message Empty {}

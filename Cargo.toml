@@ -3,7 +3,7 @@ name = "ferrsphen"
 version = "0.1.0"
 edition = "2024"
 default-run = "ferrsphen"
-license = "AGPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -15,7 +15,7 @@ ui-tests = ["desktop", "dep:gpui"]
 
 [dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", optional = true, features = ["test-support"] }
-atri_qq = { path = "../atri_qq", default-features = false }
+atri_qq = { git = "https://github.com/LaoLittle/atri_qq", default-features = false }
 gpui-kit = { version = "=0.8.0", optional = true }
 alhazen-core = { version = "0.6", optional = true }
 surrealkv = "=1.0.0"
@@ -39,7 +39,9 @@ tempfile = "3"
 qrcode = { version = "0.14", default-features = false }
 prost = "0.14"
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
-src = "0.0.6"
+dirs = "6"
+rust-i18n = "4.2"
+sys-locale = "0.3"
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7", default-features = false, features = ["clipboard", "file_selector", "image_picker", "url_launcher", "path_provider", "camera", "video_player"] }
@@ -69,3 +71,11 @@ required-features = ["desktop"]
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3"
+
+[profile.app-release]
+inherits = "release"
+lto = true
+opt-level = 3
+strip = true
+panic = "abort"
+codegen-units = 1

@@ -10,6 +10,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
+use rust_i18n::t;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -398,7 +399,7 @@ impl Render for VideoView {
                     .child(
                         Slider::new(&self.progress)
                             .disabled(duration.is_zero())
-                            .accessibility_label("播放进度"),
+                            .accessibility_label(t!("video.progress")),
                     )
                     .child(
                         div()
@@ -413,7 +414,11 @@ impl Render for VideoView {
                                     } else {
                                         IconName::Play
                                     })
-                                    .accessibility_label(if playing { "暂停" } else { "播放" })
+                                    .accessibility_label(if playing {
+                                        t!("video.pause")
+                                    } else {
+                                        t!("video.play")
+                                    })
                                     .disabled(self.player.is_none())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle();
@@ -434,7 +439,7 @@ impl Render for VideoView {
                                     } else {
                                         IconName::Volume2
                                     })
-                                    .accessibility_label("静音")
+                                    .accessibility_label(t!("video.mute"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.muted = !this.muted;
                                         if let Some(player) = &this.player {
@@ -443,18 +448,16 @@ impl Render for VideoView {
                                         cx.notify();
                                     })),
                             )
-                            .child(
-                                div()
-                                    .w_24()
-                                    .child(Slider::new(&self.volume).accessibility_label("音量")),
-                            )
+                            .child(div().w_24().child(
+                                Slider::new(&self.volume).accessibility_label(t!("video.volume")),
+                            ))
                             .when_some(self.path.clone(), |bar, path| {
                                 bar.child(
                                     Button::new("video-reveal")
                                         .ghost()
                                         .icon(IconName::FolderOpen)
-                                        .tooltip("查看本地文件")
-                                        .accessibility_label("查看本地文件")
+                                        .tooltip(t!("common.local_file"))
+                                        .accessibility_label(t!("common.local_file"))
                                         .on_click(move |_, _, cx| cx.reveal_path(&path)),
                                 )
                             })
@@ -462,7 +465,7 @@ impl Render for VideoView {
                                 Button::new("video-fullscreen")
                                     .ghost()
                                     .icon(IconName::Maximize)
-                                    .accessibility_label("全屏")
+                                    .accessibility_label(t!("video.fullscreen"))
                                     .on_click(|_, window, _| window.toggle_fullscreen()),
                             ),
                     ),

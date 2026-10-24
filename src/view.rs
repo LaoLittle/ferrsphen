@@ -21,6 +21,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
+use rust_i18n::t;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -571,7 +572,7 @@ impl AppView {
                 .collect::<Vec<_>>()
         };
         let text = if recalled {
-            "[已撤回]".to_string()
+            t!("common.recalled").to_string()
         } else {
             let text = summary(
                 &message
@@ -582,7 +583,7 @@ impl AppView {
                     .collect::<Vec<_>>(),
             );
             if text.is_empty() {
-                "消息".into()
+                t!("common.message").into_owned()
             } else {
                 text
             }
@@ -618,7 +619,7 @@ impl AppView {
                             .items_center()
                             .justify_center()
                             .text_xs()
-                            .child("图片")
+                            .child(t!("common.image"))
                             .into_any_element(),
                     })
             }))
@@ -658,7 +659,7 @@ impl AppView {
         };
         let found = rows.and_then(|rows| reply_target(rows, &reply)).is_some();
         if !found && read_only {
-            self.forward_error = Some("未找到原消息".into());
+            self.forward_error = Some(t!("error.original_missing").into_owned());
             cx.notify();
             return;
         }
@@ -728,9 +729,9 @@ impl AppView {
         });
         let Some((index, key, stacked, image_offset)) = target else {
             if read_only {
-                self.forward_error = Some("未找到原消息".into());
+                self.forward_error = Some(t!("error.original_missing").into_owned());
             } else {
-                self.error = Some("未找到原消息".into());
+                self.error = Some(t!("error.original_missing").into_owned());
             }
             self.reply_jump = None;
             return;
@@ -792,12 +793,16 @@ impl AppView {
     ) -> Self {
         let mobile_platform = cfg!(any(target_os = "ios", target_os = "android"));
         let phone = mobile_platform && phone_layout(window.viewport_size());
-        let account = cx.new(|cx| InputState::new(window, cx).placeholder("QQ 账号"));
-        let password = cx.new(|cx| InputState::new(window, cx).placeholder("密码").masked(true));
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
+        let account = cx.new(|cx| InputState::new(window, cx).placeholder(t!("login.account")));
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("login.password"))
+                .masked(true)
+        });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(t!("chat.search")));
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("输入消息")
+                .placeholder(t!("chat.input"))
                 .auto_grow(1, 6)
                 .submit_on_enter(!phone)
         });
@@ -1016,7 +1021,7 @@ impl AppView {
     }
     fn command(&mut self, command: Command) -> bool {
         if self.commands.try_send(command).is_err() {
-            self.error = Some("操作队列不可用".into());
+            self.error = Some(t!("error.queue").into_owned());
             false
         } else {
             true
@@ -1836,13 +1841,13 @@ impl AppView {
     }
     fn login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(uin) = self.account.read(cx).value().trim().parse::<u64>() else {
-            self.error = Some("请输入 QQ 账号".into());
+            self.error = Some(t!("login.enter_account").into_owned());
             cx.notify();
             return;
         };
         let password = self.password.read(cx).value().to_string();
         if password.is_empty() {
-            self.error = Some("请输入密码".into());
+            self.error = Some(t!("login.enter_password").into_owned());
             cx.notify();
             return;
         }
@@ -2058,7 +2063,7 @@ impl AppView {
                 continue;
             }
             let Some(path) = self.compose_images.get(span.token().id().as_ref()) else {
-                self.error = Some("图片不可用".into());
+                self.error = Some(t!("error.image_unavailable").into_owned());
                 cx.notify();
                 return;
             };
@@ -2187,7 +2192,7 @@ impl AppView {
             files: true,
             directories: false,
             multiple: matches!(kind, AttachmentKind::Image),
-            prompt: Some("选择文件".into()),
+            prompt: Some(t!("chat.pick_file").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
@@ -2297,7 +2302,7 @@ impl AppView {
                 let path = self
                     .compose_images
                     .get(span.token().id().as_ref())
-                    .ok_or_else(|| anyhow::anyhow!("图片不可用"))?;
+                    .ok_or_else(|| anyhow::anyhow!(t!("error.image_unavailable")))?;
                 parts.push(ferrsphen::rich_clipboard::image_file(path)?);
                 cursor = span.range().end;
             }
@@ -2323,7 +2328,9 @@ impl AppView {
     fn copy_message(&mut self, message: Message, cx: &mut Context<Self>) {
         self.pending_copy = None;
         if self.model.is_recalled(&message) {
-            cx.write_to_clipboard(ClipboardItem::new_string("[已撤回]".into()));
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                t!("common.recalled").into_owned(),
+            ));
             return;
         }
         for (index, element) in message.elements.iter().enumerate() {
@@ -2493,8 +2500,8 @@ impl AppView {
                     .small()
                     .icon(gpui_kit::assets::IconName::FaceSlightlySmiling)
                     .size(px(if self.phone { 44. } else { 32. }))
-                    .tooltip("表情")
-                    .accessibility_label("表情")
+                    .tooltip(t!("expressions.title"))
+                    .accessibility_label(t!("expressions.title"))
                     .debug_selector(|| "emoji-button".into()),
             )
             .content(move |_, _, cx| owner.update(cx, |this, cx| this.expression_content(cx)))
@@ -2509,7 +2516,7 @@ impl AppView {
                     .debug_selector(|| "faces-tab".into())
                     .ghost()
                     .small()
-                    .label("表情")
+                    .label(t!("expressions.title"))
                     .selected(!self.emoji_favorites)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.emoji_favorites = false;
@@ -2522,7 +2529,7 @@ impl AppView {
                     .debug_selector(|| "favorites-tab".into())
                     .ghost()
                     .small()
-                    .label("收藏")
+                    .label(t!("expressions.favorites"))
                     .selected(self.emoji_favorites)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.emoji_favorites = true;
@@ -2545,9 +2552,9 @@ impl AppView {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(if self.favorites_error {
-                                "加载失败"
+                                t!("common.load_failed")
                             } else {
-                                "暂无收藏表情"
+                                t!("expressions.empty")
                             })
                             .into_any_element()
                     })
@@ -2587,7 +2594,9 @@ impl AppView {
                                                     .ghost()
                                                     .size(px(52.))
                                                     .disabled(path.is_none())
-                                                    .accessibility_label("收藏表情");
+                                                    .accessibility_label(t!(
+                                                        "expressions.favorite"
+                                                    ));
                                             if let Some(path) = path {
                                                 button = button
                                                     .child(
@@ -2699,7 +2708,7 @@ impl AppView {
                     ))
                 })
                 .item(
-                    PopupMenuItem::new("戳一戳")
+                    PopupMenuItem::new(t!("chat.poke"))
                         .disabled(
                             disabled || matches!(conversation, Conversation::Temporary { .. }),
                         )
@@ -2765,10 +2774,10 @@ impl AppView {
         };
         let display = |uin: Option<u64>| {
             let Some(uin) = uin.filter(|uin| *uin != 0) else {
-                return "对方".to_owned();
+                return t!("poke.peer").into_owned();
             };
             if uin == own {
-                return "你".into();
+                return t!("poke.you").into_owned();
             }
             let friend = self.model.friends.iter().find(|friend| friend.uin == uin);
             let member = group
@@ -2783,10 +2792,11 @@ impl AppView {
                 .map_or("", |chat| chat.title.as_str());
             ferrsphen::model::display_name(friend, member, fallback, uin)
         };
+        let default_action = t!("poke.action");
         let action = parameters
             .get("action_str")
             .filter(|action| !action.trim().is_empty())
-            .map_or("戳了戳", String::as_str);
+            .map_or(default_action.as_ref(), String::as_str);
         let suffix = parameters.get("suffix_str").map_or("", String::as_str);
         let text = format!("{} {action} {}{suffix}", display(actor), display(target));
         let after = self
@@ -2903,13 +2913,14 @@ impl AppView {
     }
     fn insert_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if !path.is_file() || image::image_dimensions(&path).is_err() {
-            self.error = Some("无法读取图片".into());
+            self.error = Some(t!("error.read_image").into_owned());
             cx.notify();
             return;
         }
         let id = format!("compose-image:{:016x}", rand::random::<u64>());
         self.compose_images.insert(id.clone(), path);
-        let token = gpui_kit::component::input::InlineToken::new(id, "\u{fffc}").with_label("图片");
+        let token = gpui_kit::component::input::InlineToken::new(id, "\u{fffc}")
+            .with_label(t!("common.image"));
         let result = self.composer.update(cx, |input, cx| {
             input.focus(window, cx);
             input.replace_with_token(token, window, cx)
@@ -2930,7 +2941,7 @@ impl AppView {
         let mut standalone = Vec::new();
         for path in paths {
             if !path.is_file() {
-                self.error = Some("请选择文件".into());
+                self.error = Some(t!("chat.choose_file").into_owned());
                 continue;
             }
             let extension = path
@@ -3036,9 +3047,9 @@ impl AppView {
             .iter()
             .all(|(_, kind)| *kind == AttachmentKind::Voice)
         {
-            "发送语音"
+            t!("chat.send_voice")
         } else {
-            "发送文件"
+            t!("chat.send_file")
         };
         div()
             .id("attachment-confirmation")
@@ -3116,7 +3127,7 @@ impl AppView {
                             .child(
                                 Button::new("attachment-cancel")
                                     .ghost()
-                                    .label("取消")
+                                    .label(t!("common.cancel"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirmation = None;
                                         this.composer
@@ -3130,7 +3141,7 @@ impl AppView {
                                     .child(
                                         Button::new("attachment-confirm")
                                             .primary()
-                                            .label("发送")
+                                            .label(t!("common.send"))
                                             .disabled(self.status == "离线")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.confirm_attachments(window, cx)
@@ -3180,7 +3191,7 @@ impl AppView {
                 .justify_center()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("正在登录…")
+                .child(t!("login.signing_in"))
                 .into_any_element();
         }
         div()
@@ -3211,9 +3222,9 @@ impl AppView {
                         .debug_selector(|| "switch-login".into())
                         .ghost()
                         .label(if self.phone_qr_login {
-                            "密码登录"
+                            t!("login.password_login")
                         } else {
-                            "二维码登录"
+                            t!("login.qr_login")
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.phone_qr_login = !this.phone_qr_login;
@@ -3252,14 +3263,14 @@ impl AppView {
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("二维码加载中"),
+                                .child(t!("login.qr_loading")),
                         ),
                     }),
             )
             .child(
                 Button::new("refresh-qr")
                     .ghost()
-                    .label("刷新二维码")
+                    .label(t!("login.qr_refresh"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.qr = None;
                         this.command(Command::Qr);
@@ -3275,14 +3286,14 @@ impl AppView {
             .flex_col()
             .w_64()
             .gap_4()
-            .child(div().text_lg().child("登录 QQ"))
-            .child(Input::new(&self.account).aria_label("QQ 账号"))
-            .child(Input::new(&self.password).aria_label("密码"))
+            .child(div().text_lg().child(t!("login.title")))
+            .child(Input::new(&self.account).aria_label(t!("login.account")))
+            .child(Input::new(&self.password).aria_label(t!("login.password")))
             .child(
                 Button::new("login")
                     .primary()
                     .w_full()
-                    .label("登录")
+                    .label(t!("login.sign_in"))
                     .on_click(cx.listener(|this, _, window, cx| this.login(window, cx))),
             )
             .into_any_element()
@@ -3304,7 +3315,7 @@ impl AppView {
             .child(
                 Button::new("verify-link")
                     .ghost()
-                    .label("打开验证")
+                    .label(t!("login.open_verification"))
                     .on_click(move |_, _, _| {
                         let _ = open::that(&url);
                     }),
@@ -3320,12 +3331,12 @@ impl AppView {
                 .child(
                     Button::new("submit-verification")
                         .primary()
-                        .label("提交验证")
+                        .label(t!("login.submit_verification"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let ticket = this.ticket.read(cx).value().to_string();
                             let random = this.captcha_random.read(cx).value().to_string();
                             if ticket.is_empty() || random.is_empty() {
-                                this.error = Some("请填写验证结果".into());
+                                this.error = Some(t!("login.enter_verification").into_owned());
                             } else {
                                 this.command(Command::SubmitCaptcha { ticket, random });
                             }
@@ -3380,8 +3391,8 @@ impl AppView {
                             gpui_kit::assets::IconName::PanelRightOpen
                         })
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .accessibility_label("群详情")
-                        .tooltip("群详情")
+                        .accessibility_label(t!("group.details"))
+                        .tooltip(t!("group.details"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar = !this.sidebar;
                             cx.notify();
@@ -3462,8 +3473,18 @@ impl AppView {
             .border_color(cx.theme().border)
             .children(
                 [
-                    (Page::Chat, "nav-chat", "聊天", IconName::MessageCircle),
-                    (Page::Settings, "nav-settings", "设置", IconName::Settings),
+                    (
+                        Page::Chat,
+                        "nav-chat",
+                        t!("chat.title"),
+                        IconName::MessageCircle,
+                    ),
+                    (
+                        Page::Settings,
+                        "nav-settings",
+                        t!("settings.title"),
+                        IconName::Settings,
+                    ),
                 ]
                 .into_iter()
                 .map(|(page, id, label, icon)| {
@@ -3472,7 +3493,7 @@ impl AppView {
                             .ghost()
                             .icon(icon)
                             .when(self.phone, |button| button.size(px(44.)))
-                            .tooltip(label)
+                            .tooltip(label.clone())
                             .accessibility_label(label)
                             .when(self.page == page, |button| button.bg(cx.theme().accent))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -3531,13 +3552,13 @@ impl AppView {
                         .py_3()
                         .text_lg()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("聊天"),
+                        .child(t!("chat.title")),
                 )
             })
             .child(
                 div()
                     .p_3()
-                    .child(Input::new(&self.search).aria_label("搜索会话")),
+                    .child(Input::new(&self.search).aria_label(t!("chat.search_conversations"))),
             )
             .child(rows)
             .into_any_element()
@@ -3568,7 +3589,7 @@ impl AppView {
             .w_full()
             .h(px(72.))
             .p_3()
-            .accessibility_label(format!("打开会话 {}", chat.title))
+            .accessibility_label(t!("chat.open", name = chat.title))
             .child(
                 div()
                     .flex()
@@ -3666,7 +3687,7 @@ impl AppView {
                     .ghost()
                     .h_auto()
                     .p_0()
-                    .accessibility_label("打开图片")
+                    .accessibility_label(t!("image.open"))
                     .child(match preview {
                         Some(path) => img(path)
                             .id(SharedString::from(format!("animation:{key}")))
@@ -3688,7 +3709,7 @@ impl AppView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child("图片")
+                            .child(t!("common.image"))
                             .into_any_element(),
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3822,11 +3843,15 @@ impl AppView {
                                     .into_any_element()
                             })
                             .child(div().text_sm().child(if failed {
-                                "重试".into()
+                                t!("common.retry")
                             } else if active && position > 0. {
-                                format!("{} / {} 秒", position as u32, duration.ceil() as u32)
+                                t!(
+                                    "voice.progress",
+                                    position = position as u32,
+                                    duration = duration.ceil() as u32
+                                )
                             } else {
-                                format!("{} 秒", reference.duration)
+                                t!("voice.duration", duration = reference.duration)
                             })),
                     )
                     .child(
@@ -3854,7 +3879,11 @@ impl AppView {
                             })
                         {
                             this.voice_player.update(cx, |player, cx| {
-                                player.complete(key.clone(), Err("操作队列不可用".into()), cx)
+                                player.complete(
+                                    key.clone(),
+                                    Err(t!("error.queue").into_owned()),
+                                    cx,
+                                )
                             });
                         }
                     }))
@@ -3865,7 +3894,7 @@ impl AppView {
                 let reference = reference.clone();
                 Button::new(SharedString::from(format!("media:{key}")))
                     .ghost()
-                    .label(format!("文件 · {}", reference.name))
+                    .label(t!("chat.file", name = reference.name))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.command(Command::OpenMedia(reference.clone()));
                         cx.notify();
@@ -3895,8 +3924,8 @@ impl AppView {
                     .forward_cache
                     .get(&key)
                     .filter(|rows| !rows.is_empty())
-                    .map(|rows| format!("查看 {} 条消息", rows.len()))
-                    .unwrap_or_else(|| "查看聊天记录".into());
+                    .map(|rows| t!("forward.count", count = rows.len()))
+                    .unwrap_or_else(|| t!("forward.view"));
                 Button::new(SharedString::from(format!("forward:{key}")))
                     .ghost()
                     .h_auto()
@@ -3919,7 +3948,7 @@ impl AppView {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child("聊天记录"),
+                                    .child(t!("forward.title")),
                             )
                             .children(lines.into_iter().map(|text| {
                                 div()
@@ -3952,7 +3981,7 @@ impl AppView {
                 let title = serde_json::from_str::<serde_json::Value>(&json)
                     .ok()
                     .and_then(|value| value["prompt"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "卡片".into());
+                    .unwrap_or_else(|| t!("common.card").into_owned());
                 Button::new(SharedString::from(format!("card:{key}")))
                     .ghost()
                     .label(title)
@@ -3974,7 +4003,7 @@ impl AppView {
                 };
                 Button::new(SharedString::from(format!("group-file:{key}")))
                     .ghost()
-                    .label(format!("群文件 · {}", file.name))
+                    .label(t!("chat.group_file", name = file.name))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.command(Command::GroupFile {
                             group,
@@ -3991,7 +4020,7 @@ impl AppView {
                 let text = format!("字段 {}\n{}", value.field, hex::encode(&value.payload));
                 Button::new(SharedString::from(format!("opaque:{key}")))
                     .ghost()
-                    .label("其他消息")
+                    .label(t!("common.other_message"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.details = Some(text.clone());
                         cx.notify();
@@ -4093,7 +4122,7 @@ impl AppView {
                                     .rounded_xl()
                                     .when(selected, |button| button.bg(cx.theme().accent))
                                     .disabled(this.status == "离线" || pending)
-                                    .tooltip(format!("{}{}", if selected { "取消" } else { "" }, face.name))
+                                    .tooltip(if selected { t!("reaction.remove_face", name = &face.name) } else { face.name.clone().into() })
                                     .accessibility_label(face.name.clone())
                                     .child(this.face_image(&face))
                                     .on_click(move |_, window, cx| {
@@ -4122,7 +4151,7 @@ impl AppView {
                 PopupMenuItem::element(|_, _| {
                     div()
                         .debug_selector(|| "message-menu-reply".into())
-                        .child("回复")
+                        .child(t!("common.reply"))
                 })
                 .disabled(recalled || read_only)
                 .on_click(move |_, window, cx| {
@@ -4135,9 +4164,11 @@ impl AppView {
                     });
                 }),
             )
-            .item(PopupMenuItem::new("复制").on_click(move |_, _, cx| {
-                let _ = copy_owner.update(cx, |this, cx| this.copy_message(copied.clone(), cx));
-            }))
+            .item(
+                PopupMenuItem::new(t!("common.copy")).on_click(move |_, _, cx| {
+                    let _ = copy_owner.update(cx, |this, cx| this.copy_message(copied.clone(), cx));
+                }),
+            )
             .item(
                 PopupMenuItem::element(move |_, cx| {
                     div()
@@ -4146,7 +4177,7 @@ impl AppView {
                         } else {
                             0.4
                         }))
-                        .child("撤回")
+                        .child(t!("common.recall"))
                 })
                 .disabled(!recallable)
                 .on_click(move |_, _, cx| {
@@ -4159,7 +4190,7 @@ impl AppView {
             .when(has_image && !recalled, |menu| {
                 let path = path.clone();
                 menu.item(
-                    PopupMenuItem::new("查看本地文件")
+                    PopupMenuItem::new(t!("common.local_file"))
                         .disabled(path.is_none())
                         .on_click(move |_, _, cx| {
                             if let Some(path) = &path {
@@ -4470,8 +4501,8 @@ impl AppView {
                         .ghost()
                         .xsmall()
                         .icon(gpui_kit::assets::IconName::ChevronUp)
-                        .tooltip("收起图片")
-                        .accessibility_label("收起图片")
+                        .tooltip(t!("image.collapse"))
+                        .accessibility_label(t!("image.collapse"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.change_stack(&collapse_key, false, cx);
                         })),
@@ -4579,10 +4610,14 @@ impl AppView {
                 .disabled(self.status == "离线" || self.pending_reactions.contains(&key))
                 .tooltip(format!(
                     "{} · {}",
-                    if mine { "取消回应" } else { "回应" },
+                    if mine {
+                        t!("reaction.remove")
+                    } else {
+                        t!("reaction.add")
+                    },
                     state.count
                 ))
-                .accessibility_label(format!("回应 {}，{}次", code, state.count))
+                .accessibility_label(t!("reaction.label", code = code, count = state.count))
                 .child(
                     div()
                         .flex()
@@ -4630,8 +4665,8 @@ impl AppView {
                     .xsmall()
                     .icon(gpui_kit::assets::IconName::Reply)
                     .disabled(recalled || read_only)
-                    .tooltip("回复")
-                    .accessibility_label("回复")
+                    .tooltip(t!("common.reply"))
+                    .accessibility_label(t!("common.reply"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.reply = Some(reply.clone());
                         this.request_assets();
@@ -4645,8 +4680,8 @@ impl AppView {
                     .ghost()
                     .xsmall()
                     .icon(gpui_kit::assets::IconName::Copy)
-                    .tooltip("复制")
-                    .accessibility_label("复制")
+                    .tooltip(t!("common.copy"))
+                    .accessibility_label(t!("common.copy"))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.copy_message(copied.clone(), cx)),
                     ),
@@ -4746,7 +4781,7 @@ impl AppView {
                     .font_family(cx.theme().font_family.clone())
                     .min_w_0()
                     .truncate()
-                    .child("[已撤回]")
+                    .child(t!("common.recalled"))
                     .into_any_element(),
             );
         } else {
@@ -5091,7 +5126,7 @@ impl AppView {
                     .p_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("{text} · 发送中"))
+                    .child(t!("chat.sending", text = text))
             })
             .collect::<Vec<_>>();
         let failed = self
@@ -5109,12 +5144,12 @@ impl AppView {
                     .gap_2()
                     .text_sm()
                     .text_color(cx.theme().danger)
-                    .child(format!("发送失败 · {error}"))
+                    .child(t!("chat.failed", error = error))
                     .child(
                         Button::new(SharedString::from(format!("retry:{id}")))
                             .ghost()
                             .small()
-                            .label("重试")
+                            .label(t!("common.retry"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.retry_send(id, &retry_key, &text, cx);
                             })),
@@ -5161,7 +5196,7 @@ impl AppView {
                                 .ghost()
                                 .size(px(44.))
                                 .icon(gpui_kit::assets::IconName::ChevronLeft)
-                                .accessibility_label("返回会话列表")
+                                .accessibility_label(t!("chat.back"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.show_chat_list(window, cx)
                                 })),
@@ -5296,8 +5331,8 @@ impl AppView {
                                     .small()
                                     .icon(gpui_kit::assets::IconName::Image)
                                     .size(px(if self.phone { 44. } else { 32. }))
-                                    .tooltip("图片")
-                                    .accessibility_label("图片")
+                                    .tooltip(t!("common.image"))
+                                    .accessibility_label(t!("common.image"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.attach(AttachmentKind::Image, window, cx)
                                     })),
@@ -5309,8 +5344,8 @@ impl AppView {
                                     .small()
                                     .icon(gpui_kit::assets::IconName::Paperclip)
                                     .size(px(if self.phone { 44. } else { 32. }))
-                                    .tooltip("文件")
-                                    .accessibility_label("文件")
+                                    .tooltip(t!("common.file"))
+                                    .accessibility_label(t!("common.file"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.attach(AttachmentKind::File, window, cx)
                                     })),
@@ -5322,8 +5357,8 @@ impl AppView {
                                     .small()
                                     .icon(gpui_kit::assets::IconName::Mic)
                                     .size(px(if self.phone { 44. } else { 32. }))
-                                    .tooltip("语音")
-                                    .accessibility_label("语音")
+                                    .tooltip(t!("common.voice"))
+                                    .accessibility_label(t!("common.voice"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.attach(AttachmentKind::Voice, window, cx)
                                     })),
@@ -5335,8 +5370,8 @@ impl AppView {
                                     .small()
                                     .icon(gpui_kit::assets::IconName::Clapperboard)
                                     .size(px(if self.phone { 44. } else { 32. }))
-                                    .tooltip("视频")
-                                    .accessibility_label("视频")
+                                    .tooltip(t!("common.video"))
+                                    .accessibility_label(t!("common.video"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.attach(AttachmentKind::Video, window, cx)
                                     })),
@@ -5356,8 +5391,8 @@ impl AppView {
                                         .ghost()
                                         .xsmall()
                                         .icon(gpui_kit::assets::IconName::X)
-                                        .tooltip("取消回复")
-                                        .accessibility_label("取消回复")
+                                        .tooltip(t!("chat.cancel_reply"))
+                                        .accessibility_label(t!("chat.cancel_reply"))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.reply = None;
                                             cx.notify();
@@ -5431,7 +5466,7 @@ impl AppView {
                                                 },
                                             )
                                             .bordered(false)
-                                            .aria_label("消息内容"),
+                                            .aria_label(t!("chat.contents")),
                                     ),
                             )
                             .child(
@@ -5439,13 +5474,13 @@ impl AppView {
                                     Button::new("send")
                                         .debug_selector(|| "send-message".into())
                                         .primary()
-                                        .accessibility_label("发送")
+                                        .accessibility_label(t!("common.send"))
                                         .when(self.phone, |button| {
                                             button
                                                 .icon(gpui_kit::assets::IconName::ArrowUp)
                                                 .size(px(44.))
                                         })
-                                        .when(!self.phone, |button| button.label("发送"))
+                                        .when(!self.phone, |button| button.label(t!("common.send")))
                                         .disabled(
                                             self.composer.read(cx).value().trim().is_empty()
                                                 || self.status == "离线",
@@ -5487,7 +5522,7 @@ impl AppView {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("暂无公告"),
+                            .child(t!("group.no_announcements")),
                     )
                 })
                 .children(items.iter().map(|notice| {
@@ -5523,12 +5558,12 @@ impl AppView {
             Some(Err(_)) => div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("加载失败")
+                .child(t!("common.load_failed"))
                 .into_any_element(),
             None => div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("正在加载…")
+                .child(t!("common.loading"))
                 .into_any_element(),
         };
         div()
@@ -5557,15 +5592,15 @@ impl AppView {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child("群公告"),
+                                    .child(t!("group.announcements")),
                             )
                             .child(
                                 Button::new("refresh-announcements")
                                     .ghost()
                                     .xsmall()
                                     .icon(gpui_kit::assets::IconName::RefreshCw)
-                                    .accessibility_label("刷新群公告")
-                                    .tooltip("刷新")
+                                    .accessibility_label(t!("group.refresh_announcements"))
+                                    .tooltip(t!("common.refresh"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.model.announcements.remove(&group);
                                         this.command(Command::Announcements(group));
@@ -5586,7 +5621,7 @@ impl AppView {
                     .px_4()
                     .py_3()
                     .text_sm()
-                    .child(format!("群成员 {}", members.map_or(0, Vec::len))),
+                    .child(t!("group.members", count = members.map_or(0, Vec::len))),
             )
             .child(
                 div()
@@ -5656,7 +5691,7 @@ impl AppView {
                         reference,
                     }) {
                         this.video_results
-                            .insert(key.clone(), Err("操作队列不可用".into()));
+                            .insert(key.clone(), Err(t!("error.queue").into_owned()));
                     }
                 }
                 cx.notify();
@@ -5667,7 +5702,7 @@ impl AppView {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(960.), px(680.)), cx)),
                     window_min_size: Some(size(px(520.), px(360.))),
-                    ..ferrsphen::window_chrome::options("视频")
+                    ..ferrsphen::window_chrome::options(t!("common.video"))
                 },
                 cx,
                 move |window, cx| {
@@ -5737,8 +5772,8 @@ impl AppView {
                 DetailKind::Forward => size(px(600.), px(720.)),
             };
             let title = match kind {
-                DetailKind::Image => "图片",
-                DetailKind::Forward => "聊天记录",
+                DetailKind::Image => t!("common.image"),
+                DetailKind::Forward => t!("forward.title"),
             };
             let content_owner = owner.clone();
             let result = gpui_kit::open_window(
@@ -5808,8 +5843,13 @@ impl AppView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                ferrsphen::window_chrome::title_bar(cx)
-                    .child(div().flex_1().text_center().text_sm().child("聊天记录")),
+                ferrsphen::window_chrome::title_bar(cx).child(
+                    div()
+                        .flex_1()
+                        .text_center()
+                        .text_sm()
+                        .child(t!("forward.title")),
+                ),
             )
             .child(
                 div()
@@ -5844,7 +5884,7 @@ impl AppView {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("正在加载…"),
+                                    .child(t!("common.loading")),
                             )
                         },
                     )
@@ -5980,7 +6020,7 @@ impl AppView {
                     .context_menu(move |menu, _, _| {
                         let file = file.clone();
                         menu.item(
-                            PopupMenuItem::new("查看本地文件")
+                            PopupMenuItem::new(t!("common.local_file"))
                                 .on_click(move |_, _, cx| cx.reveal_path(&file)),
                         )
                     })
@@ -5994,25 +6034,28 @@ impl AppView {
                 .flex_col()
                 .gap_3()
                 .child(if viewer.error.is_some() {
-                    "加载失败"
+                    t!("common.load_failed")
                 } else {
-                    "正在加载…"
+                    t!("common.loading")
                 })
                 .when(viewer.error.is_some(), |view| {
-                    view.child(Button::new("retry-image").ghost().label("重试").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(viewer) = &mut this.viewer {
-                                viewer.error = None;
-                            }
-                            this.request_viewer_image();
-                            cx.notify();
-                        }),
-                    ))
+                    view.child(
+                        Button::new("retry-image")
+                            .ghost()
+                            .label(t!("common.retry"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(viewer) = &mut this.viewer {
+                                    viewer.error = None;
+                                }
+                                this.request_viewer_image();
+                                cx.notify();
+                            })),
+                    )
                 })
                 .into_any_element(),
         };
         let name = if item.reference.name.is_empty() {
-            "图片".into()
+            t!("common.image").into_owned()
         } else {
             item.reference.name.clone()
         };
@@ -6126,8 +6169,8 @@ impl AppView {
                         Button::new("viewer-previous")
                             .ghost()
                             .icon(gpui_kit::assets::IconName::ChevronLeft)
-                            .tooltip("上一张")
-                            .accessibility_label("上一张")
+                            .tooltip(t!("image.previous"))
+                            .accessibility_label(t!("image.previous"))
                             .disabled(viewer.index == 0)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.navigate_image(-1);
@@ -6143,8 +6186,8 @@ impl AppView {
                         Button::new("viewer-next")
                             .ghost()
                             .icon(gpui_kit::assets::IconName::ChevronRight)
-                            .tooltip("下一张")
-                            .accessibility_label("下一张")
+                            .tooltip(t!("image.next"))
+                            .accessibility_label(t!("image.next"))
                             .disabled(viewer.index + 1 == viewer.images.len())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.navigate_image(1);
@@ -6156,8 +6199,8 @@ impl AppView {
                         Button::new("viewer-zoom-out")
                             .ghost()
                             .icon(gpui_kit::assets::IconName::ZoomOut)
-                            .tooltip("缩小")
-                            .accessibility_label("缩小")
+                            .tooltip(t!("image.zoom_out"))
+                            .accessibility_label(t!("image.zoom_out"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(viewer) = &mut this.viewer {
                                     viewer.zoom_by(0.8);
@@ -6169,7 +6212,7 @@ impl AppView {
                         Button::new("viewer-fit")
                             .ghost()
                             .label(format!("{:.0}%", viewer.zoom * 100.))
-                            .tooltip("适应窗口")
+                            .tooltip(t!("image.fit"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(viewer) = &mut this.viewer {
                                     viewer.reset();
@@ -6181,8 +6224,8 @@ impl AppView {
                         Button::new("viewer-zoom-in")
                             .ghost()
                             .icon(gpui_kit::assets::IconName::ZoomIn)
-                            .tooltip("放大")
-                            .accessibility_label("放大")
+                            .tooltip(t!("image.zoom_in"))
+                            .accessibility_label(t!("image.zoom_in"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(viewer) = &mut this.viewer {
                                     viewer.zoom_by(1.25);
@@ -6216,12 +6259,12 @@ impl AppView {
                         div()
                             .flex()
                             .items_center()
-                            .child(div().flex_1().text_sm().child("消息详情"))
+                            .child(div().flex_1().text_sm().child(t!("detail.title")))
                             .child(
                                 Button::new("close-details")
                                     .ghost()
                                     .small()
-                                    .label("关闭")
+                                    .label(t!("common.close"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.forward = None;
                                         this.details = None;
@@ -6303,7 +6346,7 @@ impl Render for AppView {
                             Button::new("dismiss-error")
                                 .ghost()
                                 .small()
-                                .label("关闭")
+                                .label(t!("common.close"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.error = None;
                                     cx.notify();
@@ -6381,7 +6424,7 @@ fn clock_time(time: i64) -> String {
 }
 
 fn recalled_size(window: &Window, cx: &App) -> gpui_kit::Size<Pixels> {
-    let label: SharedString = "[已撤回]".into();
+    let label: SharedString = t!("common.recalled").into();
     let font_size = window.rem_size() * 0.875;
     let line = window.text_system().shape_line(
         label.clone(),
@@ -6905,8 +6948,8 @@ mod ui_tests {
             let view = view.read(cx);
             let notices = &view.poke_notices["dm:uid:peer"];
             assert_eq!(notices.len(), 2);
-            assert_eq!(notices[0].1, "你 拍了拍 好友昵称的肩膀");
-            assert_eq!(notices[1].1, "好友昵称 拍了拍 你的肩膀");
+            assert_eq!(notices[0].1, "You 拍了拍 好友昵称的肩膀");
+            assert_eq!(notices[1].1, "好友昵称 拍了拍 You的肩膀");
             assert!(notices.iter().all(|(after, _)| after.is_some()));
             assert!(view.pending_pokes.is_empty());
         });
@@ -6958,7 +7001,7 @@ mod ui_tests {
             let notices = &view.poke_notices["dm:uid:peer"];
             assert_eq!(notices.len(), 1);
             assert_eq!(notices[0].0, None);
-            assert_eq!(notices[0].1, "好友昵称 拍了拍 你的肩膀");
+            assert_eq!(notices[0].1, "好友昵称 拍了拍 You的肩膀");
         });
         assert!(
             VisualTestContext::from_window(main, cx)

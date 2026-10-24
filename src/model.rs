@@ -3,6 +3,7 @@ use atri_qq::{
     contacts::{Friend, Group, GroupAnnouncement, GroupMember},
     messages::{Conversation, Message, MessageElement, Reply},
 };
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -77,7 +78,7 @@ impl Model {
             return String::new();
         };
         let preview = if self.is_recalled(message) {
-            "[已撤回]".into()
+            t!("common.recalled").into_owned()
         } else {
             summary(&message.elements)
         };
@@ -467,16 +468,16 @@ pub fn summary(elements: &[MessageElement]) -> String {
         .map(|element| match element {
             MessageElement::Text(text) => text.clone(),
             MessageElement::Mention(m) => format!("@{}", m.display),
-            MessageElement::Reply(_) => "[回复] ".into(),
-            MessageElement::Image(_) => "[图片]".into(),
-            MessageElement::Voice(_) => "[语音]".into(),
-            MessageElement::Video(_) => "[视频]".into(),
-            MessageElement::File(f) => format!("[文件] {}", f.name),
-            MessageElement::LightApp(_) => "[卡片]".into(),
-            MessageElement::Forward(_) => "[聊天记录]".into(),
-            MessageElement::GroupFile(f) => format!("[群文件] {}", f.name),
+            MessageElement::Reply(_) => t!("preview.reply").into_owned(),
+            MessageElement::Image(_) => t!("preview.image").into_owned(),
+            MessageElement::Voice(_) => t!("preview.voice").into_owned(),
+            MessageElement::Video(_) => t!("preview.video").into_owned(),
+            MessageElement::File(f) => t!("preview.file", name = f.name).into_owned(),
+            MessageElement::LightApp(_) => t!("preview.card").into_owned(),
+            MessageElement::Forward(_) => t!("preview.forward").into_owned(),
+            MessageElement::GroupFile(f) => t!("preview.group_file", name = f.name).into_owned(),
             MessageElement::Opaque(_) => crate::expressions::Face::from_element(element)
-                .map_or_else(|| "[其他消息]".into(), |face| face.text()),
+                .map_or_else(|| t!("preview.other").into_owned(), |face| face.text()),
         })
         .collect::<String>()
 }
