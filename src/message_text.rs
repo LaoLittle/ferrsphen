@@ -6,7 +6,11 @@ use gpui_kit::{
     component::ActiveTheme,
     *,
 };
-use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+};
 
 #[derive(Default)]
 struct Projection {
@@ -29,7 +33,8 @@ impl Projection {
 pub struct SelectionState {
     handle: TextSelectionHandle,
     projection: Rc<RefCell<Projection>>,
-    registered_layout: RefCell<Option<TextLayout>>,
+    registered_bounds: Cell<Option<Bounds<Pixels>>>,
+    retained_text: RefCell<Option<StyledText>>,
     _subscription: Subscription,
 }
 impl SelectionState {
@@ -73,7 +78,8 @@ impl SelectionState {
         Self {
             handle,
             projection,
-            registered_layout: RefCell::new(None),
+            registered_bounds: Cell::new(None),
+            retained_text: RefCell::new(None),
             _subscription: subscription,
         }
     }
@@ -131,14 +137,6 @@ fn document_order(origin: Point<Pixels>) -> u64 {
         }
     };
     (u64::from(ordered(origin.y)) << 32) | u64::from(ordered(origin.x))
-}
-
-fn same_layout(previous: &TextLayout, current: &TextLayout) -> bool {
-    previous.bounds() == current.bounds() && previous.line_height() == current.line_height() && {
-        let before = previous.line_layouts();
-        let after = current.line_layouts();
-        before.len() == after.len() && before.iter().zip(&after).all(|(a, b)| Arc::ptr_eq(a, b))
-    }
 }
 
 #[cfg(all(test, feature = "ui-tests"))]
@@ -230,11 +228,15 @@ impl Element for MessageText {
                         .handle
                         .set_fallback_copy_text(self.content.clone(), cx);
                     state.projection.borrow_mut().content = self.content.clone();
-                    *state.registered_layout.borrow_mut() = None;
+                    state.registered_bounds.set(None);
+                    state.retained_text.borrow_mut().take();
                 }
                 (state.clone(), state)
             },
         );
+        if let Some(text) = state.retained_text.borrow_mut().take() {
+            self.text = text;
+        }
         #[cfg(all(test, feature = "ui-tests"))]
         if let Some(probe) = &self.probe {
             *probe.borrow_mut() = Some(state.clone());
@@ -273,14 +275,10 @@ impl Element for MessageText {
             // Keep native runs for word/line hit testing, but avoid its per-character
             // projection during desktop drags. Only the two endpoints need hit testing.
             if !snapshot.is_some_and(|snapshot| snapshot.is_selecting())
-                && state
-                    .registered_layout
-                    .borrow()
-                    .as_ref()
-                    .is_none_or(|previous| !same_layout(previous, self.text.layout()))
+                && state.registered_bounds.get() != Some(bounds)
             {
                 handle.update_runs(&runs, cx);
-                *state.registered_layout.borrow_mut() = Some(self.text.layout().clone());
+                state.registered_bounds.set(Some(bounds));
             }
             project_range(
                 snapshot,
@@ -326,6 +324,9 @@ impl Element for MessageText {
         state
             .handle
             .paint_touch_handles(&prepaint.1, cx.theme().primary, window, cx);
+        // Native hit-test runs share this layout, so keep it current across frames.
+        *state.retained_text.borrow_mut() =
+            Some(std::mem::replace(&mut self.text, StyledText::new("")));
     }
 }
 

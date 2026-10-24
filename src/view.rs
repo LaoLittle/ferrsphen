@@ -921,7 +921,14 @@ impl AppView {
         view
     }
     fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = cx.entity().downgrade();
         self._subscriptions = vec![
+            cx.on_window_closed(move |cx, closed| {
+                let owner = owner.clone();
+                cx.defer(move |cx| {
+                    let _ = owner.update(cx, |this, cx| this.release_child_window(closed, cx));
+                });
+            }),
             cx.observe(&self.voice_player, |_, _, cx| cx.notify()),
             cx.subscribe_in(&self.search, window, |_, _, _: &InputEvent, _, cx| {
                 cx.notify()
@@ -958,6 +965,42 @@ impl AppView {
                 },
             ),
         ];
+    }
+    fn release_child_window(&mut self, closed: WindowId, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self
+            .viewer_window
+            .is_some_and(|window| window.window_id() == closed)
+        {
+            self.viewer_window = None;
+            self.viewer = None;
+            changed = true;
+        }
+        if self
+            .forward_window
+            .is_some_and(|window| window.window_id() == closed)
+        {
+            self.forward_window = None;
+            self.forward = None;
+            self.forward_key = None;
+            self.forward_error = None;
+            self.forward_scroll = ScrollHandle::new();
+            if self.reply_jump.as_ref().is_some_and(|jump| jump.read_only) {
+                self.reply_jump = None;
+            }
+            changed = true;
+        }
+        self.video_windows.retain(|_, window| {
+            if window.window_id() == closed {
+                changed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if changed {
+            cx.notify();
+        }
     }
     fn desired_window(&self) -> crate::window_chrome::AppWindowKind {
         if matches!(self.phase, Phase::Chat) {
@@ -9361,6 +9404,10 @@ mod ui_tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(cx.windows().len(), 1);
+        cx.update(|cx| {
+            assert!(view.read(cx).viewer_window.is_none());
+            assert!(view.read(cx).viewer.is_none());
+        });
         cx.update_window(main, |_, window, cx| {
             view.update(cx, |view, cx| {
                 let reference =
@@ -9391,6 +9438,38 @@ mod ui_tests {
         let forward = cx.update(|cx| view.read(cx).forward_window.unwrap());
         assert_eq!(cx.windows().len(), 2);
         draw(cx, forward);
+        cx.update_window(forward, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.forward_window.is_none());
+            assert!(view.forward.is_none());
+        });
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.open_video(
+                    "closing-video".into(),
+                    MediaReference::new(MediaKind::Video, MediaConversation::Group { uin: 42 }),
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        let video = cx.update(|cx| view.read(cx).video_windows["closing-video"]);
+        cx.update_window(video, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.video_windows.is_empty());
+                view.video_results
+                    .insert("closing-video".into(), Err("late download".into()));
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
     }
     #[gpui::test]
     fn visible_recall_animates_once_and_navigation_does_not_replay_it(cx: &mut TestAppContext) {

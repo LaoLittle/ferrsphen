@@ -29,7 +29,12 @@ fn init_with_logger(root: &Path, preserve_native_logger: bool) -> Result<PathBuf
     let console_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(console_filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .with_filter(console_filter),
+        )
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
