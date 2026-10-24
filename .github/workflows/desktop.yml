@@ -183,12 +183,14 @@ jobs:
           exec "$compiler" "$@"
           SH
           cat > "$context/Dockerfile" <<'DOCKERFILE'
-          FROM rust:1-trixie
+          # Start without buildpack-deps' host development libraries so target
+          # headers do not collide with non-coinstallable host package files.
+          FROM rust:1-slim-trixie
           RUN dpkg --add-architecture riscv64 \
               && apt-get update \
               && apt-get install -y --no-install-recommends \
                  gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
-                 clang cmake pkg-config nasm perl \
+                 build-essential clang cmake pkg-config nasm perl git curl ca-certificates \
                  libfontconfig-dev:riscv64 libfreetype-dev:riscv64 libwayland-dev:riscv64 \
                  libxkbcommon-x11-dev:riscv64 libx11-xcb-dev:riscv64 libssl-dev:riscv64 \
                  libzstd-dev:riscv64 libasound2-dev:riscv64 libudev-dev:riscv64 libvulkan-dev:riscv64 \
@@ -209,7 +211,7 @@ jobs:
           WORKDIR /workspace/ferrsphen
           CMD ["cargo", "build", "--profile", "app-release", "--bin", "ferrsphen", "--target", "riscv64gc-unknown-linux-gnu"]
           DOCKERFILE
-          docker build -t ferrsphen-riscv64 "$context"
+          docker build --progress=plain -t ferrsphen-riscv64 "$context"
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" \
             -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
       - name: Restore RISC-V build ownership
