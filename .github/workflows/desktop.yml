@@ -209,6 +209,15 @@ jobs:
           docker build -t ferrsphen-riscv64 "$context"
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" \
             -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
+      - name: Restore RISC-V build ownership
+        if: always() && matrix.cross
+        run: |
+          build_owner="$(id -u):$(id -g)"
+          for path in target Cargo.lock "$GITHUB_WORKSPACE/.cargo-riscv64"; do
+            if [[ -e "$path" ]]; then
+              sudo chown -R "$build_owner" "$path"
+            fi
+          done
       - name: Package and verify architecture
         run: |
           python - <<'PY'

@@ -1,4 +1,11 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+    {
+        // rav1d assembly references exported Rust tables with PC-relative relocations.
+        // Bind definitions locally inside the cdylib to prevent symbol preemption.
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-Bsymbolic");
+    }
     println!("cargo:rerun-if-changed=src/proto");
     println!("cargo:rerun-if-changed=locales");
     let mut config = prost_build::Config::new();
