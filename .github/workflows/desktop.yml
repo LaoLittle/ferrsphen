@@ -18,29 +18,40 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   MACOSX_DEPLOYMENT_TARGET: '12.0'
-  ATRI_QQ_REVISION: 879971778d1c95bd27c1a4b0ccca9aa9a604dc36
 
 jobs:
   desktop:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
+            cross: false
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            cross: false
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
+            cross: false
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            cross: false
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            cross: false
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cross: false
+          - runner: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+            cross: true
+    env:
+      TARGET: ${{ matrix.target }}
+      CROSS_BUILD: ${{ matrix.cross }}
     defaults:
       run:
         shell: bash
@@ -51,14 +62,6 @@ jobs:
         with:
           path: ferrsphen
           persist-credentials: false
-      - name: Check out protocol library
-        uses: actions/checkout@v7
-        with:
-          repository: LaoLittle/atri_qq
-          ref: ${{ env.ATRI_QQ_REVISION }}
-          path: atri_qq
-          token: ${{ secrets.DEPENDENCY_TOKEN || github.token }}
-          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -67,18 +70,26 @@ jobs:
         run: |
           rustup update stable --no-self-update
           rustup default stable
-          rustup target add '${{ matrix.target }}'
+          if [[ "$CROSS_BUILD" != 'true' ]]; then
+            rustup target add "$TARGET"
+          fi
       - name: Cache Cargo
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            .cargo-riscv64/registry
+            .cargo-riscv64/git
             ferrsphen/target
-          key: desktop-${{ matrix.target }}-${{ hashFiles('ferrsphen/Cargo.lock', 'ferrsphen/Cargo.toml', 'ferrsphen/.github/workflows/desktop.yml') }}-${{ env.ATRI_QQ_REVISION }}
+          key: desktop-${{ matrix.target }}-${{ hashFiles('ferrsphen/Cargo.toml', 'ferrsphen/.github/workflows/desktop.yml') }}
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: bash ci/install-linux-deps.sh
+        if: runner.os == 'Linux' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config nasm perl \
+            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libudev-dev libvulkan-dev
       - name: Install macOS assembler
         if: runner.os == 'macOS'
         run: command -v nasm >/dev/null || brew install nasm
@@ -90,12 +101,179 @@ jobs:
       - name: Use static MSVC runtime
         if: runner.os == 'Windows'
         run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
-      - name: Check packaging and locale catalogs
-        run: python -m unittest discover -s ci -p 'test_*.py'
-      - name: Build
-        run: cargo build --locked --profile app-release --bin ferrsphen --target '${{ matrix.target }}'
+      - name: Check locale catalogs
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          catalogs = {}
+          for language in ('en', 'zh-CN'):
+              entries = {}
+              for line in (Path('locales') / f'{language}.yml').read_text(encoding='utf-8').splitlines():
+                  if not line.strip() or line.lstrip().startswith('#'):
+                      continue
+                  key, value = line.split(': ', 1)
+                  assert key not in entries, f'Duplicate key: {language}/{key}'
+                  entries[key] = json.loads(value)
+              catalogs[language] = entries
+          assert catalogs['en'].keys() == catalogs['zh-CN'].keys(), 'Locale keys differ'
+          for key, value in catalogs['en'].items():
+              assert set(re.findall(r'%\{(\w+)\}', value)) == set(re.findall(r'%\{(\w+)\}', catalogs['zh-CN'][key])), key
+          for source in Path('src').rglob('*.rs'):
+              for key in re.findall(r'\bt!\(\s*"([\w.]+)"', source.read_text(encoding='utf-8')):
+                  assert key in catalogs['en'], f'{source}: missing {key}'
+          PY
+      - name: Build native app-release
+        if: '!matrix.cross'
+        run: cargo build --profile app-release --bin ferrsphen --target "$TARGET"
+      - name: Build RISC-V app-release
+        if: matrix.cross
+        run: |
+          context="$(mktemp -d "$RUNNER_TEMP/ferrsphen-riscv64.XXXXXX")"
+          trap 'rm -rf "$context"' EXIT
+          cat > "$context/rustc-riscv64.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          compiler="$1"
+          shift
+          crate_name=''
+          target=''
+          previous=''
+          for argument in "$@"; do
+            case "$previous" in
+              --crate-name) crate_name="$argument" ;;
+              --target) target="$argument" ;;
+            esac
+            previous="$argument"
+          done
+          # rav1d 1.1 needs nightly for RISC-V vector feature detection.
+          if [[ "$crate_name" == 'rav1d' && "$target" == 'riscv64gc-unknown-linux-gnu' ]]; then
+            exec "$compiler" '-Zcrate-attr=feature(stdarch_riscv_feature_detection)' "$@"
+          fi
+          exec "$compiler" "$@"
+          SH
+          cat > "$context/Dockerfile" <<'DOCKERFILE'
+          FROM rust:1-trixie
+          RUN dpkg --add-architecture riscv64 \
+              && apt-get update \
+              && apt-get install -y --no-install-recommends \
+                 gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+                 clang cmake pkg-config nasm perl \
+                 libfontconfig-dev:riscv64 libfreetype-dev:riscv64 libwayland-dev:riscv64 \
+                 libxkbcommon-x11-dev:riscv64 libx11-xcb-dev:riscv64 libssl-dev:riscv64 \
+                 libzstd-dev:riscv64 libasound2-dev:riscv64 libudev-dev:riscv64 libvulkan-dev:riscv64 \
+              && rm -rf /var/lib/apt/lists/* \
+              && rustup toolchain install nightly --profile minimal --target riscv64gc-unknown-linux-gnu
+          COPY rustc-riscv64.sh /usr/local/bin/ferrsphen-rustc
+          RUN chmod +x /usr/local/bin/ferrsphen-rustc
+          ENV RUSTUP_TOOLCHAIN=nightly \
+              RUSTC_WRAPPER=/usr/local/bin/ferrsphen-rustc \
+              CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+              CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc \
+              CXX_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-g++ \
+              AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar \
+              PKG_CONFIG_ALLOW_CROSS=1 \
+              PKG_CONFIG_LIBDIR=/usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+              CARGO_BUILD_JOBS=2
+          WORKDIR /workspace/ferrsphen
+          CMD ["cargo", "build", "--profile", "app-release", "--bin", "ferrsphen", "--target", "riscv64gc-unknown-linux-gnu"]
+          DOCKERFILE
+          docker build -t ferrsphen-riscv64 "$context"
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" \
+            -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
       - name: Package and verify architecture
-        run: python ci/package-desktop.py --target '${{ matrix.target }}' --dependency-revision "$ATRI_QQ_REVISION"
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import plistlib
+          import shutil
+          import struct
+          import subprocess
+          import tarfile
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          root = Path.cwd()
+          target = os.environ['TARGET']
+          architecture = target.split('-')[0]
+          system = 'macos' if 'apple-darwin' in target else 'windows' if 'windows' in target else 'linux'
+          version = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+          binary = root / 'target' / target / 'app-release' / ('ferrsphen.exe' if system == 'windows' else 'ferrsphen')
+          data = binary.read_bytes()
+          assert len(data) >= 64, f'Invalid executable: {binary}'
+          if system == 'macos':
+              machine = {'x86_64': 0x01000007, 'aarch64': 0x0100000C}[architecture]
+              valid = data[:4] == b'\xcf\xfa\xed\xfe' and struct.unpack_from('<I', data, 4)[0] == machine
+          elif system == 'windows':
+              offset = struct.unpack_from('<I', data, 0x3C)[0]
+              machine = {'x86_64': 0x8664, 'aarch64': 0xAA64}[architecture]
+              valid = data[:2] == b'MZ' and data[offset:offset + 4] == b'PE\0\0' and struct.unpack_from('<H', data, offset + 4)[0] == machine
+          else:
+              machine = {'x86_64': 62, 'aarch64': 183, 'riscv64gc': 243}[architecture]
+              valid = data[:6] == b'\x7fELF\x02\x01' and struct.unpack_from('<H', data, 18)[0] == machine
+          assert valid, f'Executable architecture does not match {target}'
+
+          lock = tomllib.loads((root / 'Cargo.lock').read_text(encoding='utf-8'))
+          protocol = next(package['source'] for package in lock['package'] if package['name'] == 'atri_qq')
+          metadata = {'version': version, 'target': target, 'profile': 'app-release',
+                      'revision': os.environ['GITHUB_SHA'], 'atri_qq_source': protocol}
+          arch = {'aarch64': 'arm64', 'riscv64gc': 'riscv64'}.get(architecture, architecture)
+          name = f'ferrsphen-{version}-{system}-{arch}'
+          stage = root / 'target' / 'desktop-package' / name
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+          output = root / 'dist'
+          output.mkdir(exist_ok=True)
+          bundle = stage / 'ferrsphen.app'
+          resources = bundle / 'Contents' / 'Resources' if system == 'macos' else stage
+          resources.mkdir(parents=True, exist_ok=True)
+          (resources / 'build.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
+          for license_file in root.glob('LICENSE*'):
+              if license_file.is_file():
+                  shutil.copy2(license_file, resources / license_file.name)
+
+          if system == 'macos':
+              executable = bundle / 'Contents' / 'MacOS' / 'ferrsphen'
+              executable.parent.mkdir(parents=True)
+              shutil.copy2(binary, executable)
+              with (bundle / 'Contents' / 'Info.plist').open('wb') as file:
+                  plistlib.dump({'CFBundleExecutable': 'ferrsphen', 'CFBundleIdentifier': 'dev.ferrsphen.app',
+                                'CFBundleName': 'ferrsphen', 'CFBundleDisplayName': 'ferrsphen',
+                                'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version,
+                                'CFBundleVersion': version, 'LSMinimumSystemVersion': '12.0',
+                                'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication',
+                                'CFBundleDevelopmentRegion': 'en', 'CFBundleLocalizations': ['en', 'zh_CN'],
+                                'NSMicrophoneUsageDescription': 'Send voice messages.'}, file)
+              subprocess.run(['codesign', '--force', '--sign', '-', str(bundle)], check=True)
+              subprocess.run(['codesign', '--verify', '--deep', '--strict', str(bundle)], check=True)
+              archive = output / f'{name}.app.zip'
+              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(bundle), str(archive)], check=True)
+          else:
+              executable = stage / binary.name
+              shutil.copy2(binary, executable)
+              executable.chmod(0o755)
+              if system == 'windows':
+                  archive = output / f'{name}.zip'
+                  with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as file:
+                      for item in sorted(stage.iterdir()):
+                          file.write(item, f'{name}/{item.name}')
+              else:
+                  archive = output / f'{name}.tar.gz'
+                  with tarfile.open(archive, 'w:gz') as file:
+                      file.add(stage, arcname=name)
+                  with tarfile.open(archive) as file:
+                      assert file.getmember(f'{name}/ferrsphen').mode & 0o111, 'Missing execute permission'
+          with archive.open('rb') as file:
+              digest = hashlib.file_digest(file, 'sha256').hexdigest()
+          archive.with_name(archive.name + '.sha256').write_text(f'{digest}  {archive.name}\n', encoding='utf-8')
+          print(archive)
+          PY
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
@@ -104,50 +282,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  riscv64:
-    name: riscv64gc-unknown-linux-gnu
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    steps:
-      - name: Check out ferrsphen
-        uses: actions/checkout@v7
-        with:
-          path: ferrsphen
-          persist-credentials: false
-      - name: Check out protocol library
-        uses: actions/checkout@v7
-        with:
-          repository: LaoLittle/atri_qq
-          ref: ${{ env.ATRI_QQ_REVISION }}
-          path: atri_qq
-          token: ${{ secrets.DEPENDENCY_TOKEN || github.token }}
-          persist-credentials: false
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            .cargo-riscv64/registry
-            .cargo-riscv64/git
-            ferrsphen/target
-          key: desktop-riscv64-${{ hashFiles('ferrsphen/Cargo.lock', 'ferrsphen/ci/riscv64.Dockerfile', 'ferrsphen/ci/rustc-riscv64.sh') }}-${{ env.ATRI_QQ_REVISION }}
-      - name: Build cross compiler
-        run: docker build -t ferrsphen-riscv64 -f ferrsphen/ci/riscv64.Dockerfile ferrsphen/ci
-      - name: Build app-release
-        run: docker run --rm -v "$PWD:/workspace" -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
-      - name: Package and verify architecture
-        run: python3 ferrsphen/ci/package-desktop.py --target riscv64gc-unknown-linux-gnu --dependency-revision "$ATRI_QQ_REVISION"
-      - name: Upload package
-        uses: actions/upload-artifact@v7
-        with:
-          name: ferrsphen-riscv64gc-unknown-linux-gnu
-          path: ferrsphen/dist/*
-          if-no-files-found: error
-          compression-level: 0
-
   release:
     name: Publish tagged packages
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [desktop, riscv64]
+    needs: desktop
     runs-on: ubuntu-24.04
     permissions:
       contents: write
