@@ -51,6 +51,7 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 
 [dev-dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["test-support"] }
 log = "0.4"
 async-trait = "0.1"
 bytes = "1"
@@ -79,3 +80,7 @@ opt-level = 3
 strip = true
 panic = "abort"
 codegen-units = 1
+
+[[example]]
+name = "screenshot"
+required-features = ["ui-tests"]
