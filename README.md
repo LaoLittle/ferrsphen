@@ -3,7 +3,6 @@
 </p>
 
 <h1 align="center">Ferrsphen</h1>
-<p align="center">Yet another QQ client</p>
 
 Ferrsphen 是一个使用 Rust 与 GPUI 编写的跨平台 [IM](https://en.wikipedia.org/wiki/Instant_messaging) 客户端，支持 **macOS、Windows 和 Linux**。
 
