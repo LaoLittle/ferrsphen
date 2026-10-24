@@ -98,6 +98,28 @@ jobs:
         run: |
           choco install nasm --yes --no-progress
           echo 'C:/Program Files/NASM' >> "$GITHUB_PATH"
+      - name: Configure Windows Perl
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $perl = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path -LiteralPath $perl)) {
+            choco install strawberryperl --yes --no-progress
+            if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
+              throw "Strawberry Perl installation failed: $LASTEXITCODE"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $perl)) {
+            throw "Windows Perl not found: $perl"
+          }
+          & $perl '-MLocale::Maketext::Simple' '-MIPC::Cmd' '-e' 'die "Expected Windows Perl\n" unless $^O eq "MSWin32"; print "Perl $] ($^O): OpenSSL prerequisites available\n";'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Windows Perl is missing OpenSSL prerequisites'
+          }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Split-Path -Parent $perl) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Use static MSVC runtime
         if: runner.os == 'Windows'
         run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
@@ -126,8 +148,12 @@ jobs:
                   assert key in catalogs['en'], f'{source}: missing {key}'
           PY
       - name: Build native app-release
-        if: '!matrix.cross'
+        if: runner.os != 'Windows' && !matrix.cross
         run: cargo build --profile app-release --bin ferrsphen --target "$TARGET"
+      - name: Build Windows app-release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --profile app-release --bin ferrsphen --target $env:TARGET
       - name: Build RISC-V app-release
         if: matrix.cross
         run: |
