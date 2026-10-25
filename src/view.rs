@@ -32,7 +32,20 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-const REACTION_CHOICES: [u32; 12] = [66, 76, 77, 13, 0, 32, 28, 5, 21, 49, 89, 79];
+const REACTION_CHOICES: [u32; 6] = [66, 76, 77, 28, 0, 32];
+
+struct MessageContext {
+    window: WindowId,
+    read_only: bool,
+    message: Message,
+    anchor: Bounds<Pixels>,
+    menu: Entity<PopupMenu>,
+    _dismiss: Subscription,
+}
+struct ReactionChooser {
+    message: Message,
+    position: Point<Pixels>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -142,6 +155,12 @@ struct ConversationSwitch {
     started: Instant,
     entering: bool,
 }
+struct RetiringWindow;
+impl Render for RetiringWindow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().bg(cx.theme().background)
+    }
+}
 struct DetailWindow {
     owner: Entity<AppView>,
     kind: DetailKind,
@@ -149,18 +168,25 @@ struct DetailWindow {
 }
 impl Render for DetailWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = self.owner.update(cx, |owner, cx| match self.kind {
-            DetailKind::Image => {
-                if owner.viewer.is_some() {
-                    owner.image_viewer(window, cx)
-                } else {
-                    div().into_any_element()
+        let content = self.owner.update(cx, |owner, cx| {
+            let content = match self.kind {
+                DetailKind::Image => {
+                    if owner.viewer.is_some() {
+                        owner.image_viewer(window, cx)
+                    } else {
+                        div().into_any_element()
+                    }
                 }
-            }
-            DetailKind::Forward => {
-                owner.advance_reply_jump(true, window, cx);
-                owner.forward_view(window, cx)
-            }
+                DetailKind::Forward => {
+                    owner.advance_reply_jump(true, window, cx);
+                    owner.forward_view(window, cx)
+                }
+            };
+            div()
+                .relative()
+                .size_full()
+                .child(content)
+                .child(owner.message_context_overlay(window, cx))
         });
         ferrsphen::window_chrome::surface(content, window, cx)
     }
@@ -215,6 +241,12 @@ pub struct AppView {
     poke_notices: HashMap<String, Vec<(Option<String>, String)>>,
     pending_pokes: Vec<crate::activity::ActivityRecord>,
     pending_reactions: HashSet<crate::activity::ReactionKey>,
+    reaction_playbacks:
+        HashMap<crate::activity::ReactionKey, Rc<RefCell<crate::emoji_image::OncePlayback>>>,
+    local_reaction_feedback: HashSet<crate::activity::ReactionKey>,
+    reaction_chooser: Option<ReactionChooser>,
+    message_context: Option<MessageContext>,
+    message_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     compose_cache: tempfile::TempDir,
     pending_copy: Option<PendingCopy>,
     draft_contents: HashMap<String, gpui_kit::component::input::InputContent>,
@@ -909,6 +941,11 @@ impl AppView {
             poke_notices: HashMap::new(),
             pending_pokes: Vec::new(),
             pending_reactions: HashSet::new(),
+            reaction_playbacks: HashMap::new(),
+            local_reaction_feedback: HashSet::new(),
+            reaction_chooser: None,
+            message_context: None,
+            message_bounds: Rc::new(RefCell::new(HashMap::new())),
             compose_cache: tempfile::tempdir().expect("draft cache"),
             pending_copy: None,
             draft_contents: HashMap::new(),
@@ -1009,6 +1046,14 @@ impl AppView {
     fn release_child_window(&mut self, closed: WindowId, cx: &mut Context<Self>) {
         let mut changed = false;
         if self
+            .message_context
+            .as_ref()
+            .is_some_and(|context| context.window == closed)
+        {
+            self.message_context = None;
+            changed = true;
+        }
+        if self
             .viewer_window
             .is_some_and(|window| window.window_id() == closed)
         {
@@ -1078,6 +1123,10 @@ impl AppView {
             );
             match result {
                 Ok((handle, _)) => {
+                    let _ = previous.update(cx, |_, window, cx| {
+                        window.disable_focus(cx);
+                        window.replace_root(cx, |_, _| RetiringWindow);
+                    });
                     let _ = handle.update(cx, |_, window, cx| {
                         window.activate_window();
                         owner.update(cx, |this, cx| {
@@ -1088,7 +1137,38 @@ impl AppView {
                             cx.notify();
                         });
                     });
-                    let _ = previous.update(cx, |_, window, _| window.remove_window());
+                    // A deferred effect may still run inside the platform's frame callback.
+                    // Retire on a later executor turn, after native deactivation is delivered.
+                    cx.spawn(async move |cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1))
+                                .await;
+                            let ready = previous.update(cx, |_, window, cx| {
+                                !window.is_window_active()
+                                    || !cx.windows().iter().any(|candidate| {
+                                        candidate.window_id() == handle.window_id()
+                                    })
+                            });
+                            match ready {
+                                Ok(true) => {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(1))
+                                        .await;
+                                    let _ =
+                                        previous.update(cx, |_, window, _| window.remove_window());
+                                    break;
+                                }
+                                Ok(false) => {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(16))
+                                        .await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .detach();
                 }
                 Err(error) => {
                     tracing::error!(?error, "switch application window failed");
@@ -1318,7 +1398,11 @@ impl AppView {
                 code,
                 result,
             } => {
-                self.pending_reactions.remove(&(group, sequence, code));
+                let key = (group, sequence, code);
+                self.pending_reactions.remove(&key);
+                if result.is_err() {
+                    self.local_reaction_feedback.remove(&key);
+                }
                 match result {
                     Ok(record) => self.apply_activity(record),
                     Err(error) => self.error = Some(error),
@@ -1388,6 +1472,8 @@ impl AppView {
                     self.poke_notices.clear();
                     self.pending_pokes.clear();
                     self.pending_reactions.clear();
+                    self.local_reaction_feedback.clear();
+                    self.reaction_playbacks.clear();
                     self.pending_copy = None;
                     self.draft_contents.clear();
                     self.transition = None;
@@ -1587,7 +1673,16 @@ impl AppView {
                 Err(error) => tracing::warn!(%uid, %error, "resolve avatar UIN failed"),
             },
             Update::AssetFailed { key } => {
-                self.failed_assets.insert(key);
+                self.failed_assets.insert(key.clone());
+                if key.starts_with("face:noto:")
+                    && let Some(face) = crate::expressions::FACES
+                        .iter()
+                        .map(|&(id, _)| crate::expressions::Face::new(id))
+                        .find(|face| face.asset_key() == key)
+                    && let Some(url) = face.fallback_image_url()
+                {
+                    self.asset(face.fallback_asset_key(), url);
+                }
             }
             Update::Asset { key, path } => {
                 self.failed_assets.remove(&key);
@@ -2611,7 +2706,10 @@ impl AppView {
     }
     fn request_face(&mut self, face: &crate::expressions::Face) {
         if let Some(url) = face.image_url() {
-            self.asset(format!("face:{}", face.id), url);
+            self.asset(face.asset_key(), url);
+        }
+        if let Some(url) = face.poster_url() {
+            self.asset(face.poster_asset_key(), url);
         }
     }
     fn face_image(&self, face: &crate::expressions::Face) -> AnyElement {
@@ -2797,18 +2895,38 @@ impl AppView {
                                             );
                                             this.asset(key.clone(), item.url);
                                             let path = this.assets.get(&key).cloned();
-                                            let preview =
-                                                ferrsphen::image_loading::LoadingImage::new(
-                                                    SharedString::from(format!(
-                                                        "favorite-image:{key}"
-                                                    )),
-                                                    path.clone(),
-                                                )
-                                                .failed(this.failed_assets.contains(&key))
+                                            let preview = div()
                                                 .absolute()
                                                 .left(px(3.))
                                                 .top(px(3.))
-                                                .size(px(46.));
+                                                .size(px(46.))
+                                                .rounded_md()
+                                                .overflow_hidden()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(if let Some(path) = &path {
+                                                    crate::emoji_image::EmojiImage::new(
+                                                        SharedString::from(format!(
+                                                            "favorite-image:{key}"
+                                                        )),
+                                                        Some(path.clone()),
+                                                        String::new(),
+                                                        crate::emoji_image::Playback::Hover,
+                                                    )
+                                                    .edge(px(46.))
+                                                    .with_spinner()
+                                                    .into_any_element()
+                                                } else if this.failed_assets.contains(&key) {
+                                                    div().into_any_element()
+                                                } else {
+                                                    div()
+                                                        .debug_selector(|| {
+                                                            "favorite-spinner".into()
+                                                        })
+                                                        .child(Spinner::new())
+                                                        .into_any_element()
+                                                });
                                             let selector = key.clone();
                                             let mut button =
                                                 Button::new(SharedString::from(key.clone()))
@@ -2862,8 +2980,15 @@ impl AppView {
                         .debug_selector(move || format!("face-choice:{id}"))
                         .ghost()
                         .size(px(43.))
+                        .p_0()
+                        .flex_shrink_0()
+                        .tooltip(face.name.clone())
                         .accessibility_label(face.name.clone())
-                        .child(self.face_image(&face))
+                        .child(face_image_with_playback(
+                            &face,
+                            &self.assets,
+                            crate::emoji_image::Playback::Hover,
+                        ))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.insert_face(face.clone(), window, cx)
                         }))
@@ -3040,8 +3165,55 @@ impl AppView {
         true
     }
     fn apply_activity(&mut self, record: crate::activity::ActivityRecord) {
+        let reaction = match &record.event {
+            crate::activity::ActivityEvent::Notification(PushEvent::Reaction {
+                group_uin,
+                sequence,
+                code,
+                added,
+                operator_uid,
+                ..
+            }) => Some((
+                (*group_uin, *sequence, code.clone()),
+                *added,
+                operator_uid.clone(),
+            )),
+            crate::activity::ActivityEvent::ReactionConfirmed {
+                group,
+                sequence,
+                code,
+                added,
+                operator_uid,
+            } => Some((
+                (*group, *sequence, code.clone()),
+                *added,
+                operator_uid.clone(),
+            )),
+            _ => None,
+        };
+        let existed = reaction.as_ref().is_some_and(|(key, _, actor)| {
+            self.model
+                .reactions
+                .get(key)
+                .is_some_and(|state| state.actors.contains(actor))
+        });
         if !self.model.apply_activity(record.clone()) {
             return;
+        }
+        if let Some((key, added, actor)) = reaction {
+            let own = self
+                .model
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.uid == actor);
+            let locally_played =
+                (own || matches!(
+                    &record.event,
+                    crate::activity::ActivityEvent::ReactionConfirmed { .. }
+                )) && self.local_reaction_feedback.remove(&key);
+            if added && !existed && !locally_played {
+                self.arm_reaction_playback(key);
+            }
         }
         self.display_poke(record);
     }
@@ -4231,7 +4403,12 @@ impl AppView {
                 let reference = reference.clone();
                 let viewer_key = image_key(message, index);
                 let preview = self.assets.get(&image_key(message, index)).cloned();
+                let bounds = self.message_bounds.clone();
+                let bounds_key = image_key(message, index);
                 div()
+                    .on_prepaint(move |rect, _, _| {
+                        bounds.borrow_mut().insert(bounds_key.clone(), rect);
+                    })
                     .relative()
                     .child(
                         ferrsphen::image_loading::LoadingImage::new(
@@ -4267,7 +4444,12 @@ impl AppView {
                                 cx.notify();
                             })),
                     )
-                    .context_menu(self.message_menu(message, cx, read_only, Some(index)))
+                    .map(|body| {
+                        crate::message_context::MessageTrigger::new(
+                            body,
+                            self.message_context_handler(message, cx, read_only, Some(index)),
+                        )
+                    })
                     .into_any_element()
             }
             MessageElement::Video(reference) => {
@@ -4338,7 +4520,12 @@ impl AppView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_video(video_key.clone(), reference.clone(), cx);
                     }))
-                    .context_menu(self.message_menu(message, cx, read_only, Some(index)))
+                    .map(|body| {
+                        crate::message_context::MessageTrigger::new(
+                            body,
+                            self.message_context_handler(message, cx, read_only, Some(index)),
+                        )
+                    })
                     .into_any_element()
             }
             MessageElement::Voice(reference) => {
@@ -4443,7 +4630,12 @@ impl AppView {
                             });
                         }
                     }))
-                    .context_menu(self.message_menu(message, cx, read_only, Some(index)))
+                    .map(|body| {
+                        crate::message_context::MessageTrigger::new(
+                            body,
+                            self.message_context_handler(message, cx, read_only, Some(index)),
+                        )
+                    })
                     .into_any_element()
             }
             MessageElement::File(reference) => {
@@ -4571,7 +4763,13 @@ impl AppView {
             }
             MessageElement::Opaque(value) => {
                 if let Some(face) = crate::expressions::Face::from_element(element) {
-                    return self.face_image(&face);
+                    return div()
+                        .id(SharedString::from(format!(
+                            "inline-face:{}:{index}",
+                            message_key(message)
+                        )))
+                        .child(self.face_image(&face))
+                        .into_any_element();
                 }
                 let text = format!("字段 {}\n{}", value.field, hex::encode(&value.payload));
                 Button::new(SharedString::from(format!("opaque:{key}")))
@@ -4585,6 +4783,332 @@ impl AppView {
             }
         }
     }
+    fn reaction_choice(
+        &self,
+        message: &Message,
+        id: u32,
+        cx: &App,
+        owner: &WeakEntity<Self>,
+        quick: bool,
+    ) -> impl IntoElement {
+        let face = crate::expressions::Face::new(id);
+        let code = id.to_string();
+        let own = self.model.profile.as_ref().map_or("", |p| p.uid.as_str());
+        let selected = self
+            .reaction_keys(message)
+            .iter()
+            .any(|(key, state)| key.2 == code && state.actors.contains(own));
+        let pending = matches!(message.conversation, Conversation::Group { uin } if self.pending_reactions.contains(&(uin, message.sequence, code)));
+        let pressed_owner = owner.clone();
+        let clicked_owner = owner.clone();
+        let pressed_message = message.clone();
+        let clicked_message = message.clone();
+        Button::new(SharedString::from(format!("reaction-choice:{id}")))
+            .debug_selector(move || format!("reaction-choice:{id}"))
+            .ghost()
+            .size(px(36.))
+            .p_0()
+            .flex_shrink_0()
+            .rounded_full()
+            .when(selected, |button| button.bg(cx.theme().accent))
+            .disabled(self.status == "离线" || pending)
+            .tooltip(if selected {
+                t!("reaction.remove_face", name = &face.name)
+            } else {
+                face.name.clone().into()
+            })
+            .accessibility_label(face.name.clone())
+            .child(face_image_with_playback(
+                &face,
+                &self.assets,
+                crate::emoji_image::Playback::Hover,
+            ))
+            // The floating bar is outside the context menu's dismiss bounds.
+            // Commit pointer presses before the menu is removed on mouse-up.
+            .when(quick, |button| {
+                button.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    let _ = pressed_owner.update(cx, |this, cx| {
+                        this.toggle_reaction(&pressed_message, id.to_string(), cx)
+                    });
+                })
+            })
+            .on_click(move |event, window, cx| {
+                if quick && matches!(event, ClickEvent::Mouse(_)) {
+                    return;
+                }
+                cx.stop_propagation();
+                let _ = clicked_owner.update(cx, |this, cx| {
+                    this.toggle_reaction(&clicked_message, id.to_string(), cx);
+                    this.reaction_chooser = None;
+                    cx.notify();
+                });
+                window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+            })
+    }
+    fn reaction_bar(
+        &self,
+        message: &Message,
+        anchor: Bounds<Pixels>,
+        cx: &App,
+        owner: &WeakEntity<Self>,
+    ) -> AnyElement {
+        let pressed_owner = owner.clone();
+        let clicked_owner = owner.clone();
+        let pressed_message = message.clone();
+        let clicked_message = message.clone();
+        let position = anchor.bottom_right();
+        div()
+            .debug_selector(|| "reaction-panel".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .p_1()
+                    .rounded_full()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .shadow_md()
+                    .children(
+                        REACTION_CHOICES
+                            .into_iter()
+                            .map(|id| self.reaction_choice(message, id, cx, owner, true)),
+                    ),
+            )
+            .child(
+                Button::new("reaction-more")
+                    .debug_selector(|| "reaction-more".into())
+                    .ghost()
+                    .size(px(40.))
+                    .rounded_full()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .shadow_md()
+                    .icon(gpui_kit::assets::IconName::FaceGrinning)
+                    .tooltip(t!("expressions.title"))
+                    .accessibility_label(t!("expressions.title"))
+                    .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        cx.stop_propagation();
+                        let _ = pressed_owner.update(cx, |this, cx| {
+                            this.open_reaction_chooser(pressed_message.clone(), event.position, cx)
+                        });
+                    })
+                    .on_click(move |event, _, cx| {
+                        if matches!(event, ClickEvent::Mouse(_)) {
+                            return;
+                        }
+                        let _ = clicked_owner.update(cx, |this, cx| {
+                            this.open_reaction_chooser(clicked_message.clone(), position, cx)
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+    fn open_reaction_chooser(
+        &mut self,
+        message: Message,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_react(&message, false) {
+            return;
+        }
+        self.reaction_chooser = Some(ReactionChooser { message, position });
+        for &(id, _) in crate::expressions::FACES {
+            self.request_face(&crate::expressions::Face::new(id));
+        }
+        cx.notify();
+    }
+    fn full_reaction_chooser(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(chooser) = &self.reaction_chooser else {
+            return div().into_any_element();
+        };
+        let owner = cx.entity().downgrade();
+        let changed = owner.clone();
+        let message = chooser.message.clone();
+        let content_owner = owner.clone();
+        div()
+            .absolute()
+            .left(chooser.position.x)
+            .top(chooser.position.y)
+            .size_0()
+            .child(
+                Popover::new("full-reaction-chooser")
+                    .anchor(Anchor::TopRight)
+                    .open(true)
+                    .on_open_change(move |open, _, cx| {
+                        if !*open {
+                            let _ = changed.update(cx, |this, cx| {
+                                this.reaction_chooser = None;
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .trigger(Button::new("reaction-anchor").size(px(0.)).opacity(0.))
+                    .content(move |_, _, _cx| {
+                        let message = message.clone();
+                        let owner = content_owner.clone();
+                        let rows = crate::expressions::FACES.len().div_ceil(7);
+                        uniform_list("all-reactions", rows, move |range, _, cx| {
+                            owner
+                                .update(cx, |this, cx| {
+                                    range
+                                        .map(|row| {
+                                            div().flex().gap_1().children(
+                                                crate::expressions::FACES
+                                                    .iter()
+                                                    .skip(row * 7)
+                                                    .take(7)
+                                                    .map(|&(id, _)| {
+                                                        this.reaction_choice(
+                                                            &message, id, cx, &owner, false,
+                                                        )
+                                                    }),
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .debug_selector(|| "reaction-all-panel".into())
+                        .w(px(280.))
+                        .h(px(264.))
+                        .into_any_element()
+                    }),
+            )
+            .into_any_element()
+    }
+    fn message_context_handler(
+        &self,
+        message: &Message,
+        cx: &Context<Self>,
+        read_only: bool,
+        image_index: Option<usize>,
+    ) -> crate::message_context::MenuHandler {
+        let owner = cx.entity().downgrade();
+        let message = message.clone();
+        Rc::new(move |anchor, window, cx| {
+            let owner = owner.clone();
+            let message = message.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    let previous = window.focused(cx);
+                    let build = this.message_menu(&message, cx, read_only, image_index);
+                    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        let menu = if let Some(focus) = previous {
+                            menu.action_context(focus)
+                        } else {
+                            menu
+                        };
+                        build(menu, window, cx)
+                    });
+                    let id = menu.entity_id();
+                    let dismiss =
+                        cx.subscribe_in(&menu, window, move |this, _, _: &DismissEvent, _, cx| {
+                            if this
+                                .message_context
+                                .as_ref()
+                                .is_some_and(|context| context.menu.entity_id() == id)
+                            {
+                                this.message_context = None;
+                                cx.notify();
+                            }
+                        });
+                    menu.focus_handle(cx).focus(window, cx);
+                    this.message_context = Some(MessageContext {
+                        window: window.window_handle().window_id(),
+                        read_only,
+                        message,
+                        anchor,
+                        menu,
+                        _dismiss: dismiss,
+                    });
+                    cx.notify();
+                });
+            });
+        })
+    }
+    fn message_context_overlay(&self, window: &Window, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(context) = self
+            .message_context
+            .as_ref()
+            .filter(|context| context.window == window.window_handle().window_id())
+        else {
+            return div().into_any_element();
+        };
+        let bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let anchor = context.anchor;
+        let hole = anchor.intersect(&bounds);
+        let veil = rgba(0x0000000d);
+        let backdrop = div()
+            .debug_selector(|| "message-context-backdrop".into())
+            .absolute()
+            .inset_0()
+            .size_full()
+            .children(
+                [
+                    Bounds::new(
+                        bounds.origin,
+                        size(bounds.size.width, hole.top().max(px(0.))),
+                    ),
+                    Bounds::new(
+                        point(px(0.), hole.bottom()),
+                        size(
+                            bounds.size.width,
+                            (bounds.bottom() - hole.bottom()).max(px(0.)),
+                        ),
+                    ),
+                    Bounds::new(
+                        point(px(0.), hole.top()),
+                        size(hole.left().max(px(0.)), hole.size.height),
+                    ),
+                    Bounds::new(
+                        point(hole.right(), hole.top()),
+                        size(
+                            (bounds.right() - hole.right()).max(px(0.)),
+                            hole.size.height,
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .map(move |rect| {
+                    div()
+                        .absolute()
+                        .left(rect.left())
+                        .top(rect.top())
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .bg(veil)
+                }),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .child(deferred(backdrop).with_priority(gpui_kit::base::POPUP_PRIORITY - 1))
+            .child(
+                deferred(
+                    gpui_kit::base::Positioner::side(anchor)
+                        .placement(gpui_kit::base::Placement::Bottom)
+                        .align(if context.message.is_self {
+                            gpui_kit::base::Align::End
+                        } else {
+                            gpui_kit::base::Align::Start
+                        })
+                        .offset(px(8.))
+                        .margin(px(8.))
+                        .occlude()
+                        .child(context.menu.clone()),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            )
+            .into_any_element()
+    }
     fn message_menu(
         &self,
         message: &Message,
@@ -4593,6 +5117,9 @@ impl AppView {
         image_index: Option<usize>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + use<> {
         let can_react = self.can_react(message, read_only);
+        let bounds = self.message_bounds.clone();
+        let bounds_key =
+            image_index.map_or_else(|| message_key(message), |index| image_key(message, index));
         let message = message.clone();
         let owner = cx.entity().downgrade();
         let recalled = self.model.is_recalled(&message);
@@ -4642,11 +5169,17 @@ impl AppView {
             let copy_owner = owner.clone();
             let reply_owner = owner.clone();
             let recall_owner = owner.clone();
-            let menu = if can_react {
+            let source = owner.clone();
+            let target = message.clone();
+            let anchor = bounds
+                .borrow()
+                .get(&bounds_key)
+                .copied()
+                .unwrap_or_else(|| Bounds::new(window.mouse_position(), size(px(1.), px(1.))));
+            if can_react {
                 if let Some(entity) = owner.upgrade() {
                     cx.observe(&entity, |_, _, cx| cx.notify()).detach();
                 }
-                let source = owner.clone();
                 let requested = owner.clone();
                 cx.defer(move |cx| {
                     let _ = requested.update(cx, |this, cx| {
@@ -4656,58 +5189,34 @@ impl AppView {
                         cx.notify();
                     });
                 });
-                let target = message.clone();
-                menu.min_w(px(284.)).max_w(px(284.)).item(
-                    PopupMenuItem::element(move |_, cx| {
-                        let Some(entity) = source.upgrade() else {
-                            return div().into_any_element();
-                        };
-                        let this = entity.read(cx);
-                        let own = this.model.profile.as_ref().map_or("", |p| p.uid.as_str());
-                        let choices = REACTION_CHOICES.into_iter().map(|id| {
-                                let face = crate::expressions::Face::new(id);
-                                let code = id.to_string();
-                                let selected = this.reaction_keys(&target).iter().any(|(key, state)| key.2 == code && state.actors.contains(own));
-                                let pending = matches!(target.conversation, Conversation::Group { uin } if this.pending_reactions.contains(&(uin, target.sequence, code.clone())));
-                                let source = source.clone();
-                                let target = target.clone();
-                                Button::new(SharedString::from(format!("reaction-choice:{id}")))
-                                    .debug_selector(move || format!("reaction-choice:{id}"))
-                                    .ghost()
-                                    .size(px(40.))
-                                    .rounded_xl()
-                                    .when(selected, |button| button.bg(cx.theme().accent))
-                                    .disabled(this.status == "离线" || pending)
-                                    .tooltip(if selected { t!("reaction.remove_face", name = &face.name) } else { face.name.clone().into() })
-                                    .accessibility_label(face.name.clone())
-                                    .child(this.face_image(&face))
-                                    .on_click(move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        let _ = source.update(cx, |this, cx| this.toggle_reaction(&target, id.to_string(), cx));
-                                        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
-                                    })
-                        });
-                        div()
-                            .debug_selector(|| "reaction-panel".into())
-                            .w(px(260.))
-                            .py_2()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .bg(cx.theme().popover)
-                            .rounded_xl()
-                            .children(choices)
-                            .into_any_element()
-                    }).disabled(true),
-                ).separator()
-            } else {
-                menu
-            };
+            }
             menu.item(
-                PopupMenuItem::element(|_, _| {
+                PopupMenuItem::element(move |_, cx| {
                     div()
                         .debug_selector(|| "message-menu-reply".into())
                         .child(t!("common.reply"))
+                        .when(can_react, |label| {
+                            let Some(entity) = source.upgrade() else {
+                                return label;
+                            };
+                            let bar = entity.read(cx).reaction_bar(&target, anchor, cx, &source);
+                            label.child(
+                                deferred(
+                                    gpui_kit::base::Positioner::side(anchor)
+                                        .placement(gpui_kit::base::Placement::Top)
+                                        .align(if target.is_self {
+                                            gpui_kit::base::Align::End
+                                        } else {
+                                            gpui_kit::base::Align::Start
+                                        })
+                                        .offset(px(8.))
+                                        .margin(px(8.))
+                                        .occlude()
+                                        .child(bar),
+                                )
+                                .with_priority(gpui_kit::base::POPUP_PRIORITY + 1),
+                            )
+                        })
                 })
                 .disabled(recalled || read_only)
                 .on_click(move |_, window, cx| {
@@ -4878,8 +5387,13 @@ impl AppView {
                 let reference = (*reference).clone();
                 let stack_key = key.clone();
                 let expand_key = key.clone();
-                let menu = self.message_menu(message, cx, read_only, Some(*index));
+                let menu = self.message_context_handler(message, cx, read_only, Some(*index));
+                let bounds = self.message_bounds.clone();
+                let bounds_key = image_key(message, *index);
                 let trigger = div()
+                    .on_prepaint(move |rect, _, _| {
+                        bounds.borrow_mut().insert(bounds_key.clone(), rect);
+                    })
                     .id(SharedString::from(format!("stack-card:{key}:{order}")))
                     .debug_selector({
                         let key = key.clone();
@@ -4989,7 +5503,8 @@ impl AppView {
                         let trigger = if separate_messages && !expanded {
                             trigger.into_any_element()
                         } else {
-                            trigger.context_menu(menu).into_any_element()
+                            crate::message_context::MessageTrigger::new(trigger, menu)
+                                .into_any_element()
                         };
                         card.left(px(left))
                             .top(px(top + 14. * (1. - arrival)))
@@ -5078,6 +5593,34 @@ impl AppView {
         rows.sort_by(|a, b| a.0.2.cmp(&b.0.2));
         rows
     }
+    fn arm_reaction_playback(&mut self, key: crate::activity::ReactionKey) {
+        let visible = self.page == Page::Chat
+            && matches!(self.phase, Phase::Chat)
+            && (!self.phone || self.phone_conversation)
+            && self.transition.is_none()
+            && self.model.selected.as_deref() == Some(format!("group:{}", key.0).as_str())
+            && self
+                .model
+                .messages
+                .get(&format!("group:{}", key.0))
+                .is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.sequence == key.1
+                            && self
+                                .visible_bubbles
+                                .borrow()
+                                .contains_key(&message_key(message))
+                    })
+                });
+        if visible {
+            self.reaction_playbacks.insert(
+                key,
+                Rc::new(RefCell::new(crate::emoji_image::OncePlayback::new(
+                    self.recall_clock.now(),
+                ))),
+            );
+        }
+    }
     fn toggle_reaction(&mut self, message: &Message, code: String, cx: &mut Context<Self>) {
         if !self.can_react(message, false) || self.status == "离线" {
             return;
@@ -5105,14 +5648,28 @@ impl AppView {
             code,
             added,
         }) {
+            if added {
+                self.local_reaction_feedback.insert(key.clone());
+                self.arm_reaction_playback(key.clone());
+            }
             self.pending_reactions.insert(key);
         }
         cx.notify();
     }
-    fn reaction_symbol(&self, code: &str) -> AnyElement {
+    fn reaction_symbol(&self, code: &str, key: &crate::activity::ReactionKey) -> AnyElement {
         if let Ok(id) = code.parse::<u32>() {
             if id < 4096 {
-                return self.face_image(&crate::expressions::Face::new(id));
+                let playback = self
+                    .reaction_playbacks
+                    .get(key)
+                    .cloned()
+                    .map(crate::emoji_image::Playback::Once)
+                    .unwrap_or(crate::emoji_image::Playback::Still);
+                return face_image_with_playback(
+                    &crate::expressions::Face::new(id),
+                    &self.assets,
+                    playback,
+                );
             }
             if let Some(character) = char::from_u32(id) {
                 return div()
@@ -5149,6 +5706,13 @@ impl AppView {
                 .w(px(60.))
                 .h(px(28.))
                 .px_1()
+                .border_1()
+                .border_color(transparent_black())
+                .when(!mine, |button| {
+                    button
+                        .border_color(cx.theme().foreground.opacity(0.18))
+                        .bg(cx.theme().muted.opacity(0.35))
+                })
                 .when(mine, |button| button.bg(cx.theme().accent))
                 .disabled(self.status == "离线" || self.pending_reactions.contains(&key))
                 .tooltip(format!(
@@ -5166,7 +5730,7 @@ impl AppView {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(self.reaction_symbol(&code))
+                        .child(self.reaction_symbol(&code, &key))
                         .child(div().text_xs().child(if state.count > 99 {
                             "99+".into()
                         } else {
@@ -5380,13 +5944,19 @@ impl AppView {
         } else {
             div()
                 .child(body)
-                .context_menu(self.message_menu(message, cx, read_only, None))
+                .map(|body| {
+                    crate::message_context::MessageTrigger::new(
+                        body,
+                        self.message_context_handler(message, cx, read_only, None),
+                    )
+                })
                 .into_any_element()
         };
         let measured = self.bubble_sizes.clone();
         let visible = self.visible_bubbles.clone();
         let scroll = self.scroll.clone();
         let measured_key = key.clone();
+        let message_bounds = self.message_bounds.clone();
         let arrival = (!read_only)
             .then(|| self.message_arrivals.get(&key))
             .flatten();
@@ -5398,6 +5968,9 @@ impl AppView {
             .child(body)
             .on_children_prepainted(move |bounds, _, _| {
                 if let Some(bounds) = bounds.first() {
+                    message_bounds
+                        .borrow_mut()
+                        .insert(measured_key.clone(), *bounds);
                     if let Some(target) = &flight_target {
                         target.set(Some(*bounds));
                     }
@@ -6896,11 +7469,40 @@ impl Render for AppView {
             self.composer
                 .update(cx, |input, cx| input.set_submit_on_enter(!phone, cx));
         }
+        if self.page != Page::Chat
+            || self.transition.is_some()
+            || (self.phone && !self.phone_conversation)
+        {
+            self.reaction_playbacks.clear();
+        } else {
+            self.reaction_playbacks.retain(|key, _| {
+                self.model.selected.as_deref() == Some(format!("group:{}", key.0).as_str())
+            });
+        }
         self.sync_favorites_refresh(cx);
         self.advance_transition(window, cx);
         self.animate_recalls(cx);
         self.animate_message_arrivals(cx);
+        if self.reaction_chooser.as_ref().is_some_and(|chooser| {
+            self.page != Page::Chat
+                || self.transition.is_some()
+                || !self.can_react(&chooser.message, false)
+                || self.model.selected.as_ref()
+                    != Some(&conversation_key(&chooser.message.conversation))
+        }) {
+            self.reaction_chooser = None;
+        }
+        if self.message_context.as_ref().is_some_and(|context| {
+            !context.read_only
+                && (self.page != Page::Chat
+                    || self.transition.is_some()
+                    || self.model.selected.as_ref()
+                        != Some(&conversation_key(&context.message.conversation)))
+        }) {
+            self.message_context = None;
+        }
         self.visible_bubbles.borrow_mut().clear();
+        self.message_bounds.borrow_mut().clear();
         self.advance_timeline_anchor(window);
         self.advance_reply_jump(false, window, cx);
         if cx.reduce_motion() {
@@ -6966,6 +7568,12 @@ impl Render for AppView {
                 }
             })
             .children(self.message_flights(cx))
+            .when(self.message_context.is_some(), |view| {
+                view.child(self.message_context_overlay(window, cx))
+            })
+            .when(self.reaction_chooser.is_some(), |view| {
+                view.child(self.full_reaction_chooser(cx))
+            })
             .when(self.details.is_some(), |view| view.child(self.overlay(cx)))
             .when(self.confirmation.is_some(), |view| {
                 view.child(self.confirmation_view(cx))
@@ -7414,7 +8022,9 @@ mod ui_tests {
         assert_eq!(cx.windows().len(), 1);
     }
     #[gpui::test]
-    fn desktop_context_reactions_are_two_rows_and_toggle_own_selection(cx: &mut TestAppContext) {
+    fn desktop_context_reactions_float_above_message_and_toggle_own_selection(
+        cx: &mut TestAppContext,
+    ) {
         let (main, view, _updates, mut commands) = fixture(cx);
         cx.update(|cx| {
             view.update(cx, |view, cx| {
@@ -7453,18 +8063,385 @@ mod ui_tests {
         let heart = visual.debug_bounds("reaction-choice:66").unwrap();
         let question = visual.debug_bounds("reaction-choice:32").unwrap();
         let laugh = visual.debug_bounds("reaction-choice:28").unwrap();
-        let victory = visual.debug_bounds("reaction-choice:79").unwrap();
         assert_eq!(heart.origin.y, question.origin.y);
-        assert_eq!(laugh.origin.y, victory.origin.y);
-        assert!(laugh.origin.y > heart.origin.y);
-        assert_eq!(heart.origin.x, laugh.origin.x);
-        assert!(visual.debug_bounds("message-menu-reply").unwrap().origin.y > victory.origin.y);
+        assert_eq!(heart.origin.y, laugh.origin.y);
+        assert!(visual.debug_bounds("reaction-choice:79").is_none());
+        assert!(visual.debug_bounds("reaction-all-panel").is_none());
+        let bar = visual.debug_bounds("reaction-panel").unwrap();
+        assert!(bar.bottom() <= bubble.top());
+        let reply = visual.debug_bounds("message-menu-reply").unwrap();
+        assert!(!bar.intersects(&reply));
+        assert!(visual.debug_bounds("reaction-more").is_some());
         visual.simulate_click(heart.center(), Default::default());
         frames(cx, main, 3);
         assert!(visual.debug_bounds("reaction-panel").is_none());
         assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::Reaction { group:42, sequence:1, code, added:false } if code == "66")));
         assert_eq!(cx.windows().len(), 1);
     }
+    #[gpui::test]
+    fn message_context_panels_anchor_to_the_bubble_instead_of_the_pointer(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let mut message = text_message(1);
+                message.elements = vec![MessageElement::Text(
+                    "这是一条较长的消息，用来检查菜单的固定位置。".repeat(4),
+                )];
+                view.model.receive(message, false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let bubble = visual.debug_bounds("message-bubble:group:42:1:1").unwrap();
+        let mut previous = None;
+        for position in [
+            bubble.origin + point(px(12.), px(12.)),
+            bubble.bottom_right() - point(px(12.), px(12.)),
+        ] {
+            visual.simulate_mouse_down(position, gpui::MouseButton::Right, Default::default());
+            visual.simulate_mouse_up(position, gpui::MouseButton::Right, Default::default());
+            frames(cx, main, 3);
+            let reply = visual.debug_bounds("message-menu-reply").unwrap();
+            let bar = visual.debug_bounds("reaction-panel").unwrap();
+            assert!(reply.top() >= bubble.bottom() + px(8.));
+            assert!(bar.bottom() <= bubble.top());
+            if let Some(previous) = previous {
+                assert_eq!(reply, previous);
+            }
+            previous = Some(reply);
+            let backdrop = visual.debug_bounds("message-context-backdrop").unwrap();
+            assert!(backdrop.size.width >= px(1200.) && backdrop.size.height >= px(760.));
+            cx.simulate_keystrokes(main, "escape");
+            frames(cx, main, 3);
+            assert!(visual.debug_bounds("message-context-backdrop").is_none());
+        }
+    }
+    #[gpui::test]
+    fn noto_assets_are_shared_by_faces_and_reactions_with_a_qq_fallback(cx: &mut TestAppContext) {
+        let (_main, view, _updates, mut commands) = fixture(cx);
+        let face = crate::expressions::Face::new(14);
+        let reaction = crate::expressions::Face::new(76);
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                let mut message = text_message(1);
+                message.elements = vec![face.element()];
+                view.model.receive(message, false);
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "76", true, 1, "peer",
+                )));
+                view.request_assets();
+            })
+        });
+        let requests = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                Command::Asset { key, url } if key.starts_with("face:") => Some((key, url)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for face in [&face, &reaction] {
+            assert!(requests.contains(&(face.asset_key(), face.image_url().unwrap())));
+        }
+        cx.update(|cx| {
+            view.update(cx, |view, _| {
+                view.apply(Update::AssetFailed {
+                    key: face.asset_key(),
+                })
+            })
+        });
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command,
+            Command::Asset { key,url } if key == face.fallback_asset_key() && url == face.fallback_image_url().unwrap())));
+    }
+
+    #[gpui::test]
+    fn live_reactions_play_once_and_receipts_or_navigation_do_not_restart_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.profile = Some(atri_qq::UserInfo {
+                    uin: 100,
+                    uid: "self".into(),
+                    nickname: "我".into(),
+                    age: 0,
+                    gender: 0,
+                });
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let key = (42, 1, "66".to_owned());
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "66", true, 1, "peer",
+                )));
+                let first = view.reaction_playbacks[&key].clone();
+                first.borrow_mut().finished = true;
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "66", true, 1, "peer",
+                )));
+                assert!(std::rc::Rc::ptr_eq(&first, &view.reaction_playbacks[&key]));
+                view.toggle_reaction(&text_message(1), "66".into(), cx);
+                let local = view.reaction_playbacks[&key].clone();
+                assert!(!std::rc::Rc::ptr_eq(&first, &local));
+                local.borrow_mut().finished = true;
+                view.apply(Update::ReactionDone {
+                    group: 42,
+                    sequence: 1,
+                    code: "66".into(),
+                    result: Ok(reaction_ack("66", true)),
+                });
+                view.apply(Update::Activity(reaction_push(
+                    42, 1, "66", true, 2, "self",
+                )));
+                assert!(std::rc::Rc::ptr_eq(&local, &view.reaction_playbacks[&key]));
+                assert!(view.reaction_playbacks[&key].borrow().finished);
+                assert!(view.local_reaction_feedback.is_empty());
+                view.page = super::Page::Settings;
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.reaction_playbacks.is_empty());
+                view.page = super::Page::Chat;
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        cx.update(|cx| assert!(view.read(cx).reaction_playbacks.is_empty()));
+    }
+    #[gpui::test]
+    fn picker_emoji_animates_only_while_hovered_and_returns_to_its_visible_poster(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hover.gif");
+        let poster = directory.path().join("poster.png");
+        let mut encoder =
+            image::codecs::gif::GifEncoder::new(std::fs::File::create(&path).unwrap());
+        for red in [20, 200] {
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(96, 96, image::Rgba([red, 80, 180, 255])),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(80, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        image::RgbaImage::from_pixel(96, 96, image::Rgba([50, 80, 180, 255]))
+            .save(&poster)
+            .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let face = crate::expressions::Face::new(14);
+                view.assets.insert(face.asset_key(), path);
+                view.assets.insert(face.poster_asset_key(), poster);
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let button = visual.debug_bounds("emoji-button").unwrap().center();
+        visual.simulate_click(button, Default::default());
+        frames(cx, main, 40);
+        assert!(visual.debug_bounds("emoji-frame:0").is_some());
+        assert!(visual.debug_bounds("emoji-frame:1").is_none());
+        let face = visual.debug_bounds("face-choice:14").unwrap().center();
+        visual.simulate_mouse_move(face, None, Default::default());
+        let mut animated = false;
+        for _ in 0..20 {
+            frames(cx, main, 1);
+            animated |= visual.debug_bounds("emoji-frame:1").is_some();
+        }
+        assert!(animated);
+        visual.simulate_mouse_move(point(px(1.), px(1.)), None, Default::default());
+        frames(cx, main, 20);
+        assert!(visual.debug_bounds("emoji-frame:0").is_some());
+        assert!(visual.debug_bounds("emoji-frame:1").is_none());
+    }
+    #[gpui::test]
+    fn reactions_not_selected_by_self_have_translucent_borders(cx: &mut TestAppContext) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.model.receive(text_message(1), false);
+                for code in ["32", "53"] {
+                    view.apply(Update::Activity(reaction_push(
+                        42, 1, code, true, 1, "peer",
+                    )));
+                }
+                cx.notify();
+            })
+        });
+        frames(cx, main, 3);
+        let mut visual = VisualTestContext::from_window(main, cx);
+        assert!(visual.debug_bounds("reaction:42:1:32").is_some());
+        assert!(visual.debug_bounds("reaction:42:1:53").is_some());
+        let outlined = cx
+            .update_window(main, |_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        (quad.bounds.size.width.0 - 60. * scale).abs() < 1.
+                            && (quad.bounds.size.height.0 - 28. * scale).abs() < 1.
+                            && quad.border_widths.left.0 > 0.
+                            && quad.border_color.a > 0.1
+                            && quad.border_color.a < 0.3
+                    })
+                    .count()
+            })
+            .unwrap();
+        assert!(outlined >= 2);
+    }
+
+    #[gpui::test]
+    fn sent_face_has_a_full_size_canvas_and_continues_animating_across_loops(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, _commands) = fixture(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("animated.gif");
+        let mut encoder =
+            image::codecs::gif::GifEncoder::new(std::fs::File::create(&path).unwrap());
+        for red in [20, 200] {
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(96, 96, image::Rgba([red, 80, 180, 255])),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(80, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                let face = crate::expressions::Face::new(14);
+                view.assets.insert(face.asset_key(), path);
+                let mut message = text_message(1);
+                message.is_self = true;
+                message.elements = vec![face.element()];
+                view.model.receive(message, false);
+                cx.notify();
+            })
+        });
+        let mut transitions = 0;
+        let mut previous = None;
+        for _ in 0..60 {
+            frames(cx, main, 1);
+            let mut visual = VisualTestContext::from_window(main, cx);
+            let frame = if visual.debug_bounds("emoji-frame:1").is_some() {
+                Some(1)
+            } else if let Some(bounds) = visual.debug_bounds("emoji-frame:0") {
+                assert_eq!(bounds.size, size(px(24.), px(24.)));
+                Some(0)
+            } else {
+                None
+            };
+            if let (Some(previous), Some(frame)) = (previous, frame)
+                && previous != frame
+            {
+                transitions += 1;
+            }
+            if frame.is_some() {
+                previous = frame;
+            }
+        }
+        assert!(
+            transitions >= 4,
+            "sent emoji must keep cycling after its first loop"
+        );
+    }
+
+    #[gpui::test]
+    fn reaction_more_opens_a_separate_picker_and_survives_context_menu_dismissal(
+        cx: &mut TestAppContext,
+    ) {
+        let (main, view, _updates, mut commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.phase = Phase::Chat;
+                view.phone_conversation = true;
+                view.model.receive(text_message(1), false);
+                cx.notify();
+            })
+        });
+        for (width, height, id) in [(1240., 820., 14), (390., 844., 1)] {
+            cx.simulate_window_resize(main, size(px(width), px(height)));
+            frames(cx, main, 4);
+            let mut visual = VisualTestContext::from_window(main, cx);
+            let bubble = visual.debug_bounds("message-bubble:group:42:1:1").unwrap();
+            visual.simulate_mouse_down(
+                bubble.center(),
+                gpui::MouseButton::Right,
+                Default::default(),
+            );
+            visual.simulate_mouse_up(
+                bubble.center(),
+                gpui::MouseButton::Right,
+                Default::default(),
+            );
+            frames(cx, main, 3);
+            let bar = visual.debug_bounds("reaction-panel").unwrap();
+            assert!(bar.left() >= px(8.) && bar.right() <= px(width - 8.));
+            assert!(visual.debug_bounds("reaction-all-panel").is_none());
+            assert!(visual.debug_bounds("reaction-choice:14").is_none());
+            let more = visual.debug_bounds("reaction-more").unwrap().center();
+            visual.simulate_mouse_down(more, gpui::MouseButton::Left, Default::default());
+            // Native input can draw a frame between pointer down and up.
+            frames(cx, main, 3);
+            visual.simulate_mouse_up(more, gpui::MouseButton::Left, Default::default());
+            frames(cx, main, 3);
+            assert!(visual.debug_bounds("reaction-panel").is_none());
+            assert!(visual.debug_bounds("message-menu-reply").is_none());
+            let panel = visual.debug_bounds("reaction-all-panel").unwrap();
+            assert!(panel.left() >= px(0.) && panel.right() <= px(width));
+            let selector: &'static str =
+                Box::leak(format!("reaction-choice:{id}").into_boxed_str());
+            let choice = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(choice.center(), Default::default());
+            frames(cx, main, 3);
+            cx.update(|cx| assert!(view.read(cx).reaction_chooser.is_none()));
+            assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::Reaction { group:42, sequence:1, code, added:true } if code == id.to_string())));
+            assert_eq!(cx.windows().len(), 1);
+        }
+        let mut visual = VisualTestContext::from_window(main, cx);
+        let bubble = visual.debug_bounds("message-bubble:group:42:1:1").unwrap();
+        visual.simulate_mouse_down(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            bubble.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        frames(cx, main, 3);
+        let more = visual.debug_bounds("reaction-more").unwrap().center();
+        visual.simulate_click(more, Default::default());
+        frames(cx, main, 3);
+        cx.simulate_keystrokes(main, "escape");
+        frames(cx, main, 3);
+        cx.update(|cx| assert!(view.read(cx).reaction_chooser.is_none()));
+    }
+
     #[gpui::test]
     fn restored_pokes_keep_their_time_position_and_reactions_restore_without_duplicate_events(
         cx: &mut TestAppContext,
@@ -7911,6 +8888,25 @@ mod ui_tests {
         cx.run_until_parked();
         draw(cx, cx.windows()[0]);
         cx.run_until_parked();
+        assert_eq!(
+            cx.windows().len(),
+            2,
+            "the login window must survive the frame that opens main"
+        );
+        assert!(
+            cx.windows()
+                .iter()
+                .any(|window| window.window_id() == login.window_id())
+        );
+        cx.update_window(login, |_, window, _| {
+            assert!(window.root::<super::RetiringWindow>().flatten().is_some());
+        })
+        .unwrap();
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
         assert_eq!(cx.windows().len(), 1);
         let main = cx.windows()[0];
         assert_ne!(main.window_id(), login.window_id());
@@ -7938,6 +8934,16 @@ mod ui_tests {
         cx.run_until_parked();
         draw(cx, cx.windows()[0]);
         cx.run_until_parked();
+        assert_eq!(
+            cx.windows().len(),
+            2,
+            "the main window must survive the frame that opens login"
+        );
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
         assert_eq!(cx.windows().len(), 1);
         let next_login = cx.windows()[0];
         assert_ne!(next_login.window_id(), main.window_id());
@@ -7964,6 +8970,38 @@ mod ui_tests {
         draw(cx, next_login);
         assert_eq!(cx.windows()[0].window_id(), next_login.window_id());
     }
+    #[gpui::test]
+    fn closing_replacement_during_login_handoff_does_not_leave_the_login_window_alive(
+        cx: &mut TestAppContext,
+    ) {
+        let (login, view, _updates, _commands) = fixture(cx);
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.mobile_platform = false;
+                view.desktop_windows = true;
+                view.phase = Phase::Chat;
+                cx.notify();
+            })
+        });
+        draw(cx, login);
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+        let replacement = cx
+            .windows()
+            .into_iter()
+            .find(|window| window.window_id() != login.window_id())
+            .unwrap();
+        cx.update_window(replacement, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        assert!(cx.windows().is_empty());
+    }
+
     #[gpui::test]
     fn desktop_never_enters_phone_layout_when_resized_below_phone_breakpoint(
         cx: &mut TestAppContext,
@@ -10829,20 +11867,18 @@ fn phone_layout(viewport: gpui_kit::Size<Pixels>) -> bool {
 }
 
 fn face_image(face: &crate::expressions::Face, assets: &HashMap<String, PathBuf>) -> AnyElement {
-    let path = assets.get(&format!("face:{}", face.id));
-    div()
-        .min_w(px(24.))
-        .h(px(24.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(if let Some(path) = path {
-            img(path.clone())
-                .size(px(24.))
-                .object_fit(ObjectFit::Contain)
-                .into_any_element()
-        } else {
-            div().text_sm().child(face.text()).into_any_element()
-        })
+    face_image_with_playback(face, assets, crate::emoji_image::Playback::Loop)
+}
+fn face_image_with_playback(
+    face: &crate::expressions::Face,
+    assets: &HashMap<String, PathBuf>,
+    playback: crate::emoji_image::Playback,
+) -> AnyElement {
+    let path = assets
+        .get(&face.asset_key())
+        .or_else(|| assets.get(&face.fallback_asset_key()))
+        .cloned();
+    crate::emoji_image::EmojiImage::new("face-animation", path, face.display_text(), playback)
+        .with_poster(assets.get(&face.poster_asset_key()).cloned())
         .into_any_element()
 }

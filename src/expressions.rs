@@ -10,7 +10,7 @@ use atri_qq::{
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Face {
@@ -67,6 +67,23 @@ pub const FACES: &[(u32, &str)] = &[
     (85, "飞吻"),
     (89, "西瓜"),
 ];
+#[derive(Deserialize)]
+struct EmojiCatalog {
+    version: u32,
+    animated_base_url: String,
+    faces: Vec<EmojiMapping>,
+}
+#[derive(Deserialize)]
+struct EmojiMapping {
+    qq: u32,
+    unicode: String,
+    emoji: String,
+    animated: bool,
+}
+static NOTO: LazyLock<EmojiCatalog> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../assets/noto-emoji-map.json"))
+        .expect("valid bundled emoji mapping")
+});
 impl Face {
     pub fn new(id: u32) -> Self {
         Self {
@@ -81,7 +98,49 @@ impl Face {
     pub fn text(&self) -> String {
         format!("[{}]", self.name)
     }
+    pub fn asset_key(&self) -> String {
+        self.noto().map_or_else(
+            || self.fallback_asset_key(),
+            |mapping| {
+                format!(
+                    "face:noto:v{}:{}:{}",
+                    NOTO.version, self.id, mapping.unicode
+                )
+            },
+        )
+    }
+    pub fn poster_asset_key(&self) -> String {
+        format!("{}:poster", self.asset_key())
+    }
+    pub fn poster_url(&self) -> Option<String> {
+        self.noto()
+            .map(|mapping| format!("{}/{}/emoji.svg", NOTO.animated_base_url, mapping.unicode))
+    }
+    pub fn fallback_asset_key(&self) -> String {
+        format!("face:qq:{}", self.id)
+    }
+    pub fn display_text(&self) -> String {
+        self.noto()
+            .map_or_else(|| self.text(), |mapping| mapping.emoji.clone())
+    }
+    fn noto(&self) -> Option<&'static EmojiMapping> {
+        NOTO.faces.iter().find(|mapping| mapping.qq == self.id)
+    }
     pub fn image_url(&self) -> Option<String> {
+        if let Some(mapping) = self.noto() {
+            let filename = if mapping.animated {
+                "lottie.json"
+            } else {
+                "emoji.svg"
+            };
+            return Some(format!(
+                "{}/{}/{filename}",
+                NOTO.animated_base_url, mapping.unicode
+            ));
+        }
+        self.fallback_image_url()
+    }
+    pub fn fallback_image_url(&self) -> Option<String> {
         (self.id < 256).then(|| {
             format!(
                 "https://qzonestyle.gtimg.cn/qzone/em/e{}.gif",
@@ -218,6 +277,60 @@ pub async fn fetch_favorites(client: &dyn ServiceClient) -> Result<Vec<Favorite>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn noto_mapping_covers_picker_without_changing_qq_wire_ids() {
+        let ids = NOTO
+            .faces
+            .iter()
+            .map(|mapping| mapping.qq)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), NOTO.faces.len());
+        assert_eq!(ids, FACES.iter().map(|&(id, _)| id).collect());
+        for mapping in &NOTO.faces {
+            assert!(!mapping.emoji.is_empty());
+            assert!(mapping.unicode.split('_').all(|part| {
+                u32::from_str_radix(part, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .is_some()
+            }));
+            let face = Face::new(mapping.qq);
+            assert!(
+                face.image_url()
+                    .unwrap()
+                    .starts_with("https://fonts.gstatic.com/s/e/notoemoji/latest/")
+            );
+            assert!(face.asset_key().starts_with("face:noto:v2:"));
+            assert_eq!(Face::from_element(&face.element()).unwrap().id, mapping.qq);
+        }
+        assert!(
+            Face::new(32)
+                .image_url()
+                .unwrap()
+                .ends_with("/1f914/lottie.json")
+        );
+        assert_eq!(Face::new(32).display_text(), "🤔");
+        assert!(
+            Face::new(53)
+                .poster_url()
+                .unwrap()
+                .ends_with("/1f382/emoji.svg")
+        );
+        assert!(Face::new(999).image_url().is_none());
+        assert_eq!(Face::new(999).display_text(), "[表情999]");
+        assert!(
+            Face::new(14)
+                .image_url()
+                .unwrap()
+                .ends_with("/1f642/lottie.json")
+        );
+        assert!(
+            Face::new(74)
+                .image_url()
+                .unwrap()
+                .ends_with("/2600/emoji.svg")
+        );
+    }
     #[test]
     fn faces_use_native_wire_elements_and_survive_protocol_serialization() {
         let conversation = atri_qq::messages::Conversation::Group { uin: 42 };

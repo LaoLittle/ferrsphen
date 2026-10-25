@@ -1,6 +1,6 @@
 [package]
 name = "ferrsphen"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 default-run = "ferrsphen"
 license = "MIT OR Apache-2.0"
@@ -10,13 +10,15 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:gpui-kit", "dep:alhazen-core", "dep:gpui-webview", "dep:wry"]
+desktop = ["dep:gpui-kit", "dep:alhazen-core", "dep:gpui-webview", "dep:wry", "dep:velato", "dep:vello_cpu"]
 ui-tests = ["desktop", "dep:gpui"]
 
 [dependencies]
 gpui = { package = "gpui-pre", version = "0.3", optional = true, features = ["test-support"] }
 atri_qq = { git = "https://github.com/LaoLittle/atri_qq", default-features = false }
 gpui-kit = { version = "0.8", optional = true }
+velato = { version = "0.12", optional = true, default-features = false }
+vello_cpu = { version = "0.3", optional = true, default-features = false, features = ["std", "u8_pipeline"] }
 alhazen-core = { version = "0.6", optional = true }
 surrealkv = "1"
 chrono = "0.4"

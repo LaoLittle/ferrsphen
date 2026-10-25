@@ -43,8 +43,15 @@ pub mod app;
 #[cfg(feature = "desktop")]
 pub mod view;
 
+mod emoji_assets;
+#[cfg(feature = "desktop")]
+mod emoji_lottie;
 pub mod expressions;
 
+#[cfg(feature = "desktop")]
+mod emoji_image;
+#[cfg(feature = "desktop")]
+mod message_context;
 #[cfg(feature = "desktop")]
 mod message_text;
 

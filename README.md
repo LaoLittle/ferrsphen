@@ -6,7 +6,7 @@
 
 Ferrsphen 是一个使用 Rust 与 GPUI 编写的跨平台 [IM](https://en.wikipedia.org/wiki/Instant_messaging) 客户端，支持 **macOS、Windows 和 Linux**。
 
-Fersphen 是 ferris 和 spheniscidae (拉丁语 / 企鹅科) 的结合。
+Ferrsphen 是 ferris 和 spheniscidae (拉丁语 / 企鹅科) 的结合。
 
 项目目前处于**早期迭代**阶段，仍有很多功能尚未实现，现有功能和界面还在持续完善。
 

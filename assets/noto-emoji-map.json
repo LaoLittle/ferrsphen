@@ -1,0 +1,296 @@
+{
+  "version": 2,
+  "animated_base_url": "https://fonts.gstatic.com/s/e/notoemoji/latest",
+  "source": "https://googlefonts.github.io/noto-emoji-files/",
+  "license": "CC-BY-4.0",
+  "faces": [
+    {
+      "qq": 14,
+      "unicode": "1f642",
+      "emoji": "🙂",
+      "animated": true
+    },
+    {
+      "qq": 1,
+      "unicode": "1f612",
+      "emoji": "😒",
+      "animated": true
+    },
+    {
+      "qq": 2,
+      "unicode": "1f60d",
+      "emoji": "😍",
+      "animated": true
+    },
+    {
+      "qq": 3,
+      "unicode": "1f636",
+      "emoji": "😶",
+      "animated": true
+    },
+    {
+      "qq": 4,
+      "unicode": "1f60f",
+      "emoji": "😏",
+      "animated": true
+    },
+    {
+      "qq": 5,
+      "unicode": "1f622",
+      "emoji": "😢",
+      "animated": true
+    },
+    {
+      "qq": 6,
+      "unicode": "1f633",
+      "emoji": "😳",
+      "animated": true
+    },
+    {
+      "qq": 7,
+      "unicode": "1f910",
+      "emoji": "🤐",
+      "animated": true
+    },
+    {
+      "qq": 8,
+      "unicode": "1f634",
+      "emoji": "😴",
+      "animated": true
+    },
+    {
+      "qq": 9,
+      "unicode": "1f62d",
+      "emoji": "😭",
+      "animated": true
+    },
+    {
+      "qq": 10,
+      "unicode": "1f605",
+      "emoji": "😅",
+      "animated": true
+    },
+    {
+      "qq": 11,
+      "unicode": "1f621",
+      "emoji": "😡",
+      "animated": true
+    },
+    {
+      "qq": 12,
+      "unicode": "1f61c",
+      "emoji": "😜",
+      "animated": true
+    },
+    {
+      "qq": 13,
+      "unicode": "1f601",
+      "emoji": "😁",
+      "animated": true
+    },
+    {
+      "qq": 0,
+      "unicode": "1f62e",
+      "emoji": "😮",
+      "animated": true
+    },
+    {
+      "qq": 15,
+      "unicode": "1f614",
+      "emoji": "😔",
+      "animated": true
+    },
+    {
+      "qq": 16,
+      "unicode": "1f60e",
+      "emoji": "😎",
+      "animated": true
+    },
+    {
+      "qq": 18,
+      "unicode": "1f629",
+      "emoji": "😩",
+      "animated": true
+    },
+    {
+      "qq": 19,
+      "unicode": "1f92e",
+      "emoji": "🤮",
+      "animated": true
+    },
+    {
+      "qq": 20,
+      "unicode": "1f92d",
+      "emoji": "🤭",
+      "animated": true
+    },
+    {
+      "qq": 21,
+      "unicode": "1f60a",
+      "emoji": "😊",
+      "animated": true
+    },
+    {
+      "qq": 22,
+      "unicode": "1f644",
+      "emoji": "🙄",
+      "animated": true
+    },
+    {
+      "qq": 23,
+      "unicode": "1f624",
+      "emoji": "😤",
+      "animated": true
+    },
+    {
+      "qq": 25,
+      "unicode": "1f62a",
+      "emoji": "😪",
+      "animated": true
+    },
+    {
+      "qq": 26,
+      "unicode": "1f631",
+      "emoji": "😱",
+      "animated": true
+    },
+    {
+      "qq": 27,
+      "unicode": "1f613",
+      "emoji": "😓",
+      "animated": true
+    },
+    {
+      "qq": 28,
+      "unicode": "1f604",
+      "emoji": "😄",
+      "animated": true
+    },
+    {
+      "qq": 29,
+      "unicode": "1f60c",
+      "emoji": "😌",
+      "animated": true
+    },
+    {
+      "qq": 30,
+      "unicode": "1f4aa",
+      "emoji": "💪",
+      "animated": true
+    },
+    {
+      "qq": 32,
+      "unicode": "1f914",
+      "emoji": "🤔",
+      "animated": true
+    },
+    {
+      "qq": 33,
+      "unicode": "1f92b",
+      "emoji": "🤫",
+      "animated": true
+    },
+    {
+      "qq": 34,
+      "unicode": "1f635",
+      "emoji": "😵",
+      "animated": true
+    },
+    {
+      "qq": 35,
+      "unicode": "1f623",
+      "emoji": "😣",
+      "animated": true
+    },
+    {
+      "qq": 36,
+      "unicode": "1f61e",
+      "emoji": "😞",
+      "animated": true
+    },
+    {
+      "qq": 49,
+      "unicode": "1f917",
+      "emoji": "🤗",
+      "animated": true
+    },
+    {
+      "qq": 53,
+      "unicode": "1f382",
+      "emoji": "🎂",
+      "animated": true
+    },
+    {
+      "qq": 54,
+      "unicode": "26a1",
+      "emoji": "⚡",
+      "animated": true
+    },
+    {
+      "qq": 55,
+      "unicode": "1f4a3",
+      "emoji": "💣",
+      "animated": true
+    },
+    {
+      "qq": 60,
+      "unicode": "2615",
+      "emoji": "☕",
+      "animated": true
+    },
+    {
+      "qq": 66,
+      "unicode": "2764",
+      "emoji": "❤",
+      "animated": true
+    },
+    {
+      "qq": 74,
+      "unicode": "2600",
+      "emoji": "☀",
+      "animated": false
+    },
+    {
+      "qq": 75,
+      "unicode": "1f319",
+      "emoji": "🌙",
+      "animated": false
+    },
+    {
+      "qq": 76,
+      "unicode": "1f44d",
+      "emoji": "👍",
+      "animated": true
+    },
+    {
+      "qq": 77,
+      "unicode": "1f44e",
+      "emoji": "👎",
+      "animated": true
+    },
+    {
+      "qq": 78,
+      "unicode": "1f91d",
+      "emoji": "🤝",
+      "animated": true
+    },
+    {
+      "qq": 79,
+      "unicode": "270c",
+      "emoji": "✌",
+      "animated": true
+    },
+    {
+      "qq": 85,
+      "unicode": "1f618",
+      "emoji": "😘",
+      "animated": true
+    },
+    {
+      "qq": 89,
+      "unicode": "1f349",
+      "emoji": "🍉",
+      "animated": true
+    }
+  ]
+}

@@ -479,7 +479,7 @@ async fn run(
                                 });
                             }
                             Some(Command::Asset{key,url})=>{
-                                let path=root.join("cache");let cache=image_cache.clone();jobs.spawn(async move{match async {let path=fetch_image(&path,&key,&url).await?;cache.remember(&path).await}.await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load asset failed");Update::AssetFailed{key}}}});
+                                let path=root.join("cache");let cache=image_cache.clone();jobs.spawn(async move{match load_asset(&cache,&path,&key,&url).await{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load asset failed");Update::AssetFailed{key}}}});
                             }
                             Some(Command::OpenCaptcha{id,request})=>{
                                 if let Some(job)=captcha_job.take(){job.abort();}
@@ -675,6 +675,33 @@ async fn locate_reply(
             Ok(page.messages)
         }
         _ => bail!("临时会话暂不支持历史记录"),
+    }
+}
+async fn load_asset(
+    cache: &crate::image_cache::ImageCache,
+    root: &Path,
+    key: &str,
+    url: &str,
+) -> Result<PathBuf> {
+    let emoji = key.starts_with("face:");
+    if emoji && let Some(path) = crate::emoji_assets::cached(root, key).await? {
+        return Ok(path);
+    }
+    if emoji
+        && let Some(extension) = ["svg", "json"]
+            .into_iter()
+            .find(|extension| url.ends_with(&format!(".{extension}")))
+    {
+        let original = fetch_asset(root, key, url).await?;
+        return crate::emoji_assets::remember_vector(root, key, &original, extension).await;
+    }
+    let original = fetch_image(root, key, url).await?;
+    let original = cache.remember(&original).await?;
+    if emoji {
+        let prepared = crate::emoji_assets::prepare(&original, root).await?;
+        crate::emoji_assets::remember_key(root, key, &prepared).await
+    } else {
+        Ok(original)
     }
 }
 async fn load_image(
@@ -1565,6 +1592,83 @@ mod history_status_tests {
 #[cfg(test)]
 mod image_cache_tests {
     use super::fetch_image;
+    #[tokio::test]
+    async fn emoji_vectors_load_from_disk_after_restart_without_network_or_originals() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let animation_bytes =
+            br#"{"v":"5.7.4","w":100,"h":100,"fr":30,"ip":0,"op":30,"layers":[]}"#.to_vec();
+        let poster_bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><circle cx="50" cy="50" r="40" fill="red"/></svg>"#.to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (animation_body, poster_body) = (animation_bytes.clone(), poster_bytes.clone());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let body = if request.starts_with(b"GET /lottie.json ") {
+                    &animation_body
+                } else {
+                    &poster_body
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let cache = crate::image_cache::ImageCache::new(root.path());
+        let face = crate::expressions::Face::new(32);
+        let animation = super::load_asset(
+            &cache,
+            root.path(),
+            &face.asset_key(),
+            &format!("http://{address}/lottie.json"),
+        )
+        .await
+        .unwrap();
+        let poster = super::load_asset(
+            &cache,
+            root.path(),
+            &face.poster_asset_key(),
+            &format!("http://{address}/emoji.svg"),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(animation.parent().unwrap(), root.path().join("emojis"));
+        assert_eq!(animation.extension().unwrap(), "json");
+        assert_eq!(poster.extension().unwrap(), "svg");
+        for entry in std::fs::read_dir(root.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        drop(cache);
+        let restarted = crate::image_cache::ImageCache::new(root.path());
+        for (key, expected, bytes) in [
+            (face.asset_key(), animation, animation_bytes),
+            (face.poster_asset_key(), poster, poster_bytes),
+        ] {
+            let actual = super::load_asset(&restarted, root.path(), &key, "not-a-download-url")
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(std::fs::read(actual).unwrap(), bytes);
+        }
+        assert!(
+            crate::emoji_assets::cached(root.path(), "face:noto:v3:32:1f914")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     #[tokio::test]
     async fn received_images_reuse_content_before_resolving_any_download_url() {
         use atri_qq::media::{MediaConversation, MediaKind, MediaReference};
