@@ -364,11 +364,28 @@ jobs:
           pattern: ferrsphen-*
           path: dist
           merge-multiple: true
+          skip-decompress: true
       - name: Create release and upload packages
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(dist/*.zip dist/*.tar.gz)
+          if (( ${#packages[@]} == 0 )); then
+            echo '::error::No release packages found in dist'
+            exit 1
+          fi
+          assets=()
+          for package in "${packages[@]}"; do
+            if [[ ! -f "$package" || ! -f "$package.sha256" ]]; then
+              echo "::error::Missing package file or checksum: $package"
+              exit 1
+            fi
+            assets+=("$package" "$package.sha256")
+          done
+          (cd dist && sha256sum --check --strict -- *.sha256)
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --verify-tag --generate-notes
-          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
