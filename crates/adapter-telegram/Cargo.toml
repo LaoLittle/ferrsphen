@@ -1,0 +1,22 @@
+[package]
+name = "adapter-telegram"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+[dependencies]
+base64 = "0.23"
+sha1_smol = "1"
+chat-adapter = { path = "../chat-adapter" }
+td-rust = { path = "../td-rust" }
+grammers-client = { path = "../grammers/grammers-client", default-features = false, features = ["fs"] }
+grammers-mtsender = { path = "../grammers/grammers-mtsender" }
+grammers-mtproto = { path = "../grammers/grammers-mtproto" }
+grammers-session = { path = "../grammers/grammers-session", default-features = false, features = ["serde"] }
+grammers-tl-types = { path = "../grammers/grammers-tl-types" }
+tokio = { version = "1", features = ["sync", "rt", "time", "fs", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+tracing = "0.1"
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,107 @@
+#!/bin/env python
+
+import os
+import subprocess
+import sys
+
+LICENSE = '''\
+// Copyright 2020 - developers of the `grammers` project.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+'''
+
+def warn(*args, **kwargs):
+	print(*args, **kwargs, file=sys.stderr)
+
+def error(*args, **kwargs):
+	warn(*args, **kwargs)
+	exit(1)
+
+def check_fmt():
+	return subprocess.run(('cargo', '+nightly', 'fmt', '--', '--check')).returncode == 0
+
+def check_fmt_extra():
+	ok = True
+	for root, _dirs, files in os.walk('.'):
+		root = root.replace(os.path.sep, '/')
+		if not root.startswith('./grammers'):
+			continue
+		for file in files:
+			if file.lower().endswith('.rs'):
+				file = os.path.join(root, file)
+				with open(file, 'r', encoding='utf-8') as fd:
+					expecting = 0
+					was_blank = True
+					for line in map(str.strip, fd):
+						if not line:
+							if was_blank:
+								warn(file, 'a single blank lines must be used between groups')
+								ok = False
+								break
+							was_blank = True
+						elif was_blank:
+							was_blank = False
+							if line.startswith('//!'):
+								new = 2
+							elif line.startswith('///'):
+								break
+							elif line.startswith('//'):
+								new = 1
+							elif line.startswith('#!['):
+								new = 3
+							else:
+								break
+							if new <= expecting:
+								warn(file, 'order must be license comment, doc-comment, cfg, mods/uses')
+								break
+							expecting = new
+						elif expecting == 1:
+							if not line.startswith('//'):
+								ok = False
+								warn(file, 'license comment separated by a single blank line must come first')
+								break
+						elif expecting == 2:
+							if not line.startswith('//!'):
+								ok = False
+								warn(file, 'doc-comment separated by a single blank line, if any, must come second')
+								break
+						elif expecting == 3:
+							if not line.startswith('#!['):
+								ok = False
+								warn(file, 'cfg separated by a single blank line, if any, must come third')
+								break
+
+	return ok
+
+
+def check_license():
+	ok = True
+	for root, _dirs, files in os.walk('.'):
+		root = root.replace(os.path.sep, '/')
+		if not root.startswith('./grammers'):
+			continue
+		for file in files:
+			if file.lower().endswith('.rs') and not root.endswith('/examples'):
+				file = os.path.join(root, file)
+				with open(file, 'r', encoding='utf-8') as fd:
+					if fd.read(len(LICENSE)) != LICENSE:
+						ok = False
+						warn(file, 'missing license')
+	return ok
+
+def main():
+	if not check_fmt():
+		error("please run 'cargo +nightly fmt' before commit")
+
+	if not check_license():
+		error("please make sure all files have the license header")
+
+	if not check_fmt_extra():
+		error("please make sure all files separate their imports")
+
+if __name__ == '__main__':
+	main()

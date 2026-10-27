@@ -1,0 +1,10 @@
+**/target
+**/*.rs.bk
+Cargo.lock
+*.session
+
+# examples/ file to test changes, might contain sensitive information
+testbed.rs
+
+# scraped docs
+*.json

@@ -1,0 +1,70 @@
+# Dependencies
+
+## grammers-crypto
+
+Used for supporting logging in to accounts with 2-factor authentication enabled.
+
+## grammers-mtsender
+
+Used to drive the network connection to Telegram.
+
+## grammers-session
+
+Used to load and store session data, such as authorization key or current user identifier.
+
+It also contains the logic needed to correctly process updates.
+
+## grammers-tl-types
+
+Used everywhere to invoke the "raw Telegram's API". It is the implementation of all the friendly
+client methods.
+
+## pulldown-cmark
+
+Enables the user to use markdown text to send formatted messages.
+
+## html5ever
+
+Enables the user to use HTML text to send formatted messages.
+
+## tokio
+
+Used to coordinate the asynchronous methods of the client.
+
+## tracing
+
+Used to log the execution of the client to help debug issues.
+
+## tracing-subscriber
+
+Used by the examples to showcase how one may configure logging for more information.
+
+## md5
+
+Needed when uploading files to Telegram.
+
+## mime_guess
+
+Used to guess the mime-type of uploaded files when sending media unless the user explicitly sets
+the mime-type themselves. The mime-type is required by Telegram.
+
+## jiff
+
+Used for defining date types (for example, accessing the date of when a message was sent).
+
+## toml
+
+Used to test that this file lists all dependencies from `Cargo.toml`.
+
+## pin-project-lite
+
+Used for return custom types that `impl Future` so that the requests can be further configured
+without having to use `Box`.
+
+## futures-util
+
+Provides useful functions for working with futures/tasks.
+
+## url
+
+Used to parse certain URLs to offer features such as joining private chats via their invite link.

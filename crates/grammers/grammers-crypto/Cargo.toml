@@ -1,0 +1,35 @@
+[package]
+name = "grammers-crypto"
+version = "0.11.0"
+authors = ["Lonami Exo <totufals@hotmail.com>"]
+license = "MIT OR Apache-2.0"
+description = """
+Several cryptographic utilities to work with Telegram's data.
+"""
+homepage = "https://codeberg.org/Lonami/grammers"
+documentation = "https://docs.rs/grammers-crypto"
+repository = "https://codeberg.org/Lonami/grammers"
+keywords = ["telegram", "tl"]
+categories = ["cryptography"]
+edition = "2024"
+
+[dependencies]
+td-rust = { path = "../../td-rust" }
+aes = "0.9.3"
+getrandom = "0.4.3"
+glass_pumpkin = "2.0.0"
+hmac = "0.13.0"
+num-bigint = "0.5"
+pbkdf2 = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+num-traits = "0.2.19"
+ctr = "0.10.1"
+
+[dev-dependencies]
+bencher = "0.1.5"
+toml = "1.1.8"
+
+[[bench]]
+name = "cipher"
+harness = false

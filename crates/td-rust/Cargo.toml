@@ -1,0 +1,11 @@
+[package]
+name = "td-rust"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+[dependencies]
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+getrandom = "0.4"

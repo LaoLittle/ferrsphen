@@ -1,0 +1,168 @@
+//! Example to showcase how to achieve pagination with inline buttons.
+//!
+//! The `TG_ID` and `TG_HASH` environment variables must be set (learn how to do it for
+//! [Windows](https://ss64.com/nt/set.html) or [Linux](https://ss64.com/bash/export.html))
+//! to Telegram's API ID and API hash respectively.
+//!
+//! Then, run it as:
+//!
+//! ```sh
+//! cargo run --example echo -- BOT_TOKEN
+//! ```
+//!
+//! In order to achieve pagination, the button data must contain enough information for the code
+//! to determine which "offset" should it use when querying additional data.
+//!
+//! For this example, the button contains the last two values of the fibonacci sequence where it
+//! last left off, separated by a comma. This way, the code can resume.
+//!
+//! If there is no comma, then there is a single number, which we use to know what was clicked.
+//!
+//! If it's the special string "done", then we know we've reached the end (there is a limit to
+//! how much data a button's payload can contain, and to keep it simple, we're storing it inline
+//! in decimal, so the numbers can't get too large).
+
+use std::env;
+use std::sync::Arc;
+
+use grammers_client::Client;
+use grammers_client::message::{Button, InputMessage, ReplyMarkup};
+use grammers_client::update::Update;
+use grammers_mtsender::SenderPool;
+use grammers_session::storages::SqliteSession;
+use tokio::{runtime, task};
+use tracing::{error, info};
+
+type Result = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+const SESSION_FILE: &str = "inline-pagination.session";
+
+const NUMBERS_PER_PAGE: usize = 4;
+
+// https://core.telegram.org/bots/api#inlinekeyboardbutton
+const MAX_PAYLOAD_DATA_LEN: usize = 64;
+
+/// Generate the inline keyboard reply markup with a few more numbers from the sequence.
+fn fib_markup(mut a: u128, mut b: u128) -> ReplyMarkup {
+    let mut rows = Vec::with_capacity(NUMBERS_PER_PAGE + 1);
+    for _ in 0..NUMBERS_PER_PAGE {
+        let text = a.to_string();
+        rows.push(vec![Button::data(&text, text.as_bytes())]);
+
+        let bb = b;
+        b += a;
+        a = bb;
+    }
+
+    let next = format!("{a},{b}");
+    if next.len() > MAX_PAYLOAD_DATA_LEN {
+        rows.push(vec![Button::data("I'm satisfied!!", b"done".to_vec())]);
+    } else {
+        rows.push(vec![
+            Button::data("Restart!", b"0,1".to_vec()),
+            Button::data("More!", format!("{a},{b}").into_bytes()),
+        ]);
+    }
+    ReplyMarkup::from_buttons(&rows)
+}
+
+async fn handle_update(_client: Client, update: Update) -> Result {
+    match update {
+        Update::NewMessage(message) if message.text() == "/start" => {
+            message
+                .respond(
+                    InputMessage::new()
+                        .text("Here's a fibonacci")
+                        .reply_markup(fib_markup(0, 1)),
+                )
+                .await?;
+        }
+        Update::CallbackQuery(query) => {
+            let data = std::str::from_utf8(query.data()).unwrap();
+            info!("Got callback query for {data}");
+
+            // First check special-case.
+            if data == "done" {
+                query.answer().edit("Glad you liked it 👍").await?;
+                return Ok(());
+            }
+
+            // Otherwise get the stored number(s).
+            let mut parts = data.split(',');
+            let a = parts.next().unwrap().parse::<u128>().unwrap();
+            if let Some(b) = parts.next() {
+                let os = (0..b.len()).map(|_| 'o').collect::<String>();
+                let b = b.parse::<u128>().unwrap();
+                query
+                    .answer()
+                    .edit(
+                        InputMessage::from(format!("S{os} much fibonacci 🔢"))
+                            .reply_markup(fib_markup(a, b)),
+                    )
+                    .await?;
+            } else if a % 2 == 0 {
+                query.answer().text("Even that's a number!").send().await?;
+            } else {
+                query.answer().alert("That's odd…").send().await?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn async_main() -> Result {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .init();
+
+    let api_id = env!("TG_ID").parse().expect("TG_ID invalid");
+    let token = env::args().nth(1).expect("token missing");
+
+    let session = Arc::new(SqliteSession::open(SESSION_FILE).await?);
+
+    let SenderPool {
+        runner,
+        handle,
+        updates,
+    } = SenderPool::new(Arc::clone(&session), api_id);
+    let client = Client::new(handle);
+    let _ = tokio::spawn(runner.run());
+
+    if !client.is_authorized().await? {
+        info!("Signing in...");
+        client.bot_sign_in(&token, env!("TG_HASH")).await?;
+        info!("Signed in!");
+    }
+
+    info!("Waiting for messages...");
+    let mut updates = client.stream_updates(updates, Default::default()).await?;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            update = updates.next() => {
+                let update = update?;
+                let handle = client.clone();
+                task::spawn(async move {
+                    match handle_update(handle, update).await {
+                        Ok(_) => {}
+                        Err(e) => error!(e, "Error handling updates!"),
+                    }
+                });
+            }
+        }
+    }
+
+    // `runner.run()`'s task will be dropped (and disconnect occur) once the runtime exits.
+    Ok(())
+}
+
+fn main() -> Result {
+    runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
+}

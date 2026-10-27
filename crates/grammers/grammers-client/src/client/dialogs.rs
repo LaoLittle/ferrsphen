@@ -1,0 +1,272 @@
+// Copyright 2020 - developers of the `grammers` project.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+use grammers_mtsender::InvocationError;
+use grammers_session::types::{PeerKind, PeerRef, UpdateState};
+use grammers_tl_types as tl;
+
+use super::{Client, IterBuffer};
+use crate::peer::Dialog;
+
+const MAX_LIMIT: usize = 100;
+
+/// Iterator returned by [`Client::iter_dialogs`].
+pub type DialogIter = IterBuffer<tl::functions::messages::GetDialogs, Dialog>;
+
+impl DialogIter {
+    /// Resume a dialog page without replaying all preceding pages.
+    pub fn offset(mut self, date: i32, id: i32, peer: PeerRef) -> Self {
+        self.request.exclude_pinned = true;
+        self.request.offset_date = date;
+        self.request.offset_id = id;
+        self.request.offset_peer = peer.into();
+        self
+    }
+
+    fn new(client: &Client) -> Self {
+        // TODO let users tweak all the options from the request
+        Self::from_request(
+            client,
+            MAX_LIMIT,
+            tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: None,
+                offset_date: 0,
+                offset_id: 0,
+                offset_peer: tl::enums::InputPeer::Empty,
+                limit: 0,
+                hash: 0,
+            },
+        )
+    }
+
+    /// Determines how many dialogs there are in total.
+    ///
+    /// This only performs a network call if `next` has not been called before.
+    pub async fn total(&mut self) -> Result<usize, InvocationError> {
+        if let Some(total) = self.total {
+            return Ok(total);
+        }
+
+        use tl::enums::messages::Dialogs;
+
+        self.request.limit = 1;
+        let total = match self.client.invoke(&self.request).await? {
+            Dialogs::Dialogs(dialogs) => dialogs.dialogs.len(),
+            Dialogs::Slice(dialogs) => dialogs.count as usize,
+            Dialogs::NotModified(dialogs) => dialogs.count as usize,
+        };
+        self.total = Some(total);
+        Ok(total)
+    }
+
+    /// Return the next `Dialog` from the internal buffer, filling the buffer previously if it's
+    /// empty.
+    ///
+    /// Returns `None` if the `limit` is reached or there are no dialogs left.
+    pub async fn next(&mut self) -> Result<Option<Dialog>, InvocationError> {
+        if let Some(result) = self.next_raw() {
+            return result;
+        }
+
+        use tl::enums::messages::Dialogs;
+
+        self.request.limit = self.determine_limit(MAX_LIMIT);
+        let (dialogs, mut messages, users, chats) = match self.client.invoke(&self.request).await? {
+            Dialogs::Dialogs(d) => {
+                self.last_chunk = true;
+                self.total = Some(d.dialogs.len());
+                (d.dialogs, d.messages, d.users, d.chats)
+            }
+            Dialogs::Slice(d) => {
+                self.last_chunk = d.dialogs.len() < self.request.limit as usize;
+                self.total = Some(d.count as usize);
+                (d.dialogs, d.messages, d.users, d.chats)
+            }
+            Dialogs::NotModified(_) => {
+                panic!("API returned Dialogs::NotModified even though hash = 0")
+            }
+        };
+
+        let peers = self.client.build_peer_map(users, chats).await;
+
+        for dialog in dialogs.iter() {
+            if let tl::enums::Dialog::Dialog(tl::types::Dialog {
+                peer: tl::enums::Peer::Channel(channel),
+                pts: Some(pts),
+                ..
+            }) = &dialog
+            {
+                self.client
+                    .0
+                    .session
+                    .set_update_state(UpdateState::Channel {
+                        id: channel.channel_id,
+                        pts: *pts,
+                    })
+                    .await?;
+            }
+        }
+
+        self.buffer.extend(
+            dialogs
+                .into_iter()
+                .map(|dialog| Dialog::new(&self.client, dialog, &mut messages, peers.handle())),
+        );
+
+        // Don't bother updating offsets if this is the last time stuff has to be fetched.
+        if !self.last_chunk && !self.buffer.is_empty() {
+            self.request.exclude_pinned = true;
+            if let Some(last_message) = self
+                .buffer
+                .iter()
+                .rev()
+                .find_map(|dialog| dialog.last_message.as_ref())
+            {
+                self.request.offset_date = last_message.date_timestamp();
+                self.request.offset_id = last_message.id();
+            }
+            self.request.offset_peer = self.buffer[self.buffer.len() - 1].peer_ref().into();
+        }
+
+        Ok(self.pop_item())
+    }
+}
+
+/// Method implementations related to open conversations.
+impl Client {
+    /// Returns a new iterator over the dialogs.
+    ///
+    /// While iterating, the update state for any broadcast channel or megagroup will be set if it was unknown before.
+    /// When the update state is set for these peers, the library can actively check to make sure it's not missing any
+    /// updates from them (as long as the queue limit for updates is larger than zero).
+    ///
+    /// Bot accounts will receive an error response when using this method, as they do not have dialogs.
+    /// The closest a bot account can get to listing the peers it has interacted with is by querying the
+    /// session cache, but that approach can be misleading, as it often contains both additional peers,
+    /// and peers that have since blocked the bot ("deleted the dialog" with it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn f(client: grammers_client::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut dialogs = client.iter_dialogs();
+    ///
+    /// while let Some(dialog) = dialogs.next().await? {
+    ///     let peer = dialog.peer();
+    ///     println!("{} ({})", peer.name().unwrap_or_default(), peer.id());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn iter_dialogs(&self) -> DialogIter {
+        DialogIter::new(self)
+    }
+
+    /// Deletes a dialog, effectively removing it from your list of open conversations.
+    ///
+    /// The dialog is only deleted for yourself.
+    ///
+    /// Deleting a dialog effectively clears the message history and "kicks" you from it.
+    ///
+    /// For groups and channels, this is the same as leaving said chat. This method does **not**
+    /// delete the chat itself (the chat still exists and the other members will remain inside).
+    ///
+    /// Bot accounts can use this method to leave a channel or group, but attempting
+    /// to leave the dialog with a user will fail, as bots do not actually have dialogs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn f(peer: grammers_session::types::PeerRef, client: grammers_client::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Consider making a backup before, you will lose access to the messages in peer!
+    /// client.delete_dialog(peer).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_dialog<C: Into<PeerRef>>(&self, peer: C) -> Result<(), InvocationError> {
+        let peer = peer.into();
+        if peer.id.kind() == PeerKind::Channel {
+            self.invoke(&tl::functions::channels::LeaveChannel {
+                channel: peer.into(),
+            })
+            .await
+            .map(drop)
+        } else if peer.id.kind() == PeerKind::Chat {
+            self.invoke(&tl::functions::messages::DeleteChatUser {
+                chat_id: peer.into(),
+                user_id: tl::enums::InputUser::UserSelf,
+                revoke_history: false,
+            })
+            .await
+            .map(drop)
+        } else {
+            self.invoke(&tl::functions::messages::DeleteHistory {
+                just_clear: false,
+                revoke: false,
+                peer: peer.into(),
+                max_id: 0,
+                min_date: None,
+                max_date: None,
+            })
+            .await
+            .map(drop)
+        }
+    }
+
+    /// Mark a peer as read.
+    ///
+    /// If you want to get rid of all the mentions (for example, a voice note that you have not
+    /// listened to yet), you need to also use [`Client::clear_mentions`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn f(peer: grammers_session::types::PeerRef, client: grammers_client::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// client.mark_as_read(peer).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_as_read<C: Into<PeerRef>>(&self, peer: C) -> Result<(), InvocationError> {
+        let peer = peer.into();
+        if peer.id.kind() == PeerKind::Channel {
+            self.invoke(&tl::functions::channels::ReadHistory {
+                channel: peer.into(),
+                max_id: 0,
+            })
+            .await
+            .map(drop)
+        } else {
+            self.invoke(&tl::functions::messages::ReadHistory {
+                peer: peer.into(),
+                max_id: 0,
+            })
+            .await
+            .map(drop)
+        }
+    }
+
+    /// Clears all pending mentions from a peer, marking them as read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn f(peer: grammers_session::types::PeerRef, client: grammers_client::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// client.clear_mentions(peer).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn clear_mentions<C: Into<PeerRef>>(&self, peer: C) -> Result<(), InvocationError> {
+        self.invoke(&tl::functions::messages::ReadMentions {
+            peer: peer.into().into(),
+            top_msg_id: None,
+        })
+        .await
+        .map(drop)
+    }
+}

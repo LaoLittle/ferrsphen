@@ -1,0 +1,75 @@
+[package]
+name = "grammers-client"
+version = "0.11.0"
+authors = ["Lonami Exo <totufals@hotmail.com>"]
+license = "MIT OR Apache-2.0"
+description = """
+A high level client to interact with Telegram's API.
+"""
+homepage = "https://codeberg.org/Lonami/grammers"
+documentation = "https://docs.rs/grammers-client"
+repository = "https://codeberg.org/Lonami/grammers"
+keywords = ["mtproto", "telegram", "tl"]
+categories = ["api-bindings"]
+edition = "2024"
+
+[features]
+markdown = ["dep:pulldown-cmark"]
+html = ["dep:html5ever"]
+proxy = ["grammers-mtsender/proxy"]
+parse_invite_link = ["dep:url"]
+fs = ["tokio/fs"]
+default = ["fs"]
+
+[dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = [
+    "alloc"
+] }
+grammers-crypto = { path = "../grammers-crypto", version = "0.11.0" }
+grammers-mtsender = { path = "../grammers-mtsender", version = "0.11.0" }
+grammers-session = { path = "../grammers-session", version = "0.11.0", default-features = false }
+grammers-tl-types = { path = "../grammers-tl-types", version = "0.11.0", features = [
+    "tl-mtproto",
+] }
+html5ever = { version = "0.40.1", optional = true }
+jiff = "0.2.38"
+md5 = "0.8.1"
+mime_guess = "2.0.5"
+pin-project-lite = "0.2"
+pulldown-cmark = { version = "0.13.4", default-features = false, optional = true }
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt", "macros"
+] }
+tracing.workspace = true
+url = { version = "2.5.8", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", default-features = false, features = [
+    "signal",
+] }
+tracing-subscriber.workspace = true
+toml = "1.1.8"
+
+[[example]]
+name = "ping"
+required-features = ["grammers-session/sqlite-storage"]
+
+[[example]]
+name = "echo"
+required-features = ["grammers-session/sqlite-storage"]
+
+[[example]]
+name = "downloader"
+required-features = ["grammers-session/sqlite-storage"]
+
+[[example]]
+name = "dialogs"
+required-features = ["grammers-session/sqlite-storage"]
+
+[[example]]
+name = "inline-pagination"
+required-features = ["grammers-session/sqlite-storage"]
+
+[[example]]
+name = "send_album"
+required-features = ["grammers-session/sqlite-storage"]
