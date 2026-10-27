@@ -119,3 +119,52 @@ gpui_component.Attachment.Remove: "삭제"
 gpui_component.Attachment.Retry: "다시 시도"
 login.verification: "인증"
 login.verification_failed: "인증 창을 열 수 없습니다"
+
+card.link: "링크"
+card.announcement: "그룹 공지"
+card.miniapp: "미니 앱"
+card.music: "음악"
+card.location: "위치"
+card.contact: "연락처"
+
+chat.send_card: "카드 보내기"
+chat.card_invalid_json: "잘못된 JSON: %{error}"
+chat.card_object_required: "JSON은 객체여야 합니다"
+chat.card_app_id_required: "app_id를 입력하세요"
+
+chat.send_music: "음악 공유 보내기"
+music.title: "제목"
+music.summary: "설명 (선택)"
+music.jump_url: "공유 URL"
+music.picture_url: "표지 URL"
+music.music_url: "오디오 URL"
+music.app_id: "App ID"
+music.package_name: "Android 패키지 이름"
+music.signature_md5: "서명 인증서 MD5"
+music.sdk_version: "SDK 버전 (선택)"
+music.required: "%{field} 입력"
+music.invalid_app_id: "App ID는 양의 정수여야 합니다"
+music.invalid_signature: "32자리 16진수 MD5를 입력하세요"
+music.invalid_url: "유효한 HTTP 또는 HTTPS URL을 입력하세요"
+
+adapter.phone: "전화번호"
+adapter.code: "인증 코드"
+adapter.password: "비밀번호"
+adapter.continue: "계속"
+adapter.more: "더 불러오기"
+
+accounts.title: "계정"
+
+accounts.use_new: "다른 사용자로 로그인하려면 계정을 추가하세요"
+
+adapter.homeserver: "홈서버 URL"
+
+adapter.username: "사용자 이름"
+
+adapter.recovery_key: "복구 키"
+
+adapter.token: "로그인 토큰"
+
+adapter.sso: "통합 로그인"
+
+adapter.phone_login: "전화번호로 로그인"

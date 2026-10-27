@@ -119,3 +119,52 @@ gpui_component.Attachment.Remove: "削除"
 gpui_component.Attachment.Retry: "再試行"
 login.verification: "認証"
 login.verification_failed: "認証ウィンドウを開けません"
+
+card.link: "リンク"
+card.announcement: "グループのお知らせ"
+card.miniapp: "ミニアプリ"
+card.music: "音楽"
+card.location: "位置情報"
+card.contact: "連絡先"
+
+chat.send_card: "カードを送信"
+chat.card_invalid_json: "無効な JSON：%{error}"
+chat.card_object_required: "JSON はオブジェクトである必要があります"
+chat.card_app_id_required: "app_id を入力してください"
+
+chat.send_music: "音楽を共有"
+music.title: "タイトル"
+music.summary: "説明（任意）"
+music.jump_url: "共有 URL"
+music.picture_url: "カバー URL"
+music.music_url: "音声 URL"
+music.app_id: "App ID"
+music.package_name: "Android パッケージ名"
+music.signature_md5: "署名証明書 MD5"
+music.sdk_version: "SDK バージョン（任意）"
+music.required: "%{field}を入力してください"
+music.invalid_app_id: "App ID は正の整数で入力してください"
+music.invalid_signature: "32 桁の 16 進数 MD5 を入力してください"
+music.invalid_url: "有効な HTTP または HTTPS URL を入力してください"
+
+adapter.phone: "電話番号"
+adapter.code: "確認コード"
+adapter.password: "パスワード"
+adapter.continue: "続ける"
+adapter.more: "さらに読み込む"
+
+accounts.title: "アカウント"
+
+accounts.use_new: "別のユーザーでログインするにはアカウントを追加してください"
+
+adapter.homeserver: "ホームサーバーのURL"
+
+adapter.username: "ユーザー名"
+
+adapter.recovery_key: "復元キー"
+
+adapter.token: "ログイントークン"
+
+adapter.sso: "シングルサインオン"
+
+adapter.phone_login: "電話番号でログイン"

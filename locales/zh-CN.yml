@@ -111,3 +111,52 @@ settings.light: "浅色"
 settings.dark: "深色"
 login.verification: "验证码验证"
 login.verification_failed: "无法打开验证码窗口"
+
+card.link: "链接"
+card.announcement: "群公告"
+card.miniapp: "小程序"
+card.music: "音乐"
+card.location: "位置"
+card.contact: "名片"
+
+chat.send_card: "发送卡片"
+chat.card_invalid_json: "JSON 无效：%{error}"
+chat.card_object_required: "JSON 必须是对象"
+chat.card_app_id_required: "请填写 app_id"
+
+chat.send_music: "发送音乐分享"
+music.title: "标题"
+music.summary: "简介（可选）"
+music.jump_url: "分享链接"
+music.picture_url: "封面链接"
+music.music_url: "音频链接"
+music.app_id: "App ID"
+music.package_name: "Android 包名"
+music.signature_md5: "签名证书 MD5"
+music.sdk_version: "SDK 版本（可选）"
+music.required: "请填写%{field}"
+music.invalid_app_id: "App ID 必须是正整数"
+music.invalid_signature: "请填写 32 位十六进制 MD5"
+music.invalid_url: "请填写有效的 HTTP 或 HTTPS 链接"
+
+adapter.phone: "手机号"
+adapter.code: "验证码"
+adapter.password: "密码"
+adapter.continue: "继续"
+adapter.more: "加载更多"
+
+accounts.title: "账号"
+
+accounts.use_new: "请添加账号以登录其他用户"
+
+adapter.homeserver: "服务器地址"
+
+adapter.username: "用户名"
+
+adapter.recovery_key: "恢复密钥"
+
+adapter.token: "登录令牌"
+
+adapter.sso: "单点登录"
+
+adapter.phone_login: "使用手机号登录"

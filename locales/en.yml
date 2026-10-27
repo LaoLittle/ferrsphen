@@ -111,3 +111,52 @@ settings.light: "Light"
 settings.dark: "Dark"
 login.verification: "Verification"
 login.verification_failed: "Unable to open verification window"
+
+card.link: "Link"
+card.announcement: "Group announcement"
+card.miniapp: "Mini App"
+card.music: "Music"
+card.location: "Location"
+card.contact: "Contact"
+
+chat.send_card: "Send Card"
+chat.card_invalid_json: "Invalid JSON: %{error}"
+chat.card_object_required: "JSON must be an object"
+chat.card_app_id_required: "Enter app_id"
+
+chat.send_music: "Send Music Share"
+music.title: "Title"
+music.summary: "Summary (optional)"
+music.jump_url: "Share URL"
+music.picture_url: "Cover URL"
+music.music_url: "Audio URL"
+music.app_id: "App ID"
+music.package_name: "Android package name"
+music.signature_md5: "Signing certificate MD5"
+music.sdk_version: "SDK version (optional)"
+music.required: "Enter %{field}"
+music.invalid_app_id: "App ID must be a positive integer"
+music.invalid_signature: "Enter a 32-digit hexadecimal MD5"
+music.invalid_url: "Enter valid HTTP or HTTPS URLs"
+
+adapter.phone: "Phone number"
+adapter.code: "Verification code"
+adapter.password: "Password"
+adapter.continue: "Continue"
+adapter.more: "Load more"
+
+accounts.title: "Accounts"
+
+accounts.use_new: "Add another account to sign in as a different user"
+
+adapter.homeserver: "Homeserver URL"
+
+adapter.username: "Username"
+
+adapter.recovery_key: "Recovery key"
+
+adapter.token: "Login token"
+
+adapter.sso: "Single sign-on"
+
+adapter.phone_login: "Log in by phone number"
