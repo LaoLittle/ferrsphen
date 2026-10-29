@@ -14,7 +14,13 @@ Ferrsphen 是 ferris 和 spheniscidae (拉丁语 / 企鹅科) 的结合。
 
 ## 感谢
 
-- atri_qq: https://github.com/LaoLittle/atri_qq
-- ricq: https://github.com/lz1998/ricq
 - GPUI/Zed: https://github.com/zed-industries/zed
 - gpui-kit: https://github.com/longbridge/gpui-kit
+
+- Grammers: https://codeberg.org/Lonami/grammers
+- TDLib: https://github.com/tdlib/td
+
+- Matrix Rust SDK: https://github.com/matrix-org/matrix-rust-sdk
+
+- atri_qq: https://github.com/LaoLittle/atri_qq
+- ricq: https://github.com/lz1998/ricq

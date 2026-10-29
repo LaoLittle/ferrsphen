@@ -31,11 +31,67 @@ impl Database {
             root: root.into(),
         })
     }
+    pub fn records_with_prefix<T: DeserializeOwned>(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<T>> {
+        let tx = self.tree.begin()?;
+        let mut upper = prefix.as_bytes().to_vec();
+        upper.push(255);
+        let mut rows = tx.range(prefix.as_bytes(), upper.as_slice())?;
+        rows.seek_last()?;
+        let mut result = Vec::new();
+        while rows.valid() && result.len() < limit {
+            result.push(crate::proto::decode(rows.value()?.as_slice())?);
+            rows.prev()?;
+        }
+        result.reverse();
+        Ok(result)
+    }
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let tx = self.tree.begin()?;
         tx.get(key.as_bytes())?
             .map(|bytes| crate::proto::decode(bytes.as_slice()))
             .transpose()
+    }
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        let mut tx = self.tree.begin()?;
+        tx.delete(key.as_bytes())?;
+        tx.set_durability(Durability::Immediate);
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn purge_telegram_api_credentials(&self) -> Result<usize> {
+        let prefix = b"adapter/session/";
+        let tx = self.tree.begin()?;
+        let mut rows = tx.range(prefix.as_slice(), b"adapter/session0".as_slice())?;
+        rows.seek_first()?;
+        let mut keys = Vec::new();
+        while rows.valid() {
+            let key = rows.key().user_key().to_vec();
+            if let Some(encoded) = key.strip_prefix(prefix.as_slice())
+                && let Ok(decoded) = hex::decode(encoded)
+                && let Ok(decoded) = std::str::from_utf8(&decoded)
+                && decoded.starts_with("telegram/")
+                && decoded.ends_with("/credentials")
+            {
+                keys.push(key);
+            }
+            rows.next()?;
+        }
+        drop(rows);
+        drop(tx);
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.tree.begin()?;
+        for key in &keys {
+            tx.delete(key)?;
+        }
+        tx.set_durability(Durability::Immediate);
+        tx.commit().await?;
+        Ok(keys.len())
     }
     pub async fn save_session(&self, session: &Session) -> Result<()> {
         let bytes = crate::proto::encode_session(session)?;
@@ -363,6 +419,31 @@ fn decode_stored_message(bytes: &[u8], account: u64) -> Result<Message> {
     Ok(message)
 }
 
+/// Remove the old application credential records from both managed and legacy account stores.
+pub async fn purge_legacy_telegram_credentials(root: &Path) -> Result<usize> {
+    let mut roots = vec![root.to_path_buf(), root.join("adapters")];
+    let accounts = root.join("accounts");
+    if accounts.is_dir() {
+        for entry in std::fs::read_dir(accounts)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                roots.push(entry.path());
+            }
+        }
+    }
+    let mut removed = 0;
+    for root in roots {
+        if !root.join("ferrsphen.skv").is_dir() {
+            continue;
+        }
+        let db = Database::open(&root)?;
+        let result = db.purge_telegram_api_credentials().await;
+        db.close().await?;
+        removed += result?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::{Database, Session};
@@ -392,7 +473,16 @@ mod migration_tests {
                 ps_keys: std::collections::BTreeMap::from([("qq.com".into(), "ticket".into())]),
                 o3_xwid_switch: Some(0),
                 qr_sig: vec![5; 16],
-                key_exchange_key: vec![7; 16],
+                ios_msf_imei: "12A3B456-7890-4ABC-8DEF-123456789ABC".into(),
+                key_exchange_session: Some(
+                    atri_qq::NtKeyExchangeSession::new(
+                        atri_qq::ClientPlatform::IPhone,
+                        bytes::Bytes::from_static(&[7; 16]),
+                        bytes::Bytes::from_static(b"synthetic-session-ticket"),
+                        600,
+                    )
+                    .unwrap(),
+                ),
                 login_cookie: vec![0xff, 0x00, 0xc0, 0x80],
                 ..Default::default()
             },
@@ -409,7 +499,7 @@ mod migration_tests {
                 serde_json::to_value(&expected).unwrap()
             );
             assert!(loaded.keystore.qr_sig.is_empty());
-            assert!(loaded.keystore.key_exchange_key.is_empty());
+            assert!(loaded.keystore.key_exchange_session.is_none());
             assert!(loaded.keystore.login_cookie.is_empty());
         }
         let keyfile = root.path().join("keystore.bin");
@@ -439,6 +529,7 @@ mod migration_tests {
         assert_eq!(loaded.keystore.a1, session.keystore.a1);
         assert_eq!(loaded.keystore.guid, session.keystore.guid);
         assert_eq!(loaded.keystore.device_name, session.keystore.device_name);
+        assert_eq!(loaded.keystore.ios_msf_imei, session.keystore.ios_msf_imei);
         assert_eq!(loaded.machine_id, session.machine_id);
         assert_eq!(loaded.qua, session.qua);
         db.close().await.unwrap();
@@ -636,5 +727,71 @@ mod migration_tests {
         let bytes = db.tree.begin().unwrap().get(b"broken").unwrap().unwrap();
         assert_eq!(bytes.as_slice(), invalid);
         db.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod credential_cleanup_tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_purges_credentials_from_legacy_active_and_unfinished_accounts_only() {
+        let root = tempfile::tempdir().unwrap();
+        let directories = [
+            root.path().to_path_buf(),
+            root.path().join("adapters"),
+            root.path().join("accounts/active"),
+            root.path().join("accounts/unfinished"),
+        ];
+        let credential_key = format!(
+            "adapter/session/{}",
+            hex::encode("telegram/6f6e65/credentials")
+        );
+        let session_key = format!("adapter/session/{}", hex::encode("telegram/6f6e65/session"));
+        let other_key = format!("adapter/session/{}", hex::encode("matrix/6f6e65/session"));
+        for directory in &directories {
+            let db = Database::open(directory).unwrap();
+            db.put(
+                &credential_key,
+                &serde_json::json!({"api_id":12345,"api_hash":"synthetic-obsolete-hash"}),
+            )
+            .await
+            .unwrap();
+            db.put(
+                &session_key,
+                &serde_json::json!({"home_dc":2,"auth_key":"retained-session"}),
+            )
+            .await
+            .unwrap();
+            db.put(
+                &other_key,
+                &serde_json::json!({"access_token":"retained-matrix-session"}),
+            )
+            .await
+            .unwrap();
+            db.close().await.unwrap();
+        }
+        assert_eq!(
+            purge_legacy_telegram_credentials(root.path())
+                .await
+                .unwrap(),
+            directories.len()
+        );
+        for directory in &directories {
+            let db = Database::open(directory).unwrap();
+            assert!(
+                db.get::<serde_json::Value>(&credential_key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(db.get::<serde_json::Value>(&session_key).unwrap().is_some());
+            assert!(db.get::<serde_json::Value>(&other_key).unwrap().is_some());
+            db.close().await.unwrap();
+        }
+        assert_eq!(
+            purge_legacy_telegram_credentials(root.path())
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

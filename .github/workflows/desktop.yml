@@ -151,13 +151,22 @@ jobs:
         run: node src/captcha/bridge.test.cjs
       - name: Build native app-release
         if: runner.os != 'Windows' && !matrix.cross
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || vars.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: cargo build --profile app-release --bin ferrsphen --target "$TARGET"
       - name: Build Windows app-release
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || vars.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: cargo build --profile app-release --bin ferrsphen --target $env:TARGET
       - name: Build RISC-V app-release
         if: matrix.cross
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || vars.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
           context="$(mktemp -d "$RUNNER_TEMP/ferrsphen-riscv64.XXXXXX")"
           trap 'rm -rf "$context"' EXIT
@@ -213,7 +222,8 @@ jobs:
           DOCKERFILE
           docker build --progress=plain -t ferrsphen-riscv64 "$context"
           docker run --rm -v "$GITHUB_WORKSPACE:/workspace" \
-            -e CARGO_HOME=/workspace/.cargo-riscv64 ferrsphen-riscv64
+            -e CARGO_HOME=/workspace/.cargo-riscv64 \
+            -e TELEGRAM_API_ID -e TELEGRAM_API_HASH ferrsphen-riscv64
       - name: Restore RISC-V build ownership
         if: always() && matrix.cross
         run: |
@@ -278,6 +288,15 @@ jobs:
           for license_file in root.glob('LICENSE*'):
               if license_file.is_file():
                   shutil.copy2(license_file, resources / license_file.name)
+
+          for source, notice_name in [
+              ('crates/grammers/LICENSE-MIT', 'LICENSE-Grammers-MIT'),
+              ('crates/grammers/LICENSE-APACHE', 'LICENSE-Grammers-APACHE'),
+              ('crates/td-rust/LICENSE_1_0.txt', 'LICENSE-TDLib-BSL'),
+              ('crates/grammers/UPSTREAM.md', 'GRAMMERS-UPSTREAM.md'),
+              ('crates/td-rust/UPSTREAM.md', 'TDLIB-UPSTREAM.md'),
+          ]:
+              shutil.copy2(root / source, resources / notice_name)
 
           if system == 'macos':
               executable = bundle / 'Contents' / 'MacOS' / 'ferrsphen'

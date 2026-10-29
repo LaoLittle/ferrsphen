@@ -7,7 +7,7 @@ use std::{
 };
 
 pub const REVEAL_DURATION: Duration = Duration::from_millis(480);
-const PARTICLES: usize = 9;
+const PLACEHOLDER_FPS: f32 = 24.;
 
 #[derive(Clone)]
 struct BlurSource(Arc<RenderImage>);
@@ -59,72 +59,59 @@ fn blur_frames(image: &RenderImage) -> Vec<Arc<RenderImage>> {
         .collect()
 }
 
-struct CloudAsset;
-impl Asset for CloudAsset {
-    type Source = (u64, bool);
-    type Output = Arc<RenderImage>;
-    fn load(
-        (seed, dark): Self::Source,
-        cx: &mut App,
-    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        cx.background_executor().spawn(async move {
-            Arc::new(RenderImage::new(vec![image::Frame::new(cloud_pixels(
-                seed, dark,
-            ))]))
-        })
-    }
-}
-
-fn cloud_pixels(seed: u64, dark: bool) -> image::RgbaImage {
-    // Overlapping soft silhouettes retain recognizable masses and negative space.
-    let shapes = [
-        (0.48, 0.62, 0.28, 0.22),
-        (0.36, 0.32, 0.17, 0.19),
-        (0.70, 0.43, 0.15, 0.21),
-        (0.25, 0.66, 0.13, 0.14),
-    ];
-    let colors = (0..shapes.len())
-        .map(|i| {
-            Rgba::from(hsla(
-                (random(seed, 30) + i as f32 * 0.18) % 1.,
-                0.52,
-                if dark { 0.58 } else { 0.65 },
+fn cloud_pixels(seed: u64, dark: bool, time: f32) -> image::RgbaImage {
+    let base_hue = random(seed, 30);
+    let patches = (0..9)
+        .map(|index| {
+            let phase = random(seed, index + 40) * std::f32::consts::TAU;
+            let x = (index % 3) as f32 * 0.5
+                + (random(seed, index + 50) - 0.5) * 0.18
+                + (time * 0.23 + phase).sin() * 0.12;
+            let y = (index / 3) as f32 * 0.5
+                + (random(seed, index + 60) - 0.5) * 0.18
+                + (time * 0.19 + phase).cos() * 0.12;
+            let radius = 0.18 + random(seed, index + 70) * 0.18;
+            let hue = (base_hue
+                + (random(seed, index + 80) - 0.5) * 0.24
+                + (time * 0.21 + phase).sin() * 0.09)
+                .rem_euclid(1.);
+            let lightness = if dark {
+                0.065 + random(seed, index + 90) * 0.23
+            } else {
+                0.73 + random(seed, index + 90) * 0.17
+            };
+            let color = Rgba::from(hsla(
+                hue,
+                0.22 + random(seed, index + 100) * 0.2,
+                (lightness + (time * 0.32 + phase).sin() * 0.035).clamp(0., 1.),
                 1.,
-            ))
+            ));
+            (x, y, radius, color)
         })
         .collect::<Vec<_>>();
-    image::RgbaImage::from_fn(96, 96, |x, y| {
-        let (u, v) = (x as f32 / 95., y as f32 / 95.);
-        let mut density = 0.;
+    let pixels = image::RgbaImage::from_fn(48, 48, |x, y| {
+        let u = x as f32 / 47.;
+        let v = y as f32 / 47.;
+        let u = u + (v * 5. + time * 0.15).sin() * 0.05;
+        let v = v + (u * 4. - time * 0.17).cos() * 0.05;
+        let mut total = 0.;
         let mut channels = [0.; 3];
-        for (i, ((cx, cy, rx, ry), color)) in shapes.iter().zip(&colors).enumerate() {
-            let angle = (random(seed, i + 60) - 0.5) * 1.2;
-            let (sin, cos) = angle.sin_cos();
-            let dx = u - cx - (random(seed, i + 40) - 0.5) * 0.08;
-            let dy = v - cy - (random(seed, i + 50) - 0.5) * 0.08;
-            let distance =
-                ((dx * cos + dy * sin) / rx).powi(2) + ((-dx * sin + dy * cos) / ry).powi(2);
-            let weight = (-distance.powi(2) * 0.75).exp();
-            density += weight;
+        for &(cx, cy, radius, color) in &patches {
+            let distance = ((u - cx).powi(2) + (v - cy).powi(2)) / radius.powi(2);
+            let weight = (-distance * 2.).exp() + 0.0002;
+            total += weight;
             channels[0] += color.b * weight;
             channels[1] += color.g * weight;
             channels[2] += color.r * weight;
         }
-        let edge = smooth((u / 0.16).min(1.))
-            * smooth(((1. - u) / 0.16).min(1.))
-            * smooth((v / 0.16).min(1.))
-            * smooth(((1. - v) / 0.16).min(1.));
-        let alpha = (1. - (-density * 1.8).exp()) * edge * 0.9;
-        if density < 0.0001 || alpha < 1. / 255. {
-            return image::Rgba([0, 0, 0, 0]);
-        }
         image::Rgba([
-            (channels[0] / density * 255.) as u8,
-            (channels[1] / density * 255.) as u8,
-            (channels[2] / density * 255.) as u8,
-            (alpha * 255.) as u8,
+            (channels[0] / total * 255.).round() as u8,
+            (channels[1] / total * 255.).round() as u8,
+            (channels[2] / total * 255.).round() as u8,
+            255,
         ])
-    })
+    });
+    image::imageops::blur(&pixels, 2.8)
 }
 
 struct LoadingState {
@@ -135,7 +122,8 @@ struct LoadingState {
     blur_source: Option<BlurSource>,
     path: Option<PathBuf>,
     cloud: Option<Arc<RenderImage>>,
-    cloud_source: Option<(u64, bool)>,
+    cloud_sample: Option<(u64, bool, u64)>,
+    cloud_task: Option<Task<()>>,
     rotation_task: Option<Task<()>>,
     rotated: Option<Arc<RenderImage>>,
     prepared: Option<Arc<image::RgbaImage>>,
@@ -151,7 +139,8 @@ impl LoadingState {
             blur_source: None,
             path,
             cloud: None,
-            cloud_source: None,
+            cloud_sample: None,
+            cloud_task: None,
             rotation_task: None,
             rotated: None,
             prepared: None,
@@ -167,9 +156,8 @@ impl LoadingState {
         }
     }
     fn clear_blur(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
-        if let Some(source) = self.cloud_source.take() {
-            cx.remove_asset::<CloudAsset>(&source);
-        }
+        self.cloud_task = None;
+        self.cloud_sample = None;
         if let Some(image) = self.cloud.take() {
             cx.drop_image(image, window.as_deref_mut());
         }
@@ -198,25 +186,6 @@ fn random(seed: u64, index: usize) -> f32 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     ((value ^ (value >> 31)) >> 40) as f32 / (1u32 << 24) as f32
-}
-fn particle(seed: u64, index: usize, time: f32, reveal: f32) -> (f32, f32, f32) {
-    let phase = random(seed, index * 7) * std::f32::consts::TAU;
-    let drift = (time * 0.42 + phase).sin() * 0.015;
-    let along = 0.12 + random(seed, index * 7 + 1) * 0.76 + (time * 0.31 + phase).cos() * 0.03;
-    let (x, y) = match index % 4 {
-        0 => (-0.025 + drift, along),
-        1 => (1.025 + drift, along),
-        2 => (along, -0.025 + drift),
-        _ => (along, 1.025 + drift),
-    };
-    let gather = smooth((reveal / 0.85).min(1.));
-    let target_x = 0.3 + random(seed, index * 7 + 3) * 0.4;
-    let target_y = 0.3 + random(seed, index * 7 + 4) * 0.4;
-    (
-        x + (target_x - x) * gather,
-        y + (target_y - y) * gather,
-        (1. - gather).powf(1.3),
-    )
 }
 
 /// A stable placeholder and reveal transition sharing GPUI's image/GIF cache.
@@ -315,10 +284,10 @@ impl Element for LoadingImage {
         let image = loaded.and_then(Result::ok);
         let (time, reveal, blurs) = state.update(cx, |state, cx| {
             if state.path != self.path {
-                state.clear_blur(Some(window), cx);
                 state.clear_rotation(cx);
                 // Receiving the downloaded path continues the existing placeholder.
                 if state.path.is_some() {
+                    state.clear_blur(Some(window), cx);
                     state.ready = None;
                     state.painted_loading = false;
                     state.started = now;
@@ -427,39 +396,93 @@ impl Element for LoadingImage {
         let dark = cx.theme().mode.is_dark();
         if reveal < 1. && !failed {
             let fade = 1. - smooth(reveal);
-            let cloud = window.use_asset::<CloudAsset>(&(seed, dark), cx);
-            state.update(cx, |state, _| {
-                state.cloud_source = Some((seed, dark));
-                state.cloud = cloud.clone();
-            });
-            if let Some(cloud) = cloud {
-                root = root.child(
-                    img(cloud)
-                        .object_fit(ObjectFit::Fill)
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .opacity(fade),
-                );
-            }
             let mark = state.clone();
+            let rounded = self.rounded;
+            let phase = if reduce {
+                0
+            } else {
+                (time * PLACEHOLDER_FPS).floor() as u64
+            };
+            let sample = (seed, dark, phase);
             root = root.child(
-                canvas(
-                    move |bounds, window, cx| {
-                        let visible = bounds.intersects(&window.content_mask().bounds);
-                        if visible {
-                            mark.update(cx, |state, _| state.painted_loading = true);
-                        }
-                        visible
-                    },
-                    move |_, visible, window, _| {
-                        if visible && !reduce {
-                            window.request_animation_frame();
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
+                div()
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .when(rounded, |view| view.rounded_lg())
+                    .overflow_hidden()
+                    .opacity(fade)
+                    .bg(hsla(
+                        random(seed, 30),
+                        0.24,
+                        if dark { 0.16 } else { 0.82 },
+                        1.,
+                    ))
+                    .child(
+                        canvas(
+                            move |bounds, window, cx| {
+                                let visible = bounds.intersects(&window.content_mask().bounds);
+                                if visible {
+                                    mark.update(cx, |state, _| state.painted_loading = true);
+                                }
+                                visible
+                            },
+                            move |bounds, visible, window, cx| {
+                                if !visible {
+                                    return;
+                                }
+                                let active = window.is_window_active();
+                                let cloud = state.update(cx, |state, cx| {
+                                    if state.cloud_task.is_none()
+                                        && state.cloud_sample != Some(sample)
+                                        && (active || state.cloud.is_none())
+                                    {
+                                        let job = cx.background_executor().spawn(async move {
+                                            Arc::new(RenderImage::new(vec![image::Frame::new(
+                                                cloud_pixels(
+                                                    seed,
+                                                    dark,
+                                                    phase as f32 / PLACEHOLDER_FPS,
+                                                ),
+                                            )]))
+                                        });
+                                        state.cloud_task =
+                                            Some(cx.spawn(async move |state, cx| {
+                                                let image = job.await;
+                                                let _ = state.update(cx, |state, cx| {
+                                                    if let Some(previous) =
+                                                        state.cloud.replace(image)
+                                                    {
+                                                        cx.drop_image(previous, None);
+                                                    }
+                                                    state.cloud_sample = Some(sample);
+                                                    state.cloud_task = None;
+                                                    App::notify(cx, owner);
+                                                });
+                                            }));
+                                    }
+                                    state.cloud.clone()
+                                });
+                                if let Some(cloud) = cloud {
+                                    let radius = if rounded { px(8.) } else { px(0.) };
+                                    if let Err(error) = window.paint_image(
+                                        bounds,
+                                        bounds,
+                                        Corners::all(radius),
+                                        cloud,
+                                        0,
+                                        false,
+                                    ) {
+                                        tracing::debug!(%error,"paint loading placeholder failed");
+                                    }
+                                }
+                                if active && !reduce {
+                                    window.request_animation_frame();
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
             );
         }
         if let Some(image) = image {
@@ -477,7 +500,7 @@ impl Element for LoadingImage {
                     .inset_0()
                     .when(self.rounded, |view| view.rounded_lg())
                     .overflow_hidden()
-                    .opacity(reveal)
+                    .opacity(smooth(reveal))
                     .child(content),
             );
         }
@@ -504,63 +527,6 @@ impl Element for LoadingImage {
                         ),
                 );
             }
-        }
-        if reveal < 1. && !failed && !reduce {
-            root = root.child(
-                canvas(
-                    |bounds, window, _| bounds.intersects(&window.content_mask().bounds),
-                    move |bounds, visible, window, _| {
-                        if !visible {
-                            return;
-                        }
-                        for i in 0..PARTICLES {
-                            let (x, y, alpha) = particle(seed, i, time, reveal);
-                            let radius =
-                                (1.5 + random(seed, i + 80) * 1.6) * (1. - smooth(reveal) * 0.7);
-                            let spot = Bounds::new(
-                                point(
-                                    bounds.left()
-                                        + (bounds.size.width * x)
-                                            .clamp(px(-8.), bounds.size.width + px(8.))
-                                        - px(radius),
-                                    bounds.top()
-                                        + (bounds.size.height * y)
-                                            .clamp(px(-8.), bounds.size.height + px(8.))
-                                        - px(radius),
-                                ),
-                                size(px(radius * 2.), px(radius * 2.)),
-                            );
-                            let color = hsla(
-                                random(seed, i + 30),
-                                0.55,
-                                if dark { 0.9 } else { 0.64 },
-                                alpha * 0.85,
-                            );
-                            window.paint_drop_shadows(
-                                spot,
-                                Corners::all(px(radius)),
-                                &[BoxShadow {
-                                    color: color.opacity(0.75),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(9.),
-                                    spread_radius: px(3.),
-                                    inset: false,
-                                }],
-                            );
-                            window.paint_quad(quad(
-                                spot,
-                                Corners::all(px(radius)),
-                                color,
-                                Edges::all(px(0.)),
-                                transparent_black(),
-                                BorderStyle::default(),
-                            ));
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            );
         }
         if failed {
             root = root.child(
@@ -604,39 +570,47 @@ impl Element for LoadingImage {
 
 #[cfg(test)]
 mod tests {
-    use super::{REVEAL_DURATION, particle, progress};
+    use super::{REVEAL_DURATION, cloud_pixels, progress};
     use std::time::{Duration, Instant};
     #[test]
-    fn placeholder_has_soft_silhouettes_and_fully_transparent_outer_edges() {
-        for seed in [0, 1, 42, 100] {
-            let pixels = super::cloud_pixels(seed, false);
-            for i in 0..96 {
-                assert_eq!(pixels.get_pixel(0, i)[3], 0);
-                assert_eq!(pixels.get_pixel(95, i)[3], 0);
-                assert_eq!(pixels.get_pixel(i, 0)[3], 0);
-                assert_eq!(pixels.get_pixel(i, 95)[3], 0);
+    fn blurred_placeholder_is_opaque_soft_seeded_and_continuously_changing() {
+        for dark in [false, true] {
+            let first = cloud_pixels(42, dark, 0.);
+            let later = cloud_pixels(42, dark, 3.);
+            let nearby = cloud_pixels(42, dark, 1. / 24.);
+            assert!(first.pixels().all(|pixel| pixel[3] == 255));
+            assert_ne!(first, cloud_pixels(43, dark, 0.));
+            assert_ne!(first, later);
+            let difference = |a: &image::RgbaImage, b: &image::RgbaImage| {
+                a.as_raw()
+                    .iter()
+                    .zip(b.as_raw())
+                    .map(|(a, b)| a.abs_diff(*b) as usize)
+                    .sum::<usize>()
+            };
+            assert!(difference(&first, &nearby) < difference(&first, &later));
+            for y in 0..48 {
+                for x in 1..48 {
+                    for channel in 0..3 {
+                        assert!(
+                            first.get_pixel(x, y)[channel]
+                                .abs_diff(first.get_pixel(x - 1, y)[channel])
+                                <= 4,
+                            "placeholder must have blurred contours"
+                        );
+                    }
+                }
             }
-            assert!(pixels.pixels().any(|pixel| pixel[3] > 180));
-            assert!(pixels.pixels().any(|pixel| pixel[3] > 0 && pixel[3] < 100));
-            assert!(pixels.get_pixel(48, 48)[3] > pixels.get_pixel(8, 8)[3]);
         }
     }
     #[test]
-    fn reveal_finishes_and_particles_converge_without_jumping_at_start() {
+    fn reveal_has_a_bounded_tween_and_finishes() {
         let now = Instant::now();
         assert_eq!(progress(None, now), 0.);
         assert_eq!(progress(Some(now), now), 0.);
         assert_eq!(progress(Some(now), now + REVEAL_DURATION), 1.);
+        assert_eq!(progress(Some(now), now + Duration::from_secs(2)), 1.);
         assert!(progress(Some(now), now + Duration::from_millis(240)) > 0.4);
-        for i in 0..9 {
-            let (x, y, alpha) = particle(42, i, 1., 0.);
-            let (next_x, next_y, _) = particle(42, i, 1., 0.001);
-            assert!((x - next_x).abs() < 0.001 && (y - next_y).abs() < 0.001);
-            assert_eq!(alpha, 1.);
-            let (x, y, alpha) = particle(42, i, 8., 1.);
-            assert!((0.3..=0.7).contains(&x) && (0.3..=0.7).contains(&y));
-            assert_eq!(alpha, 0.);
-        }
     }
 }
 

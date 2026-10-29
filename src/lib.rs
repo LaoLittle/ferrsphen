@@ -6,8 +6,10 @@ pub mod settings;
 
 extern crate self as ferrsphen;
 
+pub mod adapters;
 pub mod backend;
 mod image_cache;
+pub mod message_card;
 pub mod message_content;
 pub mod model;
 pub mod storage;
@@ -39,7 +41,13 @@ pub mod rich_clipboard;
 pub mod platform;
 
 #[cfg(feature = "desktop")]
+pub mod accounts;
+#[cfg(feature = "desktop")]
+pub mod adapter_view;
+#[cfg(feature = "desktop")]
 pub mod app;
+#[cfg(feature = "desktop")]
+pub mod launcher;
 #[cfg(feature = "desktop")]
 pub mod view;
 
@@ -58,3 +66,15 @@ mod message_text;
 pub mod activity;
 
 pub mod proto;
+
+#[cfg(feature = "desktop")]
+mod telegram_config;
+
+#[cfg(test)]
+#[path = "../build.rs"]
+mod build_script_tests;
+
+#[cfg(feature = "desktop")]
+mod chat_ui;
+#[cfg(feature = "desktop")]
+mod settings_ui;

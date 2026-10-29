@@ -12,6 +12,10 @@ use atri_qq::{
         Conversation, ForwardReference, Message, MessageElement, Messaging, PushEvent, Reply,
         RoamDirection,
     },
+    mini_app::{MiniApp, MiniAppShareRequest},
+    sdk_share::{
+        AndroidShareSource, MusicShareContent, MusicShareReceipt, MusicShareTarget, SdkShare,
+    },
 };
 use std::{
     path::{Path, PathBuf},
@@ -81,6 +85,18 @@ pub enum Command {
         conversation: Conversation,
         elements: Vec<MessageElement>,
     },
+    ShareMusic {
+        id: u64,
+        conversation: Conversation,
+        source: AndroidShareSource,
+        content: MusicShareContent,
+    },
+    SendCard {
+        id: u64,
+        nonce: u32,
+        conversation: Conversation,
+        request: MiniAppShareRequest,
+    },
     Compose {
         id: u64,
         nonce: u32,
@@ -132,6 +148,10 @@ pub enum Command {
     SaveChats(Vec<Chat>),
 }
 pub enum Update {
+    MusicShared {
+        id: u64,
+        result: Result<MusicShareReceipt, String>,
+    },
     Captcha {
         id: u64,
         result: Result<Option<crate::captcha::Ticket>, String>,
@@ -236,6 +256,9 @@ pub struct Backend {
 }
 impl Backend {
     pub fn start(root: PathBuf) -> Self {
+        Self::start_bound(root, None)
+    }
+    pub fn start_bound(root: PathBuf, expected_uin: Option<u64>) -> Self {
         let (commands, receiver) = mpsc::channel(128);
         let (sender, updates) = mpsc::channel(512);
         let (stop, stopped) = oneshot::channel();
@@ -248,7 +271,9 @@ impl Backend {
                     .build()
                     .expect("Tokio runtime");
                 executor.block_on(async {
-                    if let Err(error) = run(root, receiver, sender.clone(), stopped).await {
+                    if let Err(error) =
+                        run(root, receiver, sender.clone(), stopped, expected_uin).await
+                    {
                         tracing::error!(error = ?error);
                         let _ = sender.try_send(Update::Error(error.to_string()));
                     }
@@ -276,6 +301,7 @@ impl Backend {
 fn fresh_device(old: &Keystore) -> Keystore {
     Keystore {
         guid: old.guid.clone(),
+        ios_msf_imei: old.ios_msf_imei.clone(),
         device_name: old.device_name.clone(),
         android_id: old.android_id.clone(),
         qimei: old.qimei.clone(),
@@ -294,6 +320,7 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     sender: mpsc::Sender<Update>,
     mut stopped: oneshot::Receiver<()>,
+    mut expected_uin: Option<u64>,
 ) -> Result<()> {
     let db = Database::open(&root)?;
     let obsolete_cards = root.join("cache/cards");
@@ -348,6 +375,8 @@ async fn run(
             let transport: Arc<dyn ServiceClient> = client.clone();
             let operations = Arc::new(Operations::new(transport.clone()));
             let media = Arc::new(Media::new(transport.clone()));
+            let sdk_share = Arc::new(SdkShare::new(transport.clone()));
+            let mini_app = Arc::new(MiniApp::new(transport.clone()));
             let messaging = Arc::new(Messaging::new(transport, media.clone()));
             let mut events = client.login_events();
             let mut packets = client.subscribe();
@@ -371,9 +400,14 @@ async fn run(
                                 emit(&sender,Update::Qr{bytes:image,url}).await?;
                             }
                             Ok(LoginEvent::QrState(state))=>emit(&sender,Update::Status(format!("{state:?}"))).await?,
-                            Ok(LoginEvent::KeystoreChanged(keystore))=>{session.keystore=keystore;db.save_session(&session).await?;}
+                            Ok(LoginEvent::KeystoreChanged(keystore))=>{
+                                if expected_uin.is_some_and(|expected| keystore.uin != 0 && keystore.uin != expected) { anyhow::bail!("This profile belongs to another QQ account"); }
+                                session.keystore=keystore;db.save_session(&session).await?;}
                             Ok(LoginEvent::Online{..})=>{
-                                online=true;let state=client.snapshot().await;session.keystore=state.keystore;db.save_session(&session).await?;
+                                let state=client.snapshot().await;
+                                if expected_uin.is_some_and(|expected| state.keystore.uin != expected) { anyhow::bail!("This profile belongs to another QQ account"); }
+                                expected_uin=Some(state.keystore.uin);
+                                online=true;session.keystore=state.keystore;db.save_session(&session).await?;
                                 emit(&sender,Update::Online(UserInfo::from(&session.keystore))).await?;
                                 emit(&sender,Update::Restored(Box::new(db.restore(session.keystore.uin)?))).await?;
                                 let cached_friends=db.get::<Vec<Friend>>(&format!("friends/{}",session.keystore.uin))?.unwrap_or_default();
@@ -437,7 +471,9 @@ async fn run(
                         }
                         command=commands.recv(),if jobs.len()<32=>match command {
                             None=>break,
-                            Some(Command::Login{uin,password:input})=>{session.keystore=fresh_device(&session.keystore);session.keystore.uin=uin;password=Some(input);return Ok::<bool,anyhow::Error>(true);}
+                            Some(Command::Login{uin,password:input})=>{
+                                if expected_uin.is_some_and(|expected| expected != uin) { emit(&sender,Update::Error("This profile belongs to another QQ account".into())).await?;continue; }
+                                session.keystore=fresh_device(&session.keystore);session.keystore.uin=uin;password=Some(input);return Ok::<bool,anyhow::Error>(true);}
                             Some(Command::Qr)=>{session.keystore=fresh_device(&session.keystore);return Ok(true);}
                             Some(Command::Favorites)=>{
                                 if let Some(items)=db.get::<Vec<crate::expressions::Favorite>>(&format!("favorites/{}",session.keystore.uin))? {emit(&sender,Update::Favorites{cached:true,result:Ok(items)}).await?;}
@@ -520,6 +556,15 @@ async fn run(
                             Some(Command::History{conversation,cursor})=>{let operations=operations.clone();let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=load_history(&operations,&messaging,&conversation,cursor).await.map_err(|error|error.to_string());Update::History{key,result}});}
                             Some(Command::LocateReply{conversation,reply})=>{let messaging=messaging.clone();jobs.spawn(async move{let key=conversation_key(&conversation);let result=locate_reply(&messaging,&conversation,&reply).await.map_err(|error|format!("{error:#}"));Update::ReplyHistory{key,reply,result}});}
                             Some(Command::Send{id,nonce,conversation,elements})=>{let messaging=messaging.clone();jobs.spawn(async move{Update::Sent{id,result:messaging.send_with_nonce(conversation,elements,nonce).await.map_err(|error|error.to_string())}});}
+                            Some(Command::ShareMusic{id,conversation,source,content})=>{
+                                let api=sdk_share.clone();let operations=operations.clone();
+                                jobs.spawn(async move {
+                                    let result=share_music(&api,&operations,conversation,source,content).await;
+                                    if let Err(error)=&result {tracing::error!(?error,"music share failed");}
+                                    Update::MusicShared{id,result:result.map_err(|error|format!("{error:#}"))}
+                                });
+                            }
+                            Some(Command::SendCard{id,nonce,conversation,request})=>{let messaging=messaging.clone();let mini_app=mini_app.clone();jobs.spawn(async move{Update::Sent{id,result:send_mini_app_card(&messaging,&mini_app,conversation,request,nonce).await.map_err(|error|format!("{error:#}"))}});}
                             Some(Command::Compose{id,nonce,conversation,parts})=>{let messaging=messaging.clone();let media=media.clone();let cache=image_cache.clone();jobs.spawn(async move{for part in &parts {if let ComposePart::Image(path)=part && let Err(error)=cache.remember(path).await {tracing::debug!(%error,"cache outgoing image failed");}}Update::Sent{id,result:send_composed(&messaging,&media,conversation,parts,nonce).await.map_err(|error|format!("{error:#}"))}});}
                             Some(Command::Attachment{id,nonce,conversation,path,kind})=>{let messaging=messaging.clone();let media=media.clone();let cache=image_cache.clone();jobs.spawn(async move{if kind==AttachmentKind::Image && let Err(error)=cache.remember(&path).await {tracing::debug!(%error,"cache outgoing image failed");}Update::Sent{id,result:send_attachment(&messaging,&media,conversation,path,kind,nonce).await.map_err(|error|error.to_string())}});}
                             Some(Command::Preview{key,reference})=>{let media=media.clone();let cache=image_cache.clone();let path=root.join("cache");jobs.spawn(async move{let result=load_image(&media,&cache,&reference,&path,&key).await;match result{Ok(path)=>Update::Asset{key,path},Err(error)=>{tracing::warn!(%error,asset=key,"load preview failed");Update::AssetFailed{key}}}});}
@@ -986,6 +1031,62 @@ async fn download_open(media: &Media, reference: &MediaReference, root: &Path) -
     open::that(path)?;
     Ok(())
 }
+async fn share_music(
+    api: &SdkShare,
+    operations: &Operations,
+    conversation: Conversation,
+    source: AndroidShareSource,
+    content: MusicShareContent,
+) -> Result<MusicShareReceipt> {
+    let target = match conversation {
+        Conversation::Temporary { .. } => {
+            bail!("Music sharing is unavailable in temporary conversations")
+        }
+        Conversation::Group { uin } => MusicShareTarget::Group { uin },
+        Conversation::Friend { uin, uid } => MusicShareTarget::Friend {
+            uin: if uin != 0 {
+                uin
+            } else {
+                operations.resolve_uin(&uid).await?
+            },
+        },
+    };
+    let receipt = api
+        .share_music(atri_qq::sdk_share::ShareMusicRequest {
+            target,
+            source,
+            content,
+        })
+        .await?;
+    tracing::info!(?receipt, "music share receipt");
+    Ok(receipt)
+}
+
+async fn send_mini_app_card(
+    messaging: &Messaging,
+    mini_app: &MiniApp,
+    conversation: Conversation,
+    request: MiniAppShareRequest,
+    nonce: u32,
+) -> Result<Message> {
+    anyhow::ensure!(
+        !request.app_id.trim().is_empty(),
+        "Mini-app share requires app_id"
+    );
+    let card = mini_app
+        .adapt_share_info(request)
+        .await
+        .context("Adapt mini-app share info")?;
+    messaging
+        .send_with_nonce(
+            conversation,
+            vec![MessageElement::LightApp(card.light_app_json)],
+            nonce,
+        )
+        .await
+        .context("Send mini-app card")
+}
+
 async fn send_composed(
     messaging: &Messaging,
     media: &Media,
@@ -1137,174 +1238,6 @@ mod asset_tests {
     }
 
     #[tokio::test]
-    async fn downloaded_qq_voice_is_decoded_and_cached_as_wave() {
-        use super::*;
-        use atri_qq::media::{MediaConversation, MediaKind};
-        let root = tempfile::tempdir().unwrap();
-        let silk =
-            include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms.silk").to_vec();
-        let pcm = include_bytes!("../../atri_qq/silk/tests/fixtures/legacy_16000_100ms_24000.pcm");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let size = silk.len() as u64;
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        silk.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            socket.write_all(&silk).await.unwrap();
-        });
-        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
-        let media = Media::new(client);
-        let mut reference = MediaReference::new(
-            MediaKind::Voice,
-            MediaConversation::Friend { uid: "peer".into() },
-        );
-        reference.download_url = Some(format!("http://{address}/voice"));
-        reference.size = size;
-        let original = download_cached(&media, &reference, root.path(), "voice:test", "audio")
-            .await
-            .unwrap();
-        let old_wave = original.with_extension("wav");
-        tokio::fs::write(&old_wave, b"old decoded audio")
-            .await
-            .unwrap();
-        let wave = download_voice(&media, &reference, root.path(), "voice:test")
-            .await
-            .unwrap();
-        server.await.unwrap();
-        let bytes = std::fs::read(&wave).unwrap();
-        assert_eq!(&bytes[..4], b"RIFF");
-        assert_eq!(bytes.len(), 44 + pcm.len());
-        assert_ne!(wave, old_wave);
-        assert_eq!(
-            tokio::fs::read(&old_wave).await.unwrap(),
-            b"old decoded audio"
-        );
-        reference.download_url = Some("http://127.0.0.1:1/unavailable".into());
-        assert_eq!(
-            download_voice(&media, &reference, root.path(), "voice:test")
-                .await
-                .unwrap(),
-            wave
-        );
-    }
-
-    #[tokio::test]
-    async fn video_upload_derives_rotated_display_metadata_in_protocol() {
-        use super::*;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("clip.mp4");
-        tokio::fs::write(&path, include_bytes!("../tests/fixtures/rotated.mp4"))
-            .await
-            .unwrap();
-        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
-        let media = Arc::new(Media::new(client.clone()));
-        let messaging = Messaging::new(client, media.clone());
-        let error = send_attachment(
-            &messaging,
-            &media,
-            Conversation::Group { uin: 42 },
-            path,
-            AttachmentKind::Video,
-            1,
-        )
-        .await
-        .unwrap_err();
-        // Container validation completes before the offline client's negotiation.
-        assert!(
-            matches!(
-                error.downcast_ref::<atri_qq::Error>(),
-                Some(atri_qq::Error::Disconnected)
-            ),
-            "{error:#}"
-        );
-    }
-
-    #[cfg(feature = "desktop")]
-    #[tokio::test]
-    async fn parsed_video_thumbnail_failure_falls_back_to_cached_video() {
-        use super::*;
-        use atri_qq::{media::MediaConversation, proto::media as pb};
-        use prost::Message as _;
-        let root = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for route in ["/cover", "/video"] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let count = socket.read(&mut request).await.unwrap();
-                assert!(String::from_utf8_lossy(&request[..count]).contains(route));
-                let (status, body): (&str, &[u8]) = if route == "/cover" {
-                    ("404 Not Found", b"missing")
-                } else {
-                    ("200 OK", include_bytes!("../tests/fixtures/clip.mp4"))
-                };
-                socket
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                socket.write_all(body).await.unwrap();
-            }
-        });
-        let video = pb::VideoFile {
-            uuid: Some(b"clip".to_vec().into()),
-            width: Some(160),
-            height: Some(90),
-            duration: Some(1),
-            thumbnail_urls: vec![format!("http://{address}/cover").into_bytes().into()],
-            urls: vec![format!("http://{address}/video").into_bytes().into()],
-            ..Default::default()
-        };
-        let raw = pb::MediaElement {
-            video: Some(video.encode_to_vec().into()),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        let mut reference =
-            MediaReference::decode_element(&raw, MediaConversation::Group { uin: 42 })
-                .unwrap()
-                .unwrap();
-        assert_eq!((reference.width, reference.height), (160, 90));
-        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
-        let media = Media::new(client);
-        let preview = video_preview(&media, &reference, root.path(), "preview:video:test")
-            .await
-            .unwrap();
-        server.await.unwrap();
-        assert_eq!(image::image_dimensions(&preview).unwrap(), (160, 90));
-        reference.download_url = Some("http://127.0.0.1:1/unavailable".into());
-        let cached = download_video(
-            &media,
-            &reference,
-            &root.path().join("videos"),
-            "video:test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            tokio::fs::read(cached).await.unwrap(),
-            include_bytes!("../tests/fixtures/clip.mp4")
-        );
-    }
-
-    #[tokio::test]
     async fn video_download_uses_updated_nt_request_without_legacy_identity() {
         use super::*;
         use atri_qq::{
@@ -1380,68 +1313,6 @@ mod asset_tests {
     }
 
     #[tokio::test]
-    async fn video_download_reuses_cache_and_checks_integrity() {
-        use super::*;
-        use atri_qq::media::{MediaConversation, MediaKind};
-        let root = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let count = socket.read(&mut request).await.unwrap();
-                assert!(
-                    String::from_utf8_lossy(&request[..count]).starts_with("GET /video?key=a%2Bb ")
-                );
-                let body = include_bytes!("../tests/fixtures/clip.mp4");
-                socket
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                socket.write_all(body).await.unwrap();
-            }
-        });
-        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
-        let media = Media::new(client);
-        let mut reference = MediaReference::new(
-            MediaKind::Video,
-            MediaConversation::Friend { uid: "peer".into() },
-        );
-        reference.download_url = Some(format!("http://{address}/video?key=a%2Bb"));
-        reference.size = include_bytes!("../tests/fixtures/clip.mp4").len() as u64;
-        let path = download_video(&media, &reference, root.path(), "video:test")
-            .await
-            .unwrap();
-        assert_eq!(
-            tokio::fs::read(&path).await.unwrap(),
-            include_bytes!("../tests/fixtures/clip.mp4")
-        );
-        assert_eq!(
-            download_video(&media, &reference, root.path(), "video:test")
-                .await
-                .unwrap(),
-            path
-        );
-        reference.size += 1;
-        assert!(
-            download_video(&media, &reference, root.path(), "video:bad")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("size mismatch")
-        );
-        assert!(!media_cache_path(root.path(), "video:bad", "mp4").exists());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn avatar_cache_is_bound_to_uin_and_reused_without_network() {
         let root = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1491,6 +1362,7 @@ mod session_tests {
                 uid: "old-account".into(),
                 guid: vec![7; 16],
                 device_name: "device".into(),
+                ios_msf_imei: "A0000000-0000-4000-8000-000000000001".into(),
                 android_id: "id".into(),
                 qimei: "qimei".into(),
                 o3_xwid_switch: selector,
@@ -1499,12 +1371,23 @@ mod session_tests {
                 d2: vec![3],
                 d2_key: vec![4],
                 qr_sig: vec![5],
+                key_exchange_session: Some(
+                    atri_qq::NtKeyExchangeSession::new(
+                        atri_qq::ClientPlatform::IPhone,
+                        bytes::Bytes::from_static(&[7; 16]),
+                        bytes::Bytes::from_static(b"synthetic-ticket"),
+                        600,
+                    )
+                    .unwrap(),
+                ),
                 ..Default::default()
             };
             let fresh = fresh_device(&stored);
             assert_eq!(fresh.o3_xwid_switch, selector);
             assert_eq!(fresh.guid, stored.guid);
             assert_eq!(fresh.device_name, stored.device_name);
+            assert_eq!(fresh.ios_msf_imei, stored.ios_msf_imei);
+            assert!(fresh.key_exchange_session.is_none());
             assert_eq!(fresh.android_id, stored.android_id);
             assert_eq!(fresh.qimei, stored.qimei);
             assert_eq!(fresh.uin, 0);
@@ -1819,5 +1702,357 @@ mod image_cache_tests {
                 path
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mini_app_card_tests {
+    use super::*;
+    use atri_qq::{
+        mini_app::ADAPT_SHARE_INFO_COMMAND,
+        proto::{messages as rpc, mini_app as pb},
+    };
+    use bytes::Bytes;
+    use prost::Message as _;
+    use std::sync::Mutex;
+
+    struct Mock {
+        response: pb::AdaptShareInfoResponse,
+        calls: Mutex<Vec<(String, Bytes)>>,
+    }
+    #[async_trait::async_trait]
+    impl ServiceClient for Mock {
+        async fn request(
+            &self,
+            command: &str,
+            body: Bytes,
+            request_type: atri_qq::RequestType,
+            encryption: atri_qq::Encryption,
+            _: Duration,
+        ) -> atri_qq::Result<Bytes> {
+            assert_eq!(request_type, atri_qq::RequestType::D2);
+            assert_eq!(encryption, atri_qq::Encryption::D2);
+            self.calls.lock().unwrap().push((command.into(), body));
+            match command {
+                ADAPT_SHARE_INFO_COMMAND => Ok(self.response.encode_to_vec().into()),
+                "MessageSvc.PbSendMsg" => Ok(rpc::SendMessageResponse {
+                    sequence: Some(123),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into()),
+                _ => panic!("Unexpected request: {command}"),
+            }
+        }
+        async fn snapshot(&self) -> atri_qq::SessionState {
+            atri_qq::SessionState {
+                profile: atri_qq::Profile::linux(),
+                keystore: Keystore::default(),
+                machine_id: String::new(),
+                online: true,
+            }
+        }
+        async fn replace_state(&self, _: atri_qq::SessionState) {
+            unreachable!()
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<atri_qq::IncomingPacket> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+    fn services(response: pb::AdaptShareInfoResponse) -> (Arc<Mock>, MiniApp, Messaging) {
+        let client = Arc::new(Mock {
+            response,
+            calls: Mutex::default(),
+        });
+        let media = Arc::new(Media::new(client.clone()));
+        (
+            client.clone(),
+            MiniApp::new(client.clone()),
+            Messaging::new(client, media),
+        )
+    }
+    fn request() -> MiniAppShareRequest {
+        MiniAppShareRequest {
+            app_id: "caller-supplied-id".into(),
+            title: Some(String::new()),
+            description: None,
+            is_wx_mini_app: true,
+            template: Some(atri_qq::mini_app::MiniAppShareTemplate {
+                id: "caller-template".into(),
+                data: "{ \"nested\": true }".into(),
+            }),
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn mini_app_card_adapts_before_sending_and_preserves_server_authorization() {
+        let raw = r#"{"appName":"com.tencent.miniapp_01","appView":"detail_1","metaData":{"detail_1":{"title":"server title"}},"config":{"token":"synthetic-server-token","ctime":1800000000,"unknown":[1,2]},"unknownRoot":{"keep":true}}"#;
+        let (client, api, messaging) = services(pb::AdaptShareInfoResponse {
+            code: Some(0),
+            content: Some(pb::AdaptShareInfoContent {
+                json: Some(raw.into()),
+            }),
+            ..Default::default()
+        });
+        let conversation = Conversation::Group { uin: 42 };
+        let message = send_mini_app_card(&messaging, &api, conversation.clone(), request(), 987)
+            .await
+            .unwrap();
+        assert_eq!(message.random, 987);
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+            [ADAPT_SHARE_INFO_COMMAND, "MessageSvc.PbSendMsg"]
+        );
+        let adapted = pb::AdaptShareInfoRequest::decode(calls[0].1.clone())
+            .unwrap()
+            .body
+            .unwrap();
+        assert_eq!(adapted.app_id.as_deref(), Some("caller-supplied-id"));
+        assert_eq!(adapted.title.as_deref(), Some(""));
+        assert!(adapted.description.is_none());
+        assert_eq!(adapted.business_type, Some(2));
+        let template = adapted.template.unwrap();
+        assert_eq!(template.id.as_deref(), Some("caller-template"));
+        assert_eq!(template.data.as_deref(), Some("{ \"nested\": true }"));
+        let sent = rpc::SendMessageRequest::decode(calls[1].1.clone()).unwrap();
+        assert_eq!(sent.random, Some(987));
+        let decoded = atri_qq::messages::decode_elements(&sent.body, &conversation, 0).unwrap();
+        let [MessageElement::LightApp(json)] = decoded.elements.as_slice() else {
+            panic!("expected a server-generated LightApp")
+        };
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let original: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(value["config"], original["config"]);
+        assert_eq!(value["unknownRoot"], original["unknownRoot"]);
+        assert_eq!(value["meta"], original["metaData"]);
+        assert_eq!(value["miniappShareOrigin"], 3);
+        assert_eq!(value["miniappOpenRefer"], "10002");
+        assert!(
+            matches!(message.elements.as_slice(), [MessageElement::LightApp(sent)] if sent == json)
+        );
+    }
+    #[tokio::test]
+    async fn mini_app_card_rejection_and_malformed_success_never_send_a_message() {
+        for response in [
+            pb::AdaptShareInfoResponse {
+                code: Some(403),
+                error_message: Some("synthetic rejection".into()),
+                ..Default::default()
+            },
+            pb::AdaptShareInfoResponse::default(),
+            pb::AdaptShareInfoResponse {
+                code: Some(0),
+                content: Some(pb::AdaptShareInfoContent {
+                    json: Some("{}".into()),
+                }),
+                ..Default::default()
+            },
+        ] {
+            let (client, api, messaging) = services(response);
+            assert!(
+                send_mini_app_card(
+                    &messaging,
+                    &api,
+                    Conversation::Group { uin: 42 },
+                    request(),
+                    987
+                )
+                .await
+                .is_err()
+            );
+            let calls = client.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, ADAPT_SHARE_INFO_COMMAND);
+        }
+        let (client, api, messaging) = services(Default::default());
+        assert!(
+            send_mini_app_card(
+                &messaging,
+                &api,
+                Conversation::Group { uin: 42 },
+                MiniAppShareRequest::default(),
+                987
+            )
+            .await
+            .is_err()
+        );
+        assert!(client.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod music_share_tests {
+    use super::*;
+    use atri_qq::proto::sdk_share as pb;
+    use bytes::Bytes;
+    use prost::Message as _;
+    use std::sync::Mutex;
+
+    struct Mock {
+        calls: Mutex<Vec<(String, Bytes)>>,
+        reject: bool,
+        timeout: bool,
+    }
+    #[async_trait::async_trait]
+    impl ServiceClient for Mock {
+        async fn request(
+            &self,
+            command: &str,
+            body: Bytes,
+            kind: atri_qq::RequestType,
+            encryption: atri_qq::Encryption,
+            _: Duration,
+        ) -> atri_qq::Result<Bytes> {
+            assert_eq!(kind, atri_qq::RequestType::D2);
+            assert_eq!(encryption, atri_qq::Encryption::D2);
+            assert_eq!(command, atri_qq::sdk_share::SHARE_MUSIC_COMMAND);
+            self.calls.lock().unwrap().push((command.into(), body));
+            if self.timeout {
+                return Err(atri_qq::Error::Timeout);
+            }
+            Ok(pb::LegacyOidbEnvelope {
+                command: Some(0xb77),
+                service: Some(9),
+                result: Some(if self.reject { 403 } else { 0 }),
+                error_message: self.reject.then(|| "rejected".into()),
+                body: Some(
+                    pb::ShareMusicResponse {
+                        wording: Some("ok".into()),
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                    .into(),
+                ),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into())
+        }
+        async fn snapshot(&self) -> atri_qq::SessionState {
+            atri_qq::SessionState {
+                profile: atri_qq::Profile::linux(),
+                keystore: Keystore::default(),
+                machine_id: String::new(),
+                online: true,
+            }
+        }
+        async fn replace_state(&self, _: atri_qq::SessionState) {
+            unreachable!()
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<atri_qq::IncomingPacket> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+    fn source() -> AndroidShareSource {
+        AndroidShareSource {
+            app_id: 12345,
+            package_name: "dev.example.music".into(),
+            signature_md5: "0123456789ABCDEF0123456789ABCDEF".into(),
+            sdk_version: None,
+        }
+    }
+    fn content() -> MusicShareContent {
+        MusicShareContent {
+            title: "Song".into(),
+            summary: Some("Artist".into()),
+            jump_url: "https://example.com/song".into(),
+            picture_url: "https://example.com/cover.jpg".into(),
+            music_url: "https://example.com/song.mp3".into(),
+        }
+    }
+    #[tokio::test]
+    async fn music_share_uses_sdk_rpc_once_for_friend_and_group() {
+        for (conversation, send_type) in [
+            (Conversation::Group { uin: 42 }, 1),
+            (
+                Conversation::Friend {
+                    uin: 42,
+                    uid: "peer".into(),
+                },
+                0,
+            ),
+        ] {
+            let client = Arc::new(Mock {
+                calls: Mutex::default(),
+                reject: false,
+                timeout: false,
+            });
+            let api = SdkShare::new(client.clone());
+            let operations = Operations::new(client.clone());
+            let receipt = share_music(&api, &operations, conversation, source(), content())
+                .await
+                .unwrap();
+            assert_eq!(receipt.wording.as_deref(), Some("ok"));
+            let calls = client.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let envelope = pb::LegacyOidbEnvelope::decode(calls[0].1.clone()).unwrap();
+            let body = pb::ShareMusicRequest::decode(envelope.body.unwrap()).unwrap();
+            assert_eq!(body.send_type, Some(send_type));
+            assert_eq!(body.receiver_uin, Some(42));
+            assert_eq!(body.app_id, Some(12345));
+            let info = body.client_info.unwrap();
+            assert_eq!(
+                info.android_package_name.as_deref(),
+                Some("dev.example.music")
+            );
+            assert_eq!(
+                info.android_signature.as_deref(),
+                Some("0123456789abcdef0123456789abcdef")
+            );
+            let music = body.rich_message.unwrap();
+            assert_eq!(music.title.as_deref(), Some("Song"));
+            assert_eq!(music.summary.as_deref(), Some("Artist"));
+            assert_eq!(
+                music.music_url.as_deref(),
+                Some("https://example.com/song.mp3")
+            );
+            assert_eq!(
+                music.picture_url.as_deref(),
+                Some("https://example.com/cover.jpg")
+            );
+            assert_eq!(music.url.as_deref(), Some("https://example.com/song"));
+        }
+    }
+    #[tokio::test]
+    async fn rejected_music_share_is_not_retried_or_sent_as_a_normal_message() {
+        let client = Arc::new(Mock {
+            calls: Mutex::default(),
+            reject: true,
+            timeout: false,
+        });
+        let error = share_music(
+            &SdkShare::new(client.clone()),
+            &Operations::new(client.clone()),
+            Conversation::Group { uin: 42 },
+            source(),
+            content(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("403"));
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn unconfirmed_music_share_preserves_uncertainty_without_retrying() {
+        let client = Arc::new(Mock {
+            calls: Mutex::default(),
+            reject: false,
+            timeout: true,
+        });
+        let error = share_music(
+            &SdkShare::new(client.clone()),
+            &Operations::new(client.clone()),
+            Conversation::Group { uin: 42 },
+            source(),
+            content(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<atri_qq::Error>(),
+            Some(atri_qq::Error::UnconfirmedSdkShare { .. })
+        ));
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
     }
 }

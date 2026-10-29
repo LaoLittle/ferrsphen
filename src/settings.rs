@@ -121,6 +121,16 @@ pub fn apply_theme(
         theme.colors.accent = rgb(accent).into();
         theme.colors.primary = rgb(primary).into();
     });
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    gpui_mobile::set_system_chrome(&gpui_mobile::SystemChromeStyle {
+        status_bar_color: Some(if mode.is_dark() { 0x202020 } else { 0xf7f7f7 }),
+        status_bar_style: if mode.is_dark() {
+            gpui_mobile::StatusBarContentStyle::Light
+        } else {
+            gpui_mobile::StatusBarContentStyle::Dark
+        },
+        ..Default::default()
+    });
 }
 
 #[cfg(test)]

@@ -64,7 +64,12 @@ pub fn extract_preview(source: &std::path::Path, output: &std::path::Path) -> an
     }
 }
 
+pub struct CloseRequested;
+
+impl EventEmitter<CloseRequested> for VideoView {}
+
 pub struct VideoView {
+    embedded: bool,
     player: Option<Player>,
     frame: Option<(Arc<RenderImage>, Arc<[u8]>)>,
     retired: VecDeque<(Instant, Arc<RenderImage>)>,
@@ -131,6 +136,7 @@ impl VideoView {
         })
         .detach();
         Self {
+            embedded: false,
             player: None,
             frame: None,
             retired: VecDeque::new(),
@@ -148,6 +154,10 @@ impl VideoView {
     }
     pub fn watch(&mut self, subscription: Subscription) {
         self.subscriptions.push(subscription);
+    }
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
     }
     pub fn complete_download(&mut self, result: Result<PathBuf, String>, cx: &mut Context<Self>) {
         if self.opening || self.path.is_some() || self.error.is_some() {
@@ -319,6 +329,7 @@ impl Render for VideoView {
         }
         let content = div()
             .id("video-player")
+            .debug_selector(|| "video-player".into())
             .track_focus(&self.focus)
             .flex()
             .flex_col()
@@ -331,6 +342,7 @@ impl Render for VideoView {
                     "left" => this.seek_by(-5.),
                     "right" => this.seek_by(5.),
                     "f" => window.toggle_fullscreen(),
+                    "escape" if this.embedded => cx.emit(CloseRequested),
                     "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
                     "escape" => {
                         let handle = window.window_handle();
@@ -343,11 +355,13 @@ impl Render for VideoView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .child(
-                crate::window_chrome::title_bar(cx)
-                    .h_12()
-                    .child(div().flex_1()),
-            )
+            .when(!self.embedded, |view| {
+                view.child(
+                    crate::window_chrome::title_bar(cx)
+                        .h_12()
+                        .child(div().flex_1()),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -470,7 +484,11 @@ impl Render for VideoView {
                             ),
                     ),
             );
-        crate::window_chrome::surface(content, window, cx)
+        if self.embedded {
+            content.into_any_element()
+        } else {
+            crate::window_chrome::surface(content, window, cx).into_any_element()
+        }
     }
 }
 fn timestamp(duration: Duration) -> String {

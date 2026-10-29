@@ -316,9 +316,16 @@ impl RenderOnce for EmojiImage {
                 .child(gpui_kit::component::spinner::Spinner::new())
                 .into_any_element()
         } else {
+            let font_size = if self.fallback.starts_with('[') {
+                px(20.).min(self.edge * (20. / 24.))
+            } else {
+                self.edge * (20. / 24.)
+            };
             div()
-                .text_size(px(20.))
-                .line_height(px(24.))
+                .max_w_full()
+                .truncate()
+                .text_size(font_size)
+                .line_height(self.edge)
                 .child(self.fallback)
                 .into_any_element()
         };

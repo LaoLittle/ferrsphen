@@ -1,4 +1,4 @@
-//! Protocol-neutral contracts. Implementations own networking; hosts own UI and storage policy.
+//! Protocol-neutral adapter contracts.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +35,7 @@ pub enum Error {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccountId {
     pub adapter: String,
-    /// Adapter-local account key. It must remain stable across reconnects.
+    /// Adapter-local account key, stable across reconnects.
     pub id: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -90,7 +90,7 @@ pub struct Conversation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Media {
-    /// Opaque, adapter-owned reference, not a local file path or expiring download URL.
+    /// Opaque, adapter-owned reference.
     pub id: String,
     pub mime: Option<String>,
     pub name: Option<String>,
@@ -126,13 +126,13 @@ pub enum DisplayPart {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionContent {
-    /// Namespaced stable identifier, for example `qq.poke`, not a Rust enum discriminant.
+    /// Namespaced stable identifier, for example `qq.poke`.
     pub kind: String,
     pub version: u32,
     /// Preserved even if the receiving host has no dedicated renderer.
     pub data: serde_json::Value,
     pub layout: Layout,
-    /// Safe declarative fallback; hosts never execute platform markup or scripts.
+    /// Declarative fallback rendering.
     pub display: Vec<DisplayPart>,
 }
 impl Content {
@@ -222,7 +222,7 @@ pub struct SendRequest {
 #[derive(Clone, Debug)]
 pub enum SendOutcome {
     Confirmed(Box<Message>),
-    /// The server accepted an operation without returning a message identity. Do not invent one.
+    /// The server accepted an operation without returning a message identity.
     Accepted {
         client_id: String,
     },
@@ -281,7 +281,6 @@ pub enum AuthState {
     },
     Closed,
 }
-/// Deliberately not Debug/Serialize: passwords, codes and API credentials must not enter logs or storage accidentally.
 pub struct AuthInput {
     pub step: String,
     pub fields: BTreeMap<String, String>,
@@ -327,7 +326,7 @@ pub enum Event {
     ResyncRequired,
 }
 
-/// A single account/session. No GUI, host database, QQ, or Telegram types cross this boundary.
+/// A single account/session.
 pub trait Adapter: Send + Sync {
     fn descriptor(&self) -> Descriptor;
     fn account(&self) -> AccountId;
@@ -338,7 +337,7 @@ pub trait Adapter: Send + Sync {
     fn send(&self, request: SendRequest) -> Task<'_, SendOutcome>;
     fn download(&self, media: Media, destination: PathBuf) -> Task<'_, PathBuf>;
     fn execute(&self, request: ExtensionRequest) -> Task<'_, serde_json::Value>;
-    /// Ends tasks and releases the session. Must be safe to call more than once.
+    /// Ends tasks and releases the session. Idempotent.
     fn close(&self) -> Task<'_, ()>;
 }
 

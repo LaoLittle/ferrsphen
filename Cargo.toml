@@ -1,3 +1,11 @@
+[workspace]
+members = ["crates/chat-adapter", "crates/td-rust", "crates/adapter-telegram", "crates/adapter-qq", "crates/adapter-matrix"]
+exclude = ["crates/grammers"]
+resolver = "3"
+
+[workspace.dependencies]
+atri_qq = { git = "https://github.com/LaoLittle/atri_qq", default-features = false }
+
 [package]
 name = "ferrsphen"
 version = "0.1.2"
@@ -10,12 +18,17 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:gpui-kit", "dep:alhazen-core", "dep:gpui-webview", "dep:wry", "dep:velato", "dep:vello_cpu"]
+desktop = ["dep:gpui-kit", "dep:alhazen-core", "dep:gpui-webview", "dep:wry", "dep:velato", "dep:vello_cpu", "dep:raw-window-handle", "dep:objc2", "dep:objc2-foundation"]
 ui-tests = ["desktop", "dep:gpui"]
 
 [dependencies]
+raw-window-handle = { version = "0.6", optional = true }
+chat-adapter = { path = "crates/chat-adapter" }
+adapter-telegram = { path = "crates/adapter-telegram" }
+adapter-qq = { path = "crates/adapter-qq" }
+adapter-matrix = { path = "crates/adapter-matrix" }
 gpui = { package = "gpui-pre", version = "0.3", optional = true, features = ["test-support"] }
-atri_qq = { git = "https://github.com/LaoLittle/atri_qq", default-features = false }
+atri_qq = { workspace = true }
 gpui-kit = { version = "0.8", optional = true }
 velato = { version = "0.12", optional = true, default-features = false }
 vello_cpu = { version = "0.3", optional = true, default-features = false, features = ["std", "u8_pipeline"] }
@@ -54,16 +67,28 @@ wry = { package = "lb-wry", version = "0.53", optional = true }
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "c24a1308e1dcb47ce94d9ef8d8d05ca4d77d2aa7", default-features = false, features = ["clipboard", "file_selector", "image_picker", "url_launcher", "path_provider", "camera", "video_player"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSGeometry"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
+log = "0.4"
+rustls-platform-verifier = "0.7"
+rust-embed = { version = "8", features = ["debug-embed"] }
+jni = { version = "0.22", default-features = false }
 
 [dev-dependencies]
+# gpui-mobile pins gpui-pre =0.3.9; keep the platform test crate on the same release.
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["test-support"] }
 log = "0.4"
 async-trait = "0.1"
 bytes = "1"
 tempfile = "3"
+
+[patch.crates-io]
+gpui-pre-wgpu = { path = "patches/gpui-pre-wgpu" }
 
 [[bin]]
 name = "ferrsphen"
@@ -75,6 +100,7 @@ name = "preview"
 required-features = ["desktop"]
 
 [build-dependencies]
+toml = "1"
 prost-build = "0.14"
 protoc-bin-vendored = "3"
 

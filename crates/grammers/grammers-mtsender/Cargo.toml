@@ -23,7 +23,7 @@ grammers-session = { path = "../grammers-session", version = "0.11.0", default-f
 grammers-tl-types = { path = "../grammers-tl-types", version = "0.11.0", features = [ "tl-mtproto", "deserializable-functions" ] }
 locate-locale = "0.2.0"
 os_info = { version = "3.15.0", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["io-util", "sync", "time", "net", "macros", "rt"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "sync", "time", "net", "macros", "rt"] }
 tracing.workspace = true
 
 tokio-socks = { version = "0.5.3", optional = true }

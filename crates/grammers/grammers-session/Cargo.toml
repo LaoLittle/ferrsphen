@@ -22,7 +22,7 @@ serde = ["dep:serde", "dep:serde_with"]
 grammers-tl-types = { path = "../grammers-tl-types", version = "0.11.0" }
 
 libsql = { version = "0.10.0", default-features = false, features = ["core"], optional = true }
-tokio = { version = "1.53.3", default-features = false, features = ["sync"] }
+tokio = { version = "1.54.1", default-features = false, features = ["sync"] }
 tracing.workspace = true
 
 serde = { version = "1", features = ["derive"], optional = true }
@@ -30,4 +30,4 @@ serde_with = { version = "3", features = ["hex"], optional = true }
 
 [dev-dependencies]
 toml = "1.1.8"
-tokio = { version = "1.53.3", default-features = false, features = ["sync", "rt"] }
+tokio = { version = "1.54.1", default-features = false, features = ["sync", "rt"] }

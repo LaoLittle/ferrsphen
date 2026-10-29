@@ -1,5 +1,6 @@
 use gpui_kit::{
     component::{ActiveTheme, TitleBar},
+    prelude::FluentBuilder,
     *,
 };
 
@@ -9,12 +10,16 @@ gpui_kit::actions!(ferrsphen, [ToggleFullscreen]);
 enum Platform {
     Mac,
     Mobile,
+    /// Desktop window simulating a phone: plain native frame, mobile layout.
+    Phone,
     Windows,
     Linux,
 }
 fn platform() -> Platform {
     if cfg!(any(target_os = "ios", target_os = "android")) {
         Platform::Mobile
+    } else if crate::platform::simulated_phone() {
+        Platform::Phone
     } else if cfg!(target_os = "macos") {
         Platform::Mac
     } else if cfg!(target_os = "windows") {
@@ -23,6 +28,9 @@ fn platform() -> Platform {
         Platform::Linux
     }
 }
+/// Logical size of the simulated phone window (iPhone 14/15).
+const PHONE_SIZE: Size<Pixels> = size(px(390.), px(844.));
+const PHONE_MIN_SIZE: Size<Pixels> = size(px(320.), px(568.));
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("f11", ToggleFullscreen, None)]);
 }
@@ -46,12 +54,14 @@ impl AppWindowKind {
     }
 }
 pub fn app_options(kind: AppWindowKind, cx: &App) -> WindowOptions {
-    if matches!(platform(), Platform::Mobile) {
-        return options("ferrsphen");
-    }
+    let (window_size, min_size) = match platform() {
+        Platform::Mobile => return options("ferrsphen"),
+        Platform::Phone => (PHONE_SIZE, PHONE_MIN_SIZE),
+        _ => (kind.size(), kind.min_size()),
+    };
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(kind.size(), cx)),
-        window_min_size: Some(kind.min_size()),
+        window_bounds: Some(WindowBounds::centered(window_size, cx)),
+        window_min_size: Some(min_size),
         ..options("ferrsphen")
     }
 }
@@ -59,11 +69,24 @@ pub fn options(title: impl Into<SharedString>) -> WindowOptions {
     options_for(platform(), title.into())
 }
 fn options_for(platform: Platform, title: SharedString) -> WindowOptions {
-    if matches!(platform, Platform::Mobile) {
-        return WindowOptions {
-            titlebar: None,
-            ..Default::default()
-        };
+    match platform {
+        Platform::Mobile => {
+            return WindowOptions {
+                titlebar: None,
+                ..Default::default()
+            };
+        }
+        Platform::Phone => {
+            return WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
+                ..Default::default()
+            };
+        }
+        _ => {}
     }
     WindowOptions {
         app_owns_titlebar_drag: true,
@@ -105,7 +128,7 @@ pub fn surface(content: impl IntoElement, window: &mut Window, cx: &mut App) -> 
     if window.focused(cx).is_none() {
         focus.focus(window, cx);
     }
-    let visible = window.fully_visible_bounds();
+    let visible = crate::platform::content_bounds(window);
     let viewport = window.viewport_size();
     div()
         .relative()
@@ -120,6 +143,9 @@ pub fn surface(content: impl IntoElement, window: &mut Window, cx: &mut App) -> 
         .size_full()
         .min_w_0()
         .min_h_0()
+        .when(crate::platform::is_mobile(), |surface| {
+            surface.bg(cx.theme().background)
+        })
         .flex()
         .flex_col()
         .pl(visible.left())
@@ -141,8 +167,98 @@ pub fn surface(content: impl IntoElement, window: &mut Window, cx: &mut App) -> 
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .when(crate::platform::is_mobile(), |content| {
+                    content.overflow_hidden()
+                })
                 .child(content),
         )
+}
+
+const RESIZE_DURATION: std::time::Duration = std::time::Duration::from_millis(360);
+struct ResizeTween {
+    from: Size<Pixels>,
+    to: Size<Pixels>,
+    started: std::time::Instant,
+}
+#[derive(Default)]
+struct ResizeState {
+    kind: Option<AppWindowKind>,
+    tween: Option<ResizeTween>,
+}
+fn tween_size(from: Size<Pixels>, to: Size<Pixels>, progress: f32) -> Size<Pixels> {
+    let t = crate::ui_motion::page_progress(progress.clamp(0., 1.));
+    size(
+        px((f32::from(from.width) + (f32::from(to.width) - f32::from(from.width)) * t).round()),
+        px((f32::from(from.height) + (f32::from(to.height) - f32::from(from.height)) * t).round()),
+    )
+}
+/// Called during render. Frame scheduling continues independently of pointer input.
+pub fn resize_to(kind: AppWindowKind, window: &mut Window, cx: &mut App) {
+    if crate::platform::is_mobile() {
+        return;
+    }
+    let state = window.use_state(cx, |_, _| ResizeState::default());
+    let now = cx.background_executor().now();
+    let current = window.bounds().size;
+    let limit = window
+        .display(cx)
+        .map(|display| display.bounds().size)
+        .unwrap_or(kind.size());
+    let target = size(
+        kind.size().width.min((limit.width - px(40.)).max(px(1.))),
+        kind.size().height.min((limit.height - px(60.)).max(px(1.))),
+    );
+    let (next, animating) = state.update(cx, |state, _| {
+        if window.is_fullscreen() || window.is_maximized() {
+            state.kind = Some(kind);
+            state.tween = None;
+            return (None, false);
+        }
+        if state.kind != Some(kind) {
+            state.kind = Some(kind);
+            state.tween = (current != target).then_some(ResizeTween {
+                from: current,
+                to: target,
+                started: now,
+            });
+        }
+        if let Some(tween) = &state.tween {
+            let progress = now.saturating_duration_since(tween.started).as_secs_f32()
+                / RESIZE_DURATION.as_secs_f32();
+            let next = tween_size(tween.from, tween.to, progress);
+            let animating = progress < 1.;
+            if !animating {
+                state.tween = None;
+            }
+            return (Some(next), animating);
+        }
+        let minimum = size(
+            kind.min_size().width.min(target.width),
+            kind.min_size().height.min(target.height),
+        );
+        if current.width < minimum.width || current.height < minimum.height {
+            return (
+                Some(size(
+                    current.width.max(minimum.width),
+                    current.height.max(minimum.height),
+                )),
+                false,
+            );
+        }
+        (None, false)
+    });
+    if let Some(next) = next
+        && next != current
+    {
+        crate::platform::resize_window(window, next, kind.min_size(), cx);
+    }
+    #[cfg(target_os = "macos")]
+    if !window.is_fullscreen() {
+        window.set_traffic_light_position(point(px(12.), px(20.)));
+    }
+    if animating {
+        window.request_animation_frame();
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +287,14 @@ mod tests {
         let mobile = options_for(Platform::Mobile, "test".into());
         assert!(mobile.titlebar.is_none());
         assert!(mobile.window_decorations.is_none());
+        let phone = options_for(Platform::Phone, "test".into());
+        let titlebar = phone.titlebar.unwrap();
+        assert!(!titlebar.appears_transparent);
+        assert!(titlebar.traffic_light_position.is_none());
+        assert!(phone.window_decorations.is_none());
+        assert!(!phone.app_owns_titlebar_drag);
+        assert!(crate::chat_ui::phone_layout(super::PHONE_SIZE));
+        assert!(crate::chat_ui::phone_layout(super::PHONE_MIN_SIZE));
     }
 }
 
@@ -272,5 +396,20 @@ mod layout_tests {
                 assert_eq!(control.bottom(), content.bottom());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::{AppWindowKind, tween_size};
+    #[test]
+    fn expansion_and_contraction_have_exact_endpoints_and_continuous_intermediate_sizes() {
+        let small = AppWindowKind::Login.size();
+        let large = AppWindowKind::Main.size();
+        assert_eq!(tween_size(small, large, 0.), small);
+        assert_eq!(tween_size(small, large, 1.), large);
+        let halfway = tween_size(small, large, 0.5);
+        assert!(halfway.width > small.width && halfway.width < large.width);
+        assert_eq!(tween_size(large, small, 1.), small);
     }
 }

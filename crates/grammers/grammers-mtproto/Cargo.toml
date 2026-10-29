@@ -15,7 +15,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1.12.1"
-crc32fast = "1.5.2"
+crc32fast = "1.5.3"
 flate2 = "1.1.10"
 getrandom = "0.4.3"
 grammers-crypto = { path = "../grammers-crypto", version = "0.11.0" }

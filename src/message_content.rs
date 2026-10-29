@@ -2,8 +2,8 @@ use crate::proto::ferrsphen::message_presentation::{Envelope, ReactionAttributes
 use atri_qq::messages::{MessageElement, OpaqueScope, validate_metadata};
 use prost::Message;
 
-// A lossy projection must never conceal an unknown business field. Requiring
-// identical re-encoding deliberately leaves noncanonical/unknown data visible.
+// Decode only when re-encoding reproduces the bytes exactly, so unknown or
+// noncanonical data stays visible.
 fn exact<M: Message + Default>(bytes: &[u8]) -> Option<M> {
     let value = M::decode(bytes).ok()?;
     (value.encode_to_vec() == bytes).then_some(value)
@@ -35,13 +35,17 @@ pub fn is_visible(element: &MessageElement, elements: &[MessageElement]) -> bool
                 })
         }
         45 => !envelope.reply.is_empty() && envelope.text.is_empty() && envelope.common.is_empty(),
-        // Service 38 carries reaction/reply sidecars, not an extra image caption.
+        // Service 38 attributes accompany image and text content.
         // Keep standalone or unrecognized instances inspectable.
         53 => {
-            elements
-                .iter()
-                .any(|element| matches!(element, MessageElement::Image(_)))
-                && !envelope.common.is_empty()
+            elements.iter().any(|element| match element {
+                MessageElement::Text(text) => !text.is_empty(),
+                MessageElement::Image(_) | MessageElement::Mention(_) => true,
+                MessageElement::Opaque(_) => {
+                    crate::expressions::Face::from_element(element).is_some()
+                }
+                _ => false,
+            }) && !envelope.common.is_empty()
                 && envelope.text.is_empty()
                 && envelope.reply.is_empty()
                 && envelope.common.iter().all(|common| {
@@ -62,6 +66,15 @@ pub fn visible_elements(elements: &[MessageElement]) -> impl Iterator<Item = &Me
         .filter(|element| is_visible(element, elements))
 }
 
+pub fn single_face(elements: &[MessageElement]) -> Option<crate::expressions::Face> {
+    let mut visible = visible_elements(elements);
+    let element = visible.next()?;
+    if visible.next().is_some() {
+        return None;
+    }
+    crate::expressions::Face::from_element(element)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +89,35 @@ mod tests {
             field,
             payload: hex::decode(hex).unwrap(),
         })
+    }
+    #[test]
+    fn only_a_single_visible_qq_face_uses_the_large_presentation() {
+        let face = crate::expressions::Face::new(14).element();
+        assert_eq!(single_face(std::slice::from_ref(&face)).unwrap().id, 14);
+        let decorated = vec![
+            face.clone(),
+            opaque(53, "aa030f082612090a070a0508021080091801"),
+        ];
+        assert_eq!(single_face(&decorated).unwrap().id, 14);
+        let reply = MessageElement::Reply(atri_qq::messages::Reply {
+            sequences: vec![1],
+            server_sequence: None,
+            message_id: 1,
+            sender_uin: 7,
+            sender_uid: String::new(),
+            time: 0,
+            elements: vec![],
+        });
+        assert!(single_face(&[reply, face.clone()]).is_none());
+        for elements in [
+            vec![],
+            vec![face.clone(), face.clone()],
+            vec![MessageElement::Text("text".into()), face.clone()],
+            vec![MessageElement::Text(" ".into()), face.clone()],
+            vec![face, opaque(53, "aa0303082718")],
+        ] {
+            assert!(single_face(&elements).is_none());
+        }
     }
     #[test]
     fn text_and_reply_attributes_do_not_add_other_message_to_preview() {
@@ -105,6 +147,27 @@ mod tests {
             1,
             "standalone data must remain inspectable"
         );
+    }
+    #[test]
+    fn text_attributes_do_not_create_an_extra_bubble_or_hide_unknown_payloads() {
+        for payload in [
+            "aa030f082612090a070a0508021080091801",
+            "aa030f082612090a070a0508021099091801",
+            "aa030f082612090a070a050802109b091801",
+            "aa030f082612090a070a050806109a091801",
+            "aa030f082612090a070a05080a109c091801",
+            "aa030f082612090a070a05080c1098091801",
+        ] {
+            let elements = vec![MessageElement::Text("hello".into()), opaque(53, payload)];
+            assert_eq!(visible_elements(&elements).count(), 1);
+            assert_eq!(crate::model::summary(&elements), "hello");
+            assert!(is_visible(&elements[1], &elements[1..]));
+        }
+        let elements = vec![
+            MessageElement::Text("hello".into()),
+            opaque(53, "aa0311082612090a070a05080210800918012001"),
+        ];
+        assert_eq!(visible_elements(&elements).count(), 2);
     }
     #[test]
     fn unknown_content_malformed_data_and_faces_remain_visible() {

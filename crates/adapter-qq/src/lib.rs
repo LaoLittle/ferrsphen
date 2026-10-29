@@ -1,4 +1,4 @@
-//! QQ adapter and lossless mapping. A host may attach an authenticated ServiceClient from any application.
+//! QQ adapter and lossless mapping.
 use atri_qq::{
     ServiceClient,
     admin::Admin,
@@ -123,7 +123,7 @@ pub fn normalize_message(account: &AccountId, message: &atri_qq::messages::Messa
         deleted: message.is_recalled(),
     }
 }
-/// Declarative representation of a platform-specific notification. The host needs no QQ event enum to render it.
+/// Declarative representation of a platform-specific notification.
 pub fn poke_content(
     event: &PushEvent,
     actor: User,

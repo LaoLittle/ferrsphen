@@ -450,7 +450,17 @@ pub fn message_groups<'a>(
     groups
 }
 
-fn same_sender(left: &Message, right: &Message) -> bool {
+pub fn continues_sender(previous: &Message, current: &Message) -> bool {
+    previous.conversation == current.conversation
+        && same_sender(previous, current)
+        && crate::message_content::visible_elements(&previous.elements)
+            .next()
+            .is_some()
+        && crate::message_content::visible_elements(&current.elements)
+            .next()
+            .is_some()
+}
+pub fn same_sender(left: &Message, right: &Message) -> bool {
     (left.is_self && right.is_self)
         || (!left.sender_uid.is_empty() && left.sender_uid == right.sender_uid)
         || (left.sender_uin != 0 && left.sender_uin == right.sender_uin)
@@ -488,7 +498,8 @@ pub fn summary(elements: &[MessageElement]) -> String {
             MessageElement::Voice(_) => t!("preview.voice").into_owned(),
             MessageElement::Video(_) => t!("preview.video").into_owned(),
             MessageElement::File(f) => t!("preview.file", name = f.name).into_owned(),
-            MessageElement::LightApp(_) => t!("preview.card").into_owned(),
+            MessageElement::LightApp(json) => crate::message_card::MessageCard::parse(json)
+                .map_or_else(|| t!("preview.card").into_owned(), |card| card.summary()),
             MessageElement::Forward(_) => t!("preview.forward").into_owned(),
             MessageElement::GroupFile(f) => t!("preview.group_file", name = f.name).into_owned(),
             MessageElement::Opaque(_) => crate::expressions::Face::from_element(element)

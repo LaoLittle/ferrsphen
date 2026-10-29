@@ -8,3 +8,4 @@ tests/
 scripts/
 dist/
 __pycache__/
+secrets.toml

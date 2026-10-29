@@ -157,7 +157,11 @@ impl Bounce {
             }
             if remainder != 0. {
                 let unused = remainder - scroll(remainder);
-                self.travel = (self.travel + unused).clamp(-self.extent * 8., self.extent * 8.);
+                // Subpixel rounding is not an edge; retaining it would consume
+                // the next entire movement as rubber-band travel.
+                if unused.abs() > 0.01 {
+                    self.travel = (self.travel + unused).clamp(-self.extent * 8., self.extent * 8.);
+                }
             }
             self.position = self.rubber(self.travel);
             self.sampled = Some(now);
@@ -342,6 +346,40 @@ mod bounce_tests {
                     assert_eq!(bounce.position, 0.);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn rounded_scroll_offsets_do_not_latch_an_edge_inside_a_long_list() {
+        let now = Instant::now();
+        let deltas = [30.600_266, 50.999_985, 43.066_406, 58.933_29, 61.200_195];
+        for direction in [1., -1.] {
+            let mut bounce = Bounce::default();
+            let mut offset = -39_375.67_f32;
+            let initial = offset;
+            for (index, delta) in deltas.into_iter().enumerate() {
+                bounce.packet(
+                    direction * delta,
+                    if index == 0 {
+                        TouchPhase::Started
+                    } else {
+                        TouchPhase::Moved
+                    },
+                    true,
+                    600.,
+                    now,
+                    |delta| {
+                        let before = offset;
+                        offset = (offset + delta).clamp(-50_000., 0.);
+                        offset - before
+                    },
+                );
+                assert_eq!(
+                    bounce.position, 0.,
+                    "rounding residual must not become overscroll"
+                );
+            }
+            assert!((offset - initial - direction * deltas.into_iter().sum::<f32>()).abs() < 0.02);
         }
     }
 

@@ -1,4 +1,4 @@
-//! A native Rust Telegram adapter. Networking and crypto are compiled from the vendored Rust sources.
+//! A native Rust Telegram adapter.
 #![forbid(unsafe_code)]
 mod mapping;
 mod session;
@@ -250,7 +250,7 @@ impl TelegramAdapter {
         self.application = application;
         self
     }
-    /// Set application credentials held only in memory for this adapter instance.
+    /// Set application credentials for this adapter instance.
     pub fn with_credentials(mut self, api_id: i32, api_hash: impl Into<String>) -> Self {
         self.configured_credentials = Some(Credentials {
             api_id,
@@ -900,7 +900,7 @@ mod profile_tests {
         assert!(matches!(auth,AuthState::Form {step,..} if step=="credentials"));
         assert!(store.get(key).await.unwrap().is_none());
         let configured = TelegramAdapter::new("two", store.clone())
-            .with_credentials(31991342, "0123456789abcdef0123456789abcdef");
+            .with_credentials(12345, "0123456789abcdef0123456789abcdef");
         assert!(
             store
                 .get(format!("{}/credentials", configured.prefix()))

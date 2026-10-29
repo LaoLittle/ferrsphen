@@ -14,7 +14,7 @@ categories = ["parser-implementations"]
 edition = "2024"
 
 [dependencies]
-crc32fast = "1.5.2"
+crc32fast = "1.5.3"
 
 [dev-dependencies]
 toml = "1.1.8"

@@ -19,7 +19,6 @@ pub struct Request {
     pub url: String,
     pub preferences: crate::settings::Preferences,
 }
-// Keep verification credentials out of Debug output.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ticket {
     pub ticket: String,

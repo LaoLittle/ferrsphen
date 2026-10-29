@@ -31,6 +31,7 @@ impl From<&Keystore> for wire::Keystore {
             uin: value.uin,
             uid: value.uid.clone(),
             guid: value.guid.clone(),
+            ios_msf_imei: value.ios_msf_imei.clone(),
             device_name: value.device_name.clone(),
             android_id: value.android_id.clone(),
             qimei: value.qimei.clone(),
@@ -61,6 +62,9 @@ impl From<&Keystore> for wire::Keystore {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             o3_xwid_switch: value.o3_xwid_switch,
+            nt_ticket_times: value.nt_ticket_times.map(Into::into),
+            wt_ticket_times: value.wt_ticket_times.map(Into::into),
+            ticket_generated_unix_seconds: value.ticket_generated_unix_seconds,
         }
     }
 }
@@ -71,6 +75,7 @@ impl TryFrom<wire::Keystore> for Keystore {
             uin: value.uin,
             uid: value.uid,
             guid: value.guid,
+            ios_msf_imei: value.ios_msf_imei,
             device_name: value.device_name,
             android_id: value.android_id,
             qimei: value.qimei,
@@ -100,11 +105,64 @@ impl TryFrom<wire::Keystore> for Keystore {
             wt_session_ticket_key: value.wt_session_ticket_key,
             ps_keys: value.ps_keys.into_iter().collect(),
             o3_xwid_switch: value.o3_xwid_switch,
+            nt_ticket_times: value.nt_ticket_times.map(Into::into),
+            wt_ticket_times: value.wt_ticket_times.map(Into::into),
+            ticket_generated_unix_seconds: value.ticket_generated_unix_seconds,
             qr_sig: Vec::new(),
-            key_exchange_ticket: Vec::new(),
-            key_exchange_key: Vec::new(),
+            key_exchange_session: None,
             login_cookie: Vec::new(),
         })
+    }
+}
+
+impl From<atri_qq::NtTicketTimeValues> for wire::NtTicketTimeValues {
+    fn from(value: atri_qq::NtTicketTimeValues) -> Self {
+        Self {
+            raw_field1: value.raw_field1,
+            raw_field2: value.raw_field2,
+        }
+    }
+}
+impl From<wire::NtTicketTimeValues> for atri_qq::NtTicketTimeValues {
+    fn from(value: wire::NtTicketTimeValues) -> Self {
+        Self {
+            raw_field1: value.raw_field1,
+            raw_field2: value.raw_field2,
+        }
+    }
+}
+impl From<atri_qq::NtTicketTimeMetadata> for wire::NtTicketTimeMetadata {
+    fn from(value: atri_qq::NtTicketTimeMetadata) -> Self {
+        Self {
+            field12: value.field12.map(Into::into),
+            field16: value.field16.map(Into::into),
+            received_unix_ms: value.received_unix_ms,
+        }
+    }
+}
+impl From<wire::NtTicketTimeMetadata> for atri_qq::NtTicketTimeMetadata {
+    fn from(value: wire::NtTicketTimeMetadata) -> Self {
+        Self {
+            field12: value.field12.map(Into::into),
+            field16: value.field16.map(Into::into),
+            received_unix_ms: value.received_unix_ms,
+        }
+    }
+}
+impl From<atri_qq::WtTicketTimeMetadata> for wire::WtTicketTimeMetadata {
+    fn from(value: atri_qq::WtTicketTimeMetadata) -> Self {
+        Self {
+            next_refresh_unix_seconds: value.next_refresh_unix_seconds,
+            expire_unix_seconds: value.expire_unix_seconds,
+        }
+    }
+}
+impl From<wire::WtTicketTimeMetadata> for atri_qq::WtTicketTimeMetadata {
+    fn from(value: wire::WtTicketTimeMetadata) -> Self {
+        Self {
+            next_refresh_unix_seconds: value.next_refresh_unix_seconds,
+            expire_unix_seconds: value.expire_unix_seconds,
+        }
     }
 }
 
@@ -127,4 +185,107 @@ pub(crate) fn decode_keystore_file(bytes: &[u8]) -> Result<Session> {
     file.session
         .context("Keystore is missing its session")?
         .try_into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_refresh_metadata_survives_keystore_and_database_encoding() {
+        let session = Session {
+            keystore: Keystore {
+                nt_ticket_times: Some(atri_qq::NtTicketTimeMetadata {
+                    field12: Some(atri_qq::NtTicketTimeValues {
+                        raw_field1: Some(0),
+                        raw_field2: None,
+                    }),
+                    field16: Some(atri_qq::NtTicketTimeValues {
+                        raw_field1: Some(1_800_000_100),
+                        raw_field2: Some(1_800_000_200),
+                    }),
+                    received_unix_ms: 1_800_000_000_123,
+                }),
+                wt_ticket_times: Some(atri_qq::WtTicketTimeMetadata {
+                    next_refresh_unix_seconds: 1_800_000_300,
+                    expire_unix_seconds: 1_800_000_400,
+                }),
+                ticket_generated_unix_seconds: Some(1_800_000_000),
+                ..Default::default()
+            },
+            machine_id: "device".into(),
+            qua: "test".into(),
+        };
+        let restored = decode_keystore_file(&encode_keystore_file(&session)).unwrap();
+        assert!(restored.keystore == session.keystore);
+        let encoded = super::super::encode_session(&session).unwrap();
+        let restored: Session = super::super::decode(&encoded).unwrap();
+        assert!(restored.keystore == session.keystore);
+    }
+
+    #[test]
+    fn ios_identity_survives_both_protobuf_formats_but_exchange_sessions_never_do() {
+        let ticket = b"synthetic-private-nt-exchange-ticket";
+        let session = Session {
+            keystore: Keystore {
+                ios_msf_imei: "A0000000-0000-4000-8000-000000000001".into(),
+                a1: vec![1, 2, 3],
+                qr_sig: vec![4],
+                login_cookie: vec![5],
+                key_exchange_session: Some(
+                    atri_qq::NtKeyExchangeSession::new(
+                        atri_qq::ClientPlatform::IPhone,
+                        bytes::Bytes::from_static(&[7; 16]),
+                        bytes::Bytes::from_static(ticket),
+                        600,
+                    )
+                    .unwrap(),
+                ),
+                ..Default::default()
+            },
+            machine_id: "device".into(),
+            qua: atri_qq::Profile::iphone().qua,
+        };
+        let file = encode_keystore_file(&session);
+        let record = super::super::encode_session(&session).unwrap();
+        for bytes in [&file, &record] {
+            assert!(!bytes.windows(ticket.len()).any(|window| window == ticket));
+        }
+        let from_file = decode_keystore_file(&file).unwrap();
+        let from_record: Session = super::super::decode(&record).unwrap();
+        for restored in [from_file, from_record] {
+            assert_eq!(
+                restored.keystore.ios_msf_imei,
+                session.keystore.ios_msf_imei
+            );
+            assert_eq!(restored.keystore.a1, session.keystore.a1);
+            assert_eq!(restored.qua, session.qua);
+            assert!(restored.keystore.key_exchange_session.is_none());
+            assert!(restored.keystore.qr_sig.is_empty());
+            assert!(restored.keystore.login_cookie.is_empty());
+        }
+    }
+    #[test]
+    fn legacy_cbor_exchange_fields_are_discarded_while_ios_identity_is_preserved() {
+        let legacy = serde_json::json!({"keystore":{"uin":123,"ios_msf_imei":"device-imei","a1":[1,2],"key_exchange_key":[7,7],"key_exchange_ticket":[8,8]},"machine_id":"device","qua":"legacy-profile"});
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).unwrap();
+        let session: Session = super::super::decode(&bytes).unwrap();
+        assert_eq!(session.keystore.ios_msf_imei, "device-imei");
+        assert!(session.keystore.key_exchange_session.is_none());
+        let restored = decode_keystore_file(&encode_keystore_file(&session)).unwrap();
+        assert_eq!(restored.keystore.ios_msf_imei, "device-imei");
+        assert_eq!(restored.keystore.a1, [1, 2]);
+    }
+
+    #[test]
+    fn older_protobuf_keystores_keep_ticket_times_absent() {
+        let store: Keystore = wire::Keystore::default().try_into().unwrap();
+        assert!(store.ios_msf_imei.is_empty());
+        assert!(store.key_exchange_session.is_none());
+        assert_eq!(store.nt_ticket_times, None);
+        assert_eq!(store.wt_ticket_times, None);
+        assert_eq!(store.ticket_generated_unix_seconds, None);
+        assert_eq!(store.next_ticket_refresh_unix_seconds(), None);
+    }
 }
