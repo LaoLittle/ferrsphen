@@ -4218,7 +4218,11 @@ impl AppView {
         };
         let (url, captcha) = match challenge {
             atri_qq::LoginChallenge::Captcha { url } => (url.clone(), true),
-            atri_qq::LoginChallenge::NewDevice { url } => (url.clone(), false),
+            atri_qq::LoginChallenge::NewDevice { url }
+            | atri_qq::LoginChallenge::IosDeviceVerification { url } => (url.clone(), false),
+            atri_qq::LoginChallenge::IosSecurity(security) => {
+                (security.jump_url.clone().unwrap_or_default(), false)
+            }
         };
         div()
             .flex()

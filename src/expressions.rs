@@ -367,7 +367,9 @@ mod tests {
                 state: std::sync::Mutex::new(atri_qq::SessionState {
                     profile: atri_qq::Profile::linux(),
                     keystore,
-                    machine_id: String::new(),
+                    platform: atri_qq::PlatformState::Linux {
+                        machine_id: String::new(),
+                    },
                     online: true,
                 }),
                 packets,

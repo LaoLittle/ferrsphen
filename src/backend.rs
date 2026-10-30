@@ -302,6 +302,7 @@ fn fresh_device(old: &Keystore) -> Keystore {
     Keystore {
         guid: old.guid.clone(),
         ios_msf_imei: old.ios_msf_imei.clone(),
+        ios_virtual_state: old.ios_virtual_state.clone(),
         device_name: old.device_name.clone(),
         android_id: old.android_id.clone(),
         qimei: old.qimei.clone(),
@@ -351,11 +352,14 @@ async fn run(
     let work = async {
         loop {
             let config = ClientConfig {
-                machine_id: session.machine_id.clone(),
                 profile: atri_qq::Profile {
                     qua: session.qua.clone(),
                     ..atri_qq::Profile::linux()
                 },
+                platform: Some(atri_qq::PlatformConfig::Linux(atri_qq::LinuxConfig {
+                    machine_id: session.machine_id.clone(),
+                    ..Default::default()
+                })),
                 uin: session.keystore.uin,
                 password: password.take(),
                 ..ClientConfig::default()
@@ -1748,7 +1752,9 @@ mod mini_app_card_tests {
             atri_qq::SessionState {
                 profile: atri_qq::Profile::linux(),
                 keystore: Keystore::default(),
-                machine_id: String::new(),
+                platform: atri_qq::PlatformState::Linux {
+                    machine_id: String::new(),
+                },
                 online: true,
             }
         }
@@ -1933,7 +1939,9 @@ mod music_share_tests {
             atri_qq::SessionState {
                 profile: atri_qq::Profile::linux(),
                 keystore: Keystore::default(),
-                machine_id: String::new(),
+                platform: atri_qq::PlatformState::Linux {
+                    machine_id: String::new(),
+                },
                 online: true,
             }
         }

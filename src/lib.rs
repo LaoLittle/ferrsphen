@@ -70,10 +70,6 @@ pub mod proto;
 #[cfg(feature = "desktop")]
 mod telegram_config;
 
-#[cfg(test)]
-#[path = "../build.rs"]
-mod build_script_tests;
-
 #[cfg(feature = "desktop")]
 mod chat_ui;
 #[cfg(feature = "desktop")]

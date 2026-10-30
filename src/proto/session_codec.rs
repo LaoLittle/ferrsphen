@@ -65,6 +65,15 @@ impl From<&Keystore> for wire::Keystore {
             nt_ticket_times: value.nt_ticket_times.map(Into::into),
             wt_ticket_times: value.wt_ticket_times.map(Into::into),
             ticket_generated_unix_seconds: value.ticket_generated_unix_seconds,
+            ios_virtual_state: value.ios_virtual_state.as_ref().map(|state| {
+                super::encode(state).expect("iOS virtual state maps to a storage record")
+            }),
+            ios_server_lists: if value.ios_server_lists.is_empty() {
+                Vec::new()
+            } else {
+                super::encode(&value.ios_server_lists)
+                    .expect("iOS server lists map to a storage record")
+            },
         }
     }
 }
@@ -76,6 +85,16 @@ impl TryFrom<wire::Keystore> for Keystore {
             uid: value.uid,
             guid: value.guid,
             ios_msf_imei: value.ios_msf_imei,
+            ios_virtual_state: value
+                .ios_virtual_state
+                .map(|bytes| super::decode(&bytes))
+                .transpose()
+                .context("Invalid iOS virtual state")?,
+            ios_server_lists: if value.ios_server_lists.is_empty() {
+                Default::default()
+            } else {
+                super::decode(&value.ios_server_lists).context("Invalid iOS server lists")?
+            },
             device_name: value.device_name,
             android_id: value.android_id,
             qimei: value.qimei,
@@ -241,6 +260,31 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                ios_virtual_state: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "hardware_model": "iPhone13,4",
+                        "collector_uuid": "00000000-0000-4000-8000-000000000001",
+                        "vendor_uuid": "00000000-0000-4000-8000-000000000002",
+                        "home_uuid": "00000000-0000-4000-8000-000000000003",
+                        "bundle_uuid": "00000000-0000-4000-8000-000000000004",
+                        "runtime_id": "runtime",
+                        "installed_unix_micros": 1,
+                        "boot_unix_micros": 2,
+                        "filesystem_created_unix_micros": 3,
+                        "private_var_inode": 4,
+                        "mobile_preferences_inode": 5,
+                        "xwid_candidate": "xwid",
+                        "connection_sequence": 6,
+                        "guild_sync": {"7": {"last_msg_time": 8, "last_pull_time": null, "entries": {"9": 10}}},
+                        "registered_accounts": [11],
+                        "token": {"expires_at": 12, "token": [13, 14], "associated_uin": "11"}
+                    }))
+                    .unwrap(),
+                ),
+                ios_server_lists: serde_json::from_value(serde_json::json!({
+                    "nossid_wifi": {"server_time": 1, "carrier": "carrier"}
+                }))
+                .unwrap(),
                 ..Default::default()
             },
             machine_id: "device".into(),
@@ -259,6 +303,11 @@ mod tests {
                 session.keystore.ios_msf_imei
             );
             assert_eq!(restored.keystore.a1, session.keystore.a1);
+            assert!(restored.keystore.ios_virtual_state == session.keystore.ios_virtual_state);
+            assert_eq!(
+                serde_json::to_value(&restored.keystore.ios_server_lists).unwrap(),
+                serde_json::to_value(&session.keystore.ios_server_lists).unwrap()
+            );
             assert_eq!(restored.qua, session.qua);
             assert!(restored.keystore.key_exchange_session.is_none());
             assert!(restored.keystore.qr_sig.is_empty());

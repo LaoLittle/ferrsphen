@@ -2,7 +2,7 @@ target/
 run/
 .DS_Store
 data/
-Cargo.lock
+#Cargo.lock
 mobile/
 tests/
 scripts/
